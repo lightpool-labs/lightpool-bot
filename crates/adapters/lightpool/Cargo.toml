@@ -1,0 +1,63 @@
+[package]
+name = "nautilus-lightpool"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "LightPool integration adapter for the Nautilus trading engine"
+categories.workspace = true
+keywords.workspace = true
+documentation.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "nautilus_lightpool"
+crate-type = ["rlib"]
+
+[features]
+default = ["high-precision"]
+examples = ["nautilus-live/node"]
+high-precision = ["nautilus-model/high-precision"]
+
+[dependencies]
+nautilus-common = { workspace = true, features = ["live"] }
+nautilus-core = { workspace = true }
+nautilus-live = { workspace = true }
+nautilus-model = { workspace = true }
+
+lightpool-sdk = { path = "../../../../../crates/lightpool-sdk" }
+
+ahash = { workspace = true }
+bincode = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+dashmap = { workspace = true }
+futures-util = { workspace = true }
+log = { workspace = true }
+reqwest = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tokio-util = { workspace = true }
+ustr = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+nautilus-testkit = { workspace = true }
+nautilus-trading = { workspace = true }
+clap = { version = "4.5", features = ["derive"] }
+dotenvy = "0.15"
+
+[[example]]
+name = "lightpool-data-tester"
+path = "examples/node_data_tester.rs"
+required-features = ["examples"]
+doc = false
