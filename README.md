@@ -48,5 +48,3 @@ export HTTPS_PROXY=http://127.0.0.1:7890
 cargo run -p lightpool-strategies --bin liquidity-maker -- \
   --slug fed-rate-hike-in-2026
 ```
-
-Supported variables: `HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy`, `ALL_PROXY`, `all_proxy`.
