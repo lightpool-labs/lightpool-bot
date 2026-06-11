@@ -5399,6 +5399,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dotenvy",
+ "indexmap 2.14.0",
  "log",
  "nautilus-common",
  "nautilus-core",
@@ -5407,6 +5408,7 @@ dependencies = [
  "nautilus-model",
  "nautilus-polymarket",
  "nautilus-trading",
+ "rust_decimal",
  "tokio",
 ]
 

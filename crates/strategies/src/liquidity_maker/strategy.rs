@@ -56,6 +56,8 @@ pub struct LiquidityMaker {
     pub(super) instrument_to_market_key: AHashMap<InstrumentId, String>,
     pub(super) subscribed_instruments: AHashSet<InstrumentId>,
     pub(super) delta_batches: AHashMap<InstrumentId, u64>,
+    /// Polymarket instrument id -> paired LightPool instrument id.
+    pub(super) pm_to_lp: AHashMap<InstrumentId, InstrumentId>,
 }
 
 impl LiquidityMaker {
@@ -72,6 +74,7 @@ impl LiquidityMaker {
             instrument_to_market_key: AHashMap::new(),
             subscribed_instruments: AHashSet::new(),
             delta_batches: AHashMap::new(),
+            pm_to_lp: AHashMap::new(),
         }
     }
 
@@ -298,7 +301,15 @@ impl DataActor for LiquidityMaker {
             self.config.lightpool_enabled,
         );
         self.reconcile_subscriptions();
+        self.rebuild_instrument_pairs();
         self.warn_missing_lightpool_markets();
+        if self.config.trading_enabled {
+            log::info!(
+                "LightPool mirroring enabled depth={} client_id={}",
+                self.config.depth,
+                self.config.lightpool_client_id,
+            );
+        }
         Ok(())
     }
 
@@ -310,6 +321,7 @@ impl DataActor for LiquidityMaker {
         }
         self.sync_markets_from_cache();
         self.reconcile_subscriptions();
+        self.rebuild_instrument_pairs();
         if venue == LIGHTPOOL_VENUE {
             log::debug!(
                 "LightPool instrument loaded instrument_id={instrument_id} lightpool_markets={}",
@@ -329,8 +341,21 @@ impl DataActor for LiquidityMaker {
     fn on_book_deltas(&mut self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
         self.sync_markets_from_cache();
         self.reconcile_subscriptions();
+        self.rebuild_instrument_pairs();
 
         let instrument_id = deltas.instrument_id;
+        let venue = instrument_id.venue.as_str();
+
+        if venue == POLYMARKET_VENUE {
+            if self.config.trading_enabled {
+                if let Err(e) = self.reconcile_from_polymarket_delta(instrument_id) {
+                    log::warn!(
+                        "Failed to reconcile LightPool liquidity for {instrument_id}: {e:#}"
+                    );
+                }
+            }
+        }
+
         if !self.venue_logging_enabled(instrument_id) {
             return Ok(());
         }

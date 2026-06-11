@@ -15,7 +15,7 @@
 
 //! Configuration for the liquidity maker strategy.
 
-use nautilus_model::identifiers::StrategyId;
+use nautilus_model::identifiers::{ClientId, StrategyId};
 use nautilus_trading::strategy::StrategyConfig;
 
 /// Configuration for subscribing Polymarket order book deltas with managed cache books.
@@ -38,6 +38,10 @@ pub struct LiquidityMakerConfig {
     pub lightpool_enabled: bool,
     /// When `true`, print Polymarket order book snapshots from cache.
     pub log_polymarket: bool,
+    /// When `true`, mirror Polymarket depth onto LightPool via execution client.
+    pub trading_enabled: bool,
+    /// Execution client id for LightPool order submission.
+    pub lightpool_client_id: ClientId,
 }
 
 impl LiquidityMakerConfig {
@@ -57,6 +61,8 @@ impl LiquidityMakerConfig {
             managed_book: true,
             lightpool_enabled: true,
             log_polymarket: true,
+            trading_enabled: false,
+            lightpool_client_id: ClientId::from("LIGHTPOOL"),
         }
     }
 
@@ -99,6 +105,18 @@ impl LiquidityMakerConfig {
     #[must_use]
     pub fn with_strategy_id(mut self, strategy_id: StrategyId) -> Self {
         self.base.strategy_id = Some(strategy_id);
+        self
+    }
+
+    #[must_use]
+    pub fn with_trading_enabled(mut self, enabled: bool) -> Self {
+        self.trading_enabled = enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn with_lightpool_client_id(mut self, client_id: ClientId) -> Self {
+        self.lightpool_client_id = client_id;
         self
     }
 }

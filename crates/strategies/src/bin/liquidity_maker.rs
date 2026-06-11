@@ -34,8 +34,8 @@ use lightpool_strategies::{LiquidityMaker, LiquidityMakerConfig};
 use log::LevelFilter;
 use nautilus_common::{enums::Environment, logging::logger::LoggerConfig};
 use nautilus_lightpool::{
-    config::LightpoolDataClientConfig,
-    factories::LightpoolDataClientFactory,
+    config::{LightpoolDataClientConfig, LightpoolExecClientConfig},
+    factories::{LightpoolDataClientFactory, LightpoolExecutionClientFactory},
 };
 use nautilus_live::node::LiveNode;
 use nautilus_model::identifiers::{StrategyId, TraderId};
@@ -69,6 +69,9 @@ struct Args {
     /// Disable Polymarket order book log output (still subscribes for reference data).
     #[arg(long, default_value_t = false)]
     no_polymarket_log: bool,
+    /// Disable LightPool order mirroring (data/logging only).
+    #[arg(long, default_value_t = false)]
+    no_trading: bool,
 }
 
 fn require_non_empty(name: &str, value: &str) -> Result<String> {
@@ -144,6 +147,8 @@ async fn main() -> Result<()> {
         )
         .context("failed to register Polymarket data client")?;
 
+    let trading_enabled = lightpool_enabled && !args.no_trading;
+
     if lightpool_enabled {
         let lightpool_data_config = LightpoolDataClientConfig::new(lightpool_slugs.clone())
             .with_book_depth(u32::try_from(args.depth).unwrap_or(10));
@@ -156,6 +161,17 @@ async fn main() -> Result<()> {
             .context("failed to register LightPool data client")?;
     }
 
+    if trading_enabled {
+        let lightpool_exec_config = LightpoolExecClientConfig::default();
+        node_builder = node_builder
+            .add_exec_client(
+                None,
+                Box::new(LightpoolExecutionClientFactory),
+                Box::new(lightpool_exec_config),
+            )
+            .context("failed to register LightPool execution client")?;
+    }
+
     let mut node = node_builder.build()?;
 
     let strategy_config = LiquidityMakerConfig::new(polymarket_slugs)
@@ -164,11 +180,13 @@ async fn main() -> Result<()> {
         .with_log_interval(args.log_interval)
         .with_lightpool_enabled(lightpool_enabled)
         .with_log_polymarket(!args.no_polymarket_log)
+        .with_trading_enabled(trading_enabled)
         .with_strategy_id(strategy_id);
 
     log::info!(
         "Starting liquidity maker polymarket_slug={polymarket_slug} \
-         lightpool_slug={} depth={} lightpool_enabled={lightpool_enabled}",
+         lightpool_slug={} depth={} lightpool_enabled={lightpool_enabled} \
+         trading_enabled={trading_enabled}",
         lightpool_slug.as_deref().unwrap_or("-"),
         args.depth,
     );
