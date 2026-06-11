@@ -13,15 +13,17 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Live runner for the Polymarket liquidity maker strategy.
+//! Live runner for the dual-venue liquidity maker strategy.
 //!
-//! Subscribes to Polymarket order book deltas and reads managed books from cache.
+//! Subscribes to Polymarket and LightPool order book deltas and logs managed cache books.
 //!
 //! # Usage
 //!
 //! ```sh
 //! cargo run -p lightpool-strategies --bin liquidity-maker -- \
-//!   --slug gta-vi-released-before-june-2026
+//!   --polymarket-slug world-cup-winner \
+//!   --lightpool-slug france-world-cup-2026 \
+//!   --log-interval 50
 //! ```
 
 use std::sync::Arc;
@@ -31,6 +33,10 @@ use clap::Parser;
 use lightpool_strategies::{LiquidityMaker, LiquidityMakerConfig};
 use log::LevelFilter;
 use nautilus_common::{enums::Environment, logging::logger::LoggerConfig};
+use nautilus_lightpool::{
+    config::LightpoolDataClientConfig,
+    factories::LightpoolDataClientFactory,
+};
 use nautilus_live::node::LiveNode;
 use nautilus_model::identifiers::{StrategyId, TraderId};
 use nautilus_polymarket::{
@@ -41,17 +47,36 @@ use nautilus_polymarket::{
 };
 
 #[derive(Parser, Debug)]
-#[command(about = "Polymarket liquidity maker: subscribe order book deltas and read cache books.")]
+#[command(
+    about = "Dual-venue liquidity maker: Polymarket + LightPool order book delta logging."
+)]
 struct Args {
     /// Polymarket event slug (Gamma event slug).
     #[arg(long)]
-    slug: String,
+    polymarket_slug: String,
+    /// LightPool market slug (clob-index market slug).
+    #[arg(long)]
+    lightpool_slug: Option<String>,
     /// Number of book levels to track per side.
     #[arg(long, default_value_t = 10)]
     depth: usize,
     /// Log a book snapshot every N delta batches. `0` disables periodic logs.
     #[arg(long, default_value_t = 50)]
     log_interval: u64,
+    /// Disable LightPool data client and subscriptions.
+    #[arg(long, default_value_t = false)]
+    polymarket_only: bool,
+    /// Disable Polymarket order book log output (still subscribes for reference data).
+    #[arg(long, default_value_t = false)]
+    no_polymarket_log: bool,
+}
+
+fn require_non_empty(name: &str, value: &str) -> Result<String> {
+    let trimmed = value.trim().to_string();
+    if trimmed.is_empty() {
+        bail!("{name} must be non-empty");
+    }
+    Ok(trimmed)
 }
 
 #[tokio::main]
@@ -59,11 +84,20 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     let args = Args::parse();
 
-    let slug = args.slug.trim().to_string();
-    if slug.is_empty() {
-        bail!("--slug must be non-empty");
-    }
-    let slugs = vec![slug.clone()];
+    let polymarket_slug = require_non_empty("--polymarket-slug", &args.polymarket_slug)?;
+    let polymarket_slugs = vec![polymarket_slug.clone()];
+    let lightpool_enabled = !args.polymarket_only;
+    let lightpool_slug = if lightpool_enabled {
+        let slug = args
+            .lightpool_slug
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--lightpool-slug is required unless --polymarket-only"))?;
+        Some(require_non_empty("--lightpool-slug", slug)?)
+    } else {
+        None
+    };
+    let lightpool_slugs = lightpool_slug.iter().cloned().collect::<Vec<_>>();
+
     let proxy_url = proxy_url_from_env();
 
     let environment = Environment::Live;
@@ -78,15 +112,15 @@ async fn main() -> Result<()> {
     };
 
     let filters: Vec<Arc<dyn InstrumentFilter>> = vec![Arc::new(EventQueryFilter::from_queries(
-        slugs
+        polymarket_slugs
             .iter()
             .map(|s| (s.clone(), params.clone()))
             .collect(),
     ))];
 
-    let data_config = PolymarketDataClientConfig {
+    let polymarket_data_config = PolymarketDataClientConfig {
         instrument_config: Some(PolymarketInstrumentProviderConfig {
-            event_slugs: Some(slugs.clone()),
+            market_slugs: Some(polymarket_slugs.clone()),
             ..Default::default()
         }),
         proxy_url,
@@ -99,25 +133,43 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
 
-    let mut node = LiveNode::builder(trader_id, environment)?
+    let mut node_builder = LiveNode::builder(trader_id, environment)?
         .with_name("LIQUIDITY-MAKER".to_string())
         .with_logging(log_config)
         .with_delay_post_stop_secs(2)
         .add_data_client(
             None,
             Box::new(PolymarketDataClientFactory),
-            Box::new(data_config),
+            Box::new(polymarket_data_config),
         )
-        .context("failed to build live node")?
-        .build()?;
+        .context("failed to register Polymarket data client")?;
 
-    let strategy_config = LiquidityMakerConfig::new(slugs)
+    if lightpool_enabled {
+        let lightpool_data_config = LightpoolDataClientConfig::new(lightpool_slugs.clone())
+            .with_book_depth(u32::try_from(args.depth).unwrap_or(10));
+        node_builder = node_builder
+            .add_data_client(
+                None,
+                Box::new(LightpoolDataClientFactory),
+                Box::new(lightpool_data_config),
+            )
+            .context("failed to register LightPool data client")?;
+    }
+
+    let mut node = node_builder.build()?;
+
+    let strategy_config = LiquidityMakerConfig::new(polymarket_slugs)
+        .with_lightpool_slugs(lightpool_slugs)
         .with_depth(args.depth)
         .with_log_interval(args.log_interval)
+        .with_lightpool_enabled(lightpool_enabled)
+        .with_log_polymarket(!args.no_polymarket_log)
         .with_strategy_id(strategy_id);
 
     log::info!(
-        "Starting liquidity maker slug={slug} depth={}",
+        "Starting liquidity maker polymarket_slug={polymarket_slug} \
+         lightpool_slug={} depth={} lightpool_enabled={lightpool_enabled}",
+        lightpool_slug.as_deref().unwrap_or("-"),
         args.depth,
     );
 

@@ -10,8 +10,12 @@ pub struct ClobIndexHttpClient {
 
 impl ClobIndexHttpClient {
     pub fn new(base_url: impl Into<String>) -> Self {
+        let client = Client::builder()
+            .http1_only()
+            .build()
+            .unwrap_or_else(|_| Client::new());
         Self {
-            client: Client::new(),
+            client,
             base_url: base_url.into().trim_end_matches('/').to_string(),
         }
     }

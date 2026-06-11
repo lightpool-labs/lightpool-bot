@@ -5402,6 +5402,7 @@ dependencies = [
  "log",
  "nautilus-common",
  "nautilus-core",
+ "nautilus-lightpool",
  "nautilus-live",
  "nautilus-model",
  "nautilus-polymarket",

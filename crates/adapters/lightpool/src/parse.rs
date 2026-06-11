@@ -138,7 +138,7 @@ fn cents_to_decimal(price: &str) -> anyhow::Result<Decimal> {
         .trim()
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid cents price '{price}': {e}"))?;
-    Ok(Decimal::new(cents as i64, 2) / Decimal::from(100))
+    Ok(Decimal::from(cents) / Decimal::from(100))
 }
 
 fn parse_price(price: &str) -> anyhow::Result<Price> {

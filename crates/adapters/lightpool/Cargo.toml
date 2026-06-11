@@ -61,3 +61,8 @@ name = "lightpool-data-tester"
 path = "examples/node_data_tester.rs"
 required-features = ["examples"]
 doc = false
+
+[[example]]
+name = "lightpool-ws-tester"
+path = "examples/ws_tester.rs"
+doc = false

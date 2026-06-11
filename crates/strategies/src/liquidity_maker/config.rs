@@ -24,7 +24,9 @@ pub struct LiquidityMakerConfig {
     /// Base strategy configuration.
     pub base: StrategyConfig,
     /// Polymarket event slugs to mirror (resolved to instruments via data client filters).
-    pub slugs: Vec<String>,
+    pub polymarket_slugs: Vec<String>,
+    /// LightPool market slugs to mirror (resolved via clob-index bootstrap).
+    pub lightpool_slugs: Vec<String>,
     /// Number of price levels to retain per side.
     pub depth: usize,
     /// Log top-of-book snapshot every N delta batches. `0` disables logging.
@@ -32,23 +34,36 @@ pub struct LiquidityMakerConfig {
     /// When `true`, subscribe with managed books so the data engine also
     /// maintains an `OrderBook` in cache (`cache.order_book()`).
     pub managed_book: bool,
+    /// When `true`, subscribe to LightPool order books for the same slugs.
+    pub lightpool_enabled: bool,
+    /// When `true`, print Polymarket order book snapshots from cache.
+    pub log_polymarket: bool,
 }
 
 impl LiquidityMakerConfig {
     /// Creates a new config for the given Polymarket event slugs.
     #[must_use]
-    pub fn new(slugs: Vec<String>) -> Self {
+    pub fn new(polymarket_slugs: Vec<String>) -> Self {
         Self {
             base: StrategyConfig {
                 strategy_id: Some(StrategyId::from("LIQUIDITY_MAKER-001")),
                 order_id_tag: Some("001".to_string()),
                 ..Default::default()
             },
-            slugs,
+            polymarket_slugs,
+            lightpool_slugs: Vec::new(),
             depth: 10,
             log_interval: 0,
             managed_book: true,
+            lightpool_enabled: true,
+            log_polymarket: true,
         }
+    }
+
+    #[must_use]
+    pub fn with_lightpool_slugs(mut self, lightpool_slugs: Vec<String>) -> Self {
+        self.lightpool_slugs = lightpool_slugs;
+        self
     }
 
     #[must_use]
@@ -66,6 +81,18 @@ impl LiquidityMakerConfig {
     #[must_use]
     pub fn with_managed_book(mut self, managed: bool) -> Self {
         self.managed_book = managed;
+        self
+    }
+
+    #[must_use]
+    pub fn with_lightpool_enabled(mut self, enabled: bool) -> Self {
+        self.lightpool_enabled = enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn with_log_polymarket(mut self, enabled: bool) -> Self {
+        self.log_polymarket = enabled;
         self
     }
 

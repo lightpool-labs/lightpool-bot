@@ -4,7 +4,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use super::models::{OrderBookDelta, OrderBookWsSnapshot, WsError, WsSubscribed};
+use super::models::{OrderBookDelta, OrderBookWsSnapshot, WsError};
 
 #[derive(Debug, Clone)]
 pub enum BookWsEvent {
@@ -86,24 +86,28 @@ impl ClobIndexBookWsClient {
         text: &str,
         tx: &mpsc::UnboundedSender<BookWsEvent>,
     ) -> anyhow::Result<()> {
-        if let Ok(error) = serde_json::from_str::<WsError>(text) {
-            if error.msg_type == "error" {
+        let envelope: serde_json::Value = serde_json::from_str(text)?;
+        let Some(msg_type) = envelope.get("type").and_then(|v| v.as_str()) else {
+            log::warn!("clob-index WS message missing type field: {text}");
+            return Ok(());
+        };
+
+        match msg_type {
+            "error" => {
+                let error = serde_json::from_value::<WsError>(envelope)?;
                 let _ = tx.send(BookWsEvent::Error(error.error));
             }
-            return Ok(());
-        }
-        if serde_json::from_str::<WsSubscribed>(text).is_ok() {
-            return Ok(());
-        }
-        if let Ok(snapshot) = serde_json::from_str::<OrderBookWsSnapshot>(text) {
-            if snapshot.msg_type == "orderbook_snapshot" {
+            "subscribed" => {}
+            "orderbook_snapshot" => {
+                let snapshot = serde_json::from_value::<OrderBookWsSnapshot>(envelope)?;
                 let _ = tx.send(BookWsEvent::Snapshot(snapshot));
             }
-            return Ok(());
-        }
-        if let Ok(delta) = serde_json::from_str::<OrderBookDelta>(text) {
-            if delta.msg_type == "orderbook_delta" {
+            "orderbook_delta" => {
+                let delta = serde_json::from_value::<OrderBookDelta>(envelope)?;
                 let _ = tx.send(BookWsEvent::Delta(delta));
+            }
+            other => {
+                log::warn!("Unhandled clob-index WS message type: {other}");
             }
         }
         Ok(())

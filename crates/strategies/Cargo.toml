@@ -22,6 +22,7 @@ nautilus-model = { workspace = true, features = ["stubs"] }
 nautilus-core = { workspace = true }
 nautilus-live = { workspace = true, features = ["node"] }
 nautilus-polymarket = { workspace = true, default-features = true }
+nautilus-lightpool = { workspace = true, default-features = true }
 
 ahash = { workspace = true }
 anyhow = { workspace = true }

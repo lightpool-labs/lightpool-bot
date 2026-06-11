@@ -1,4 +1,4 @@
-//! Slug-to-market id mapping built from the Polymarket instrument cache.
+//! Slug-to-market id mapping built from Polymarket and LightPool instrument caches.
 
 use ahash::{AHashMap, AHashSet};
 use nautilus_common::cache::Cache;
@@ -7,9 +7,10 @@ use nautilus_model::{
     instruments::{Instrument, InstrumentAny},
 };
 
-/// YES/NO instrument ids for a single Polymarket condition market.
+/// YES/NO instrument ids for a single prediction market.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlugMarketIds {
+    /// Polymarket condition id or LightPool market slug.
     pub condition_id: String,
     pub yes_id: InstrumentId,
     pub no_id: InstrumentId,
@@ -59,6 +60,81 @@ pub fn discover_markets_from_cache(cache: &Cache) -> AHashMap<String, SlugMarket
         );
     }
     markets
+}
+
+/// Builds paired YES/NO markets from LightPool binary options in cache.
+pub fn discover_lightpool_markets_from_cache(cache: &Cache) -> AHashMap<String, SlugMarketIds> {
+    let venue = Venue::from("LIGHTPOOL");
+    let mut by_slug: AHashMap<String, (Option<InstrumentId>, Option<InstrumentId>)> =
+        AHashMap::new();
+
+    for instrument in cache.instruments(&venue, None) {
+        let InstrumentAny::BinaryOption(opt) = instrument else {
+            continue;
+        };
+        let id = instrument.id();
+        let market_slug = opt
+            .info
+            .as_ref()
+            .and_then(|params| params.get("market_slug"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| market_slug_from_symbol(id.symbol.as_str()));
+        let outcome = opt
+            .outcome
+            .map(|v| v.to_string().to_lowercase())
+            .unwrap_or_default();
+        let entry = by_slug
+            .entry(market_slug)
+            .or_insert((None, None));
+        match outcome.as_str() {
+            "yes" => entry.0 = Some(id),
+            "no" => entry.1 = Some(id),
+            _ => {}
+        }
+    }
+
+    let mut markets = AHashMap::new();
+    for (market_slug, (yes_id, no_id)) in by_slug {
+        let (Some(yes_id), Some(no_id)) = (yes_id, no_id) else {
+            continue;
+        };
+        markets.insert(
+            market_slug.clone(),
+            SlugMarketIds {
+                condition_id: market_slug,
+                yes_id,
+                no_id,
+            },
+        );
+    }
+    markets
+}
+
+fn market_slug_from_symbol(symbol: &str) -> String {
+    symbol
+        .strip_suffix("-YES")
+        .or_else(|| symbol.strip_suffix("-NO"))
+        .unwrap_or(symbol)
+        .to_string()
+}
+
+/// Assigns discovered LightPool markets to configured slugs.
+pub fn assign_lightpool_markets_to_slugs(
+    slugs: &[String],
+    discovered: &AHashMap<String, SlugMarketIds>,
+    slug_markets: &mut AHashMap<String, SlugMarketIds>,
+) -> usize {
+    let mut new_count = 0;
+    for slug in slugs {
+        let Some(market) = discovered.get(slug) else {
+            continue;
+        };
+        if slug_markets.insert(slug.clone(), market.clone()).is_none() {
+            new_count += 1;
+        }
+    }
+    new_count
 }
 
 /// Assigns discovered markets to configured event slugs.

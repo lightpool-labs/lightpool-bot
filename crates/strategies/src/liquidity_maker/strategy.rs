@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Liquidity maker strategy: subscribe Polymarket book deltas and read books from cache.
+//! Liquidity maker strategy: subscribe Polymarket + LightPool book deltas and read cache books.
 
 use std::fmt::Debug;
 use std::num::NonZeroUsize;
@@ -24,27 +24,36 @@ use nautilus_model::{
     data::OrderBookDeltas,
     enums::BookType,
     identifiers::InstrumentId,
+    instruments::{Instrument, InstrumentAny},
     orderbook::OrderBook,
 };
 use nautilus_trading::{nautilus_strategy, strategy::StrategyCore};
 
 use super::config::LiquidityMakerConfig;
-use super::markets::{SlugMarketIds, assign_markets_to_slugs, discover_markets_from_cache};
+use super::markets::{
+    SlugMarketIds, assign_lightpool_markets_to_slugs, assign_markets_to_slugs,
+    discover_lightpool_markets_from_cache, discover_markets_from_cache,
+};
 
-/// Subscribes to Polymarket `OrderBookDeltas` and reads the managed book from cache.
+const POLYMARKET_VENUE: &str = "POLYMARKET";
+const LIGHTPOOL_VENUE: &str = "LIGHTPOOL";
+
+/// Subscribes to Polymarket and LightPool `OrderBookDeltas` and reads managed books from cache.
 ///
 /// Requires `managed_book = true` so the data engine `BookUpdater` maintains
 /// `cache.order_book()` while deltas stream in.
 pub struct LiquidityMaker {
     pub(super) core: StrategyCore,
     pub(super) config: LiquidityMakerConfig,
-    /// Event slug -> condition_id -> YES/NO instrument ids.
+    /// Event slug -> condition_id -> YES/NO instrument ids (Polymarket).
     pub(super) slug_markets: AHashMap<String, AHashMap<String, SlugMarketIds>>,
-    /// Event slug -> condition ids discovered for that slug.
+    /// Event slug -> condition ids discovered for that slug (Polymarket).
     pub(super) slug_to_conditions: AHashMap<String, AHashSet<String>>,
-    /// condition_id -> YES/NO instrument ids.
+    /// condition_id -> YES/NO instrument ids (Polymarket).
     pub(super) markets: AHashMap<String, SlugMarketIds>,
-    pub(super) instrument_to_condition: AHashMap<InstrumentId, String>,
+    /// market_slug -> YES/NO instrument ids (LightPool).
+    pub(super) lightpool_markets: AHashMap<String, SlugMarketIds>,
+    pub(super) instrument_to_market_key: AHashMap<InstrumentId, String>,
     pub(super) subscribed_instruments: AHashSet<InstrumentId>,
     pub(super) delta_batches: AHashMap<InstrumentId, u64>,
 }
@@ -59,13 +68,14 @@ impl LiquidityMaker {
             slug_markets: AHashMap::new(),
             slug_to_conditions: AHashMap::new(),
             markets: AHashMap::new(),
-            instrument_to_condition: AHashMap::new(),
+            lightpool_markets: AHashMap::new(),
+            instrument_to_market_key: AHashMap::new(),
             subscribed_instruments: AHashSet::new(),
             delta_batches: AHashMap::new(),
         }
     }
 
-    fn sync_markets_from_cache(&mut self) -> usize {
+    fn sync_polymarket_markets_from_cache(&mut self) -> usize {
         let discovered = discover_markets_from_cache(&self.cache());
         for (condition_id, market) in &discovered {
             self.markets
@@ -73,11 +83,57 @@ impl LiquidityMaker {
                 .or_insert_with(|| market.clone());
         }
         assign_markets_to_slugs(
-            &self.config.slugs,
+            &self.config.polymarket_slugs,
             &discovered,
             &mut self.slug_markets,
             &mut self.slug_to_conditions,
         )
+    }
+
+    fn sync_lightpool_markets_from_cache(&mut self) -> usize {
+        if !self.config.lightpool_enabled {
+            return 0;
+        }
+        let discovered = discover_lightpool_markets_from_cache(&self.cache());
+        assign_lightpool_markets_to_slugs(
+            &self.config.lightpool_slugs,
+            &discovered,
+            &mut self.lightpool_markets,
+        )
+    }
+
+    fn sync_markets_from_cache(&mut self) -> usize {
+        self.sync_polymarket_markets_from_cache() + self.sync_lightpool_markets_from_cache()
+    }
+
+    fn subscribe_market(
+        &mut self,
+        market: &SlugMarketIds,
+        depth: NonZeroUsize,
+        venue_label: &str,
+    ) {
+        for instrument_id in [market.yes_id, market.no_id] {
+            if self.subscribed_instruments.contains(&instrument_id) {
+                continue;
+            }
+            self.subscribe_book_deltas(
+                instrument_id,
+                BookType::L2_MBP,
+                Some(depth),
+                None,
+                true,
+                None,
+            );
+            self.instrument_to_market_key
+                .insert(instrument_id, market.condition_id.clone());
+            self.subscribed_instruments.insert(instrument_id);
+            log::info!(
+                "Subscribed to {venue_label} order book deltas instrument_id={instrument_id} \
+                 market_key={} depth={}",
+                market.condition_id,
+                self.config.depth,
+            );
+        }
     }
 
     fn reconcile_subscriptions(&mut self) {
@@ -85,29 +141,16 @@ impl LiquidityMaker {
             return;
         };
 
-        let markets: Vec<SlugMarketIds> = self.markets.values().cloned().collect();
-        for market in markets {
-            for instrument_id in [market.yes_id, market.no_id] {
-                if self.subscribed_instruments.contains(&instrument_id) {
-                    continue;
-                }
-                self.subscribe_book_deltas(
-                    instrument_id,
-                    BookType::L2_MBP,
-                    Some(depth),
-                    None,
-                    true,
-                    None,
-                );
-                self.instrument_to_condition
-                    .insert(instrument_id, market.condition_id.clone());
-                self.subscribed_instruments.insert(instrument_id);
-                log::info!(
-                    "Subscribed to Polymarket order book deltas instrument_id={instrument_id} \
-                     condition_id={} depth={}",
-                    market.condition_id,
-                    self.config.depth,
-                );
+        let polymarket_markets: Vec<SlugMarketIds> = self.markets.values().cloned().collect();
+        for market in polymarket_markets {
+            self.subscribe_market(&market, depth, "Polymarket");
+        }
+
+        if self.config.lightpool_enabled {
+            let lightpool_markets: Vec<SlugMarketIds> =
+                self.lightpool_markets.values().cloned().collect();
+            for market in lightpool_markets {
+                self.subscribe_market(&market, depth, "Lightpool");
             }
         }
     }
@@ -124,22 +167,35 @@ impl LiquidityMaker {
             })
     }
 
+    fn venue_label(instrument_id: InstrumentId) -> &'static str {
+        match instrument_id.venue.as_str() {
+            POLYMARKET_VENUE => "Polymarket",
+            LIGHTPOOL_VENUE => "Lightpool",
+            _ => "Unknown",
+        }
+    }
+
     fn log_cache_book(&self, instrument_id: InstrumentId, batch: u64) {
-        let condition_id = self
-            .instrument_to_condition
+        let venue_label = Self::venue_label(instrument_id);
+        let market_key = self
+            .instrument_to_market_key
             .get(&instrument_id)
             .map(String::as_str)
             .unwrap_or("unknown");
-        let slug = self
-            .slug_for_condition(condition_id)
-            .unwrap_or("unknown");
+        let slug = if instrument_id.venue.as_str() == LIGHTPOOL_VENUE {
+            market_key
+        } else {
+            self.slug_for_condition(market_key)
+                .unwrap_or("unknown")
+        };
 
         let snapshot = {
             let cache = self.cache();
             let Some(book) = cache.order_book(&instrument_id) else {
                 log::warn!(
-                    "cache.order_book() is None for slug={slug} condition_id={condition_id} \
-                     instrument_id={instrument_id} batch={batch}; ensure managed_book=true"
+                    "cache.order_book() is None for venue={venue_label} slug={slug} \
+                     market_key={market_key} instrument_id={instrument_id} batch={batch}; \
+                     ensure managed_book=true"
                 );
                 return;
             };
@@ -153,7 +209,7 @@ impl LiquidityMaker {
         };
 
         log::info!(
-            "Polymarket cache order book slug={slug} condition_id={condition_id} \
+            "{venue_label} cache order book slug={slug} market_key={market_key} \
              instrument_id={instrument_id} batch={batch} sequence={} update_count={} \
              bids=[{}] asks=[{}]",
             snapshot.0,
@@ -163,8 +219,32 @@ impl LiquidityMaker {
         );
     }
 
+    fn venue_logging_enabled(&self, instrument_id: InstrumentId) -> bool {
+        match instrument_id.venue.as_str() {
+            POLYMARKET_VENUE => self.config.log_polymarket,
+            LIGHTPOOL_VENUE => true,
+            _ => true,
+        }
+    }
+
     fn should_log(&self, batch: u64) -> bool {
+        if batch == 1 {
+            return true;
+        }
         self.config.log_interval > 0 && batch.is_multiple_of(self.config.log_interval)
+    }
+
+    fn warn_missing_lightpool_markets(&self) {
+        if !self.config.lightpool_enabled || !self.lightpool_markets.is_empty() {
+            return;
+        }
+        let discovered = discover_lightpool_markets_from_cache(&self.cache());
+        log::warn!(
+            "No LightPool markets matched lightpool_slugs={:?}; \
+             available_lightpool_slugs_in_cache={:?}",
+            self.config.lightpool_slugs,
+            discovered.keys().collect::<Vec<_>>(),
+        );
     }
 }
 
@@ -191,9 +271,11 @@ nautilus_strategy!(LiquidityMaker);
 impl Debug for LiquidityMaker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(LiquidityMaker))
-            .field("slugs", &self.config.slugs)
+            .field("polymarket_slugs", &self.config.polymarket_slugs)
+            .field("lightpool_slugs", &self.config.lightpool_slugs)
             .field("depth", &self.config.depth)
-            .field("markets", &self.markets.len())
+            .field("polymarket_markets", &self.markets.len())
+            .field("lightpool_markets", &self.lightpool_markets.len())
             .finish()
     }
 }
@@ -206,11 +288,34 @@ impl DataActor for LiquidityMaker {
 
         let synced = self.sync_markets_from_cache();
         log::info!(
-            "LiquidityMaker started slugs={:?} synced_markets={synced} total_markets={}",
-            self.config.slugs,
+            "LiquidityMaker started polymarket_slugs={:?} lightpool_slugs={:?} \
+             synced_markets={synced} polymarket_markets={} lightpool_markets={} \
+             lightpool_enabled={}",
+            self.config.polymarket_slugs,
+            self.config.lightpool_slugs,
             self.markets.len(),
+            self.lightpool_markets.len(),
+            self.config.lightpool_enabled,
         );
         self.reconcile_subscriptions();
+        self.warn_missing_lightpool_markets();
+        Ok(())
+    }
+
+    fn on_instrument(&mut self, instrument: &InstrumentAny) -> anyhow::Result<()> {
+        let instrument_id = instrument.id();
+        let venue = instrument_id.venue.as_str();
+        if venue != POLYMARKET_VENUE && venue != LIGHTPOOL_VENUE {
+            return Ok(());
+        }
+        self.sync_markets_from_cache();
+        self.reconcile_subscriptions();
+        if venue == LIGHTPOOL_VENUE {
+            log::debug!(
+                "LightPool instrument loaded instrument_id={instrument_id} lightpool_markets={}",
+                self.lightpool_markets.len(),
+            );
+        }
         Ok(())
     }
 
@@ -222,11 +327,14 @@ impl DataActor for LiquidityMaker {
     }
 
     fn on_book_deltas(&mut self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
-        if self.sync_markets_from_cache() > 0 {
-            self.reconcile_subscriptions();
-        }
+        self.sync_markets_from_cache();
+        self.reconcile_subscriptions();
 
         let instrument_id = deltas.instrument_id;
+        if !self.venue_logging_enabled(instrument_id) {
+            return Ok(());
+        }
+
         let batch = {
             let count = self
                 .delta_batches
