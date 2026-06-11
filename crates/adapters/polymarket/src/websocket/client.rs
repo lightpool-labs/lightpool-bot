@@ -104,6 +104,7 @@ impl WsSubscriptionHandle {
 pub struct PolymarketWebSocketClient {
     channel: WsChannel,
     url: String,
+    proxy_url: Option<String>,
     connection_mode: Arc<AtomicU8>,
     signal: Arc<AtomicBool>,
     cmd_tx: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>>,
@@ -129,10 +130,22 @@ impl PolymarketWebSocketClient {
         subscribe_new_markets: bool,
         transport_backend: TransportBackend,
     ) -> Self {
+        Self::new_market_with_proxy(base_url, None, subscribe_new_markets, transport_backend)
+    }
+
+    /// Creates a new market-channel client with an optional WebSocket proxy.
+    #[must_use]
+    pub fn new_market_with_proxy(
+        base_url: Option<String>,
+        proxy_url: Option<String>,
+        subscribe_new_markets: bool,
+        transport_backend: TransportBackend,
+    ) -> Self {
         let url = base_url.unwrap_or_else(|| clob_ws_market_url().to_string());
         Self::new_inner(
             WsChannel::Market,
             url,
+            proxy_url,
             None,
             subscribe_new_markets,
             transport_backend,
@@ -152,6 +165,7 @@ impl PolymarketWebSocketClient {
         Self::new_inner(
             WsChannel::User,
             url,
+            None,
             Some(credential),
             false,
             transport_backend,
@@ -161,6 +175,7 @@ impl PolymarketWebSocketClient {
     fn new_inner(
         channel: WsChannel,
         url: String,
+        proxy_url: Option<String>,
         credential: Option<Credential>,
         subscribe_new_markets: bool,
         transport_backend: TransportBackend,
@@ -169,6 +184,7 @@ impl PolymarketWebSocketClient {
         Self {
             channel,
             url,
+            proxy_url,
             connection_mode: Arc::new(AtomicU8::new(ConnectionMode::Closed.as_u8())),
             signal: Arc::new(AtomicBool::new(false)),
             cmd_tx: Arc::new(tokio::sync::RwLock::new(placeholder_tx)),
@@ -208,7 +224,7 @@ impl PolymarketWebSocketClient {
             reconnect_max_attempts: None,
             idle_timeout_ms: Some(idle_timeout_ms_for(self.channel)),
             backend: self.transport_backend,
-            proxy_url: None,
+            proxy_url: self.proxy_url.clone(),
         };
 
         let client =

@@ -45,6 +45,7 @@ members = [
   "crates/system",
   "crates/testkit",
   "crates/trading",
+  "crates/strategies",
 ]
 
 [workspace.package]
@@ -91,6 +92,7 @@ nautilus-serialization = { path = "crates/serialization", version = "0.58.0" }
 nautilus-system = { path = "crates/system", version = "0.58.0" }
 nautilus-testkit = { path = "crates/testkit", version = "0.58.0" }
 nautilus-trading = { path = "crates/trading", version = "0.58.0" }
+lightpool-strategies = { path = "crates/strategies", version = "0.58.0" }
 
 # -----------------------------------------------------------------------------
 # Adapters

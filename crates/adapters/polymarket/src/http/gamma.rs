@@ -70,6 +70,19 @@ impl PolymarketGammaRawHttpClient {
     ///
     /// Returns an error if the HTTP client cannot be created.
     pub fn new(base_url: Option<String>, timeout_secs: u64) -> StdResult<Self, HttpClientError> {
+        Self::new_with_proxy(base_url, None, timeout_secs)
+    }
+
+    /// Creates a new [`PolymarketGammaRawHttpClient`] with an optional HTTP proxy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be created.
+    pub fn new_with_proxy(
+        base_url: Option<String>,
+        proxy_url: Option<String>,
+        timeout_secs: u64,
+    ) -> StdResult<Self, HttpClientError> {
         Ok(Self {
             client: HttpClient::new(
                 Self::default_headers(),
@@ -77,7 +90,7 @@ impl PolymarketGammaRawHttpClient {
                 vec![],
                 Some(*POLYMARKET_GAMMA_REST_QUOTA),
                 Some(timeout_secs),
-                None,
+                proxy_url,
             )?,
             base_url: base_url
                 .unwrap_or_else(|| gamma_api_url().to_string())
@@ -351,9 +364,24 @@ impl PolymarketGammaHttpClient {
         timeout_secs: u64,
         retry_config: RetryConfig,
     ) -> StdResult<Self, HttpClientError> {
+        Self::new_with_proxy(gamma_base_url, None, timeout_secs, retry_config)
+    }
+
+    /// Creates a new [`PolymarketGammaHttpClient`] with an optional HTTP proxy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying HTTP client cannot be created.
+    pub fn new_with_proxy(
+        gamma_base_url: Option<String>,
+        proxy_url: Option<String>,
+        timeout_secs: u64,
+        retry_config: RetryConfig,
+    ) -> StdResult<Self, HttpClientError> {
         Ok(Self {
-            inner: Arc::new(PolymarketGammaRawHttpClient::new(
+            inner: Arc::new(PolymarketGammaRawHttpClient::new_with_proxy(
                 gamma_base_url,
+                proxy_url,
                 timeout_secs,
             )?),
             clock: get_atomic_clock_realtime(),

@@ -83,8 +83,9 @@ impl DataClientFactory for PolymarketDataClientFactory {
 
         let client_id = ClientId::from(name);
 
-        let gamma_client = PolymarketGammaHttpClient::new(
+        let gamma_client = PolymarketGammaHttpClient::new_with_proxy(
             Some(polymarket_config.gamma_url()),
+            polymarket_config.proxy_url(),
             polymarket_config.http_timeout_secs,
             RetryConfig {
                 max_retries: 10,
@@ -98,18 +99,21 @@ impl DataClientFactory for PolymarketDataClientFactory {
             },
         )?;
 
-        let clob_public_client = PolymarketClobPublicClient::new(
+        let clob_public_client = PolymarketClobPublicClient::new_with_proxy(
             polymarket_config.base_url_http.clone(),
+            polymarket_config.proxy_url(),
             polymarket_config.http_timeout_secs,
         )?;
 
-        let data_api_client = PolymarketDataApiHttpClient::new(
+        let data_api_client = PolymarketDataApiHttpClient::new_with_proxy(
             Some(polymarket_config.data_api_url()),
+            polymarket_config.proxy_url(),
             polymarket_config.http_timeout_secs,
         )?;
 
-        let ws_client = PolymarketWebSocketClient::new_market(
+        let ws_client = PolymarketWebSocketClient::new_market_with_proxy(
             polymarket_config.base_url_ws.clone(),
+            polymarket_config.proxy_url(),
             polymarket_config.subscribe_new_markets,
             polymarket_config.transport_backend,
         );

@@ -5103,6 +5103,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "lightpool-strategies"
+version = "0.58.0"
+dependencies = [
+ "ahash 0.8.12",
+ "anyhow",
+ "clap",
+ "dotenvy",
+ "log",
+ "nautilus-common",
+ "nautilus-core",
+ "nautilus-live",
+ "nautilus-model",
+ "nautilus-polymarket",
+ "nautilus-trading",
+ "tokio",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

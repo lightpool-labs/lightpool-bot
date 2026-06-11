@@ -26,6 +26,32 @@ use crate::{
     filters::InstrumentFilter,
 };
 
+fn nonempty_env(var: &str) -> Option<String> {
+    std::env::var(var)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Resolves an HTTP/WebSocket proxy URL from standard environment variables.
+#[must_use]
+pub fn proxy_url_from_env() -> Option<String> {
+    nonempty_env("HTTPS_PROXY")
+        .or_else(|| nonempty_env("https_proxy"))
+        .or_else(|| nonempty_env("HTTP_PROXY"))
+        .or_else(|| nonempty_env("http_proxy"))
+        .or_else(|| nonempty_env("ALL_PROXY"))
+        .or_else(|| nonempty_env("all_proxy"))
+}
+
+fn resolve_proxy_url(configured: &Option<String>) -> Option<String> {
+    configured
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(proxy_url_from_env)
+}
+
 /// Configuration for the Polymarket instrument provider.
 ///
 /// This mirrors the Python adapter's `instrument_config` layering so scoped
@@ -124,6 +150,7 @@ pub struct PolymarketDataClientConfig {
     pub base_url_ws: Option<String>,
     pub base_url_gamma: Option<String>,
     pub base_url_data_api: Option<String>,
+    pub proxy_url: Option<String>,
     /// HTTP timeout in seconds.
     #[builder(default = 60)]
     pub http_timeout_secs: u64,
@@ -228,6 +255,11 @@ impl PolymarketDataClientConfig {
         self.base_url_data_api
             .clone()
             .unwrap_or_else(|| "https://data-api.polymarket.com".to_string())
+    }
+
+    #[must_use]
+    pub fn proxy_url(&self) -> Option<String> {
+        resolve_proxy_url(&self.proxy_url)
     }
 }
 

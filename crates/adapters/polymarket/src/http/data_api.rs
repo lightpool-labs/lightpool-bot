@@ -84,6 +84,19 @@ impl PolymarketDataApiHttpClient {
     ///
     /// Returns an error if the HTTP client cannot be created.
     pub fn new(base_url: Option<String>, timeout_secs: u64) -> StdResult<Self, HttpClientError> {
+        Self::new_with_proxy(base_url, None, timeout_secs)
+    }
+
+    /// Creates a new [`PolymarketDataApiHttpClient`] with an optional HTTP proxy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be created.
+    pub fn new_with_proxy(
+        base_url: Option<String>,
+        proxy_url: Option<String>,
+        timeout_secs: u64,
+    ) -> StdResult<Self, HttpClientError> {
         Ok(Self {
             client: HttpClient::new(
                 HashMap::from([
@@ -94,7 +107,7 @@ impl PolymarketDataApiHttpClient {
                 vec![],
                 None,
                 Some(timeout_secs),
-                None,
+                proxy_url,
             )?,
             base_url: base_url
                 .unwrap_or_else(|| POLYMARKET_DATA_API_URL.to_string())
