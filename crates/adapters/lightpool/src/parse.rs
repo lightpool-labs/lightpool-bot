@@ -13,7 +13,8 @@ use ustr::Ustr;
 
 use crate::{
     common::{
-        consts::{LIGHTPOOL_VENUE, MAX_PRICE, MIN_PRICE, PRICE_TICK},
+        amounts::raw_to_decimal,
+        consts::{LIGHTPOOL_VENUE, MAX_PRICE, MIN_PRICE},
         currency::collateral_currency,
     },
     http::models::{BookLevel, BookSnapshot, Market},
@@ -39,6 +40,7 @@ pub fn create_instrument(
     market: &Market,
     outcome: LightpoolOutcome,
     spot_market: &str,
+    tick_size_raw: u64,
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
     let suffix = match outcome {
@@ -49,7 +51,9 @@ pub fn create_instrument(
     let instrument_id = InstrumentId::new(symbol, *LIGHTPOOL_VENUE);
     let raw_symbol = Symbol::new(spot_market);
     let currency = collateral_currency();
-    let price_increment = Price::from(PRICE_TICK);
+    let price_increment = Price::from_decimal_dp(raw_to_decimal(tick_size_raw), 6)
+        .map_err(|e| anyhow::anyhow!("invalid tick size {tick_size_raw}: {e}"))?;
+    let price_precision = price_increment.precision;
     let size_increment = Quantity::from("0.000001");
 
     let outcome_token = match outcome {
@@ -57,6 +61,10 @@ pub fn create_instrument(
         LightpoolOutcome::No => market.no_token.as_str(),
     };
     let mut info = Params::new();
+    info.insert(
+        "tick_size_raw".to_string(),
+        serde_json::Value::from(tick_size_raw),
+    );
     info.insert(
         "market_slug".to_string(),
         serde_json::Value::String(market.slug.clone()),
@@ -93,7 +101,7 @@ pub fn create_instrument(
         currency,
         UnixNanos::default(),
         UnixNanos::from((market.resolution_deadline as u64) * 1_000_000_000),
-        2,
+        price_precision,
         6,
         price_increment,
         size_increment,
@@ -117,25 +125,40 @@ pub fn create_instrument(
     Ok(InstrumentAny::BinaryOption(binary_option))
 }
 
-pub fn instruments_for_market(market: &Market, ts_init: UnixNanos) -> anyhow::Result<Vec<InstrumentAny>> {
-    Ok(vec![
-        create_instrument(market, LightpoolOutcome::Yes, &market.yes_spot_market, ts_init)?,
-        create_instrument(market, LightpoolOutcome::No, &market.no_spot_market, ts_init)?,
-    ])
-}
-
 fn cents_to_decimal(price: &str) -> anyhow::Result<Decimal> {
-    let cents: u64 = price
-        .trim()
-        .parse()
+    let value = Decimal::from_str(price.trim())
         .map_err(|e| anyhow::anyhow!("invalid cents price '{price}': {e}"))?;
-    Ok(Decimal::from(cents) / Decimal::from(100))
+    Ok(value / Decimal::from(100))
 }
 
 fn parse_price(price: &str) -> anyhow::Result<Price> {
     let value = cents_to_decimal(price)?;
-    Price::from_decimal_dp(value, 2)
+    Price::from_decimal_dp(value, 6)
         .map_err(|e| anyhow::anyhow!("invalid price '{price}': {e}"))
+}
+
+pub fn instruments_for_market(
+    market: &Market,
+    yes_tick_size_raw: u64,
+    no_tick_size_raw: u64,
+    ts_init: UnixNanos,
+) -> anyhow::Result<Vec<InstrumentAny>> {
+    Ok(vec![
+        create_instrument(
+            market,
+            LightpoolOutcome::Yes,
+            &market.yes_spot_market,
+            yes_tick_size_raw,
+            ts_init,
+        )?,
+        create_instrument(
+            market,
+            LightpoolOutcome::No,
+            &market.no_spot_market,
+            no_tick_size_raw,
+            ts_init,
+        )?,
+    ])
 }
 
 fn parse_quantity(size: &str) -> anyhow::Result<Quantity> {

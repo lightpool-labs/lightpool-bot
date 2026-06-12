@@ -4,14 +4,14 @@ use std::sync::{
 
 use async_trait::async_trait;
 use lightpool_sdk::{
-    spot_events::extract_order_id_from_events, ActionBuilder, CancelOrderParams, LightPoolClient,
+    spot_events::extract_order_id_from_events, ActionBuilder, CancelOrderParams,
     OrderParamsType, OrderSide, PlaceOrderParams, Signer, TimeInForce, TransactionBuilder,
-    parse_token_contract, TOKEN_SCALE,
+    UpdateOrderParams, parse_token_contract,
 };
 use nautilus_common::{
     clients::ExecutionClient,
     live::{get_runtime, runner::get_exec_event_sender},
-    messages::execution::{CancelOrder, SubmitOrder},
+    messages::execution::{CancelOrder, ModifyOrder, SubmitOrder},
 };
 use nautilus_core::{Params, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
@@ -23,21 +23,24 @@ use nautilus_model::{
     orders::{Order, OrderAny},
     types::{AccountBalance, MarginBalance, Money},
 };
-use rust_decimal::prelude::ToPrimitive;
 
 use crate::{
     common::{
+        amounts::{
+            decimal_to_raw_amount, probability_to_limit_price, tick_size_from_instrument_info,
+        },
         currency::collateral_currency_code,
         signer::signer_from_private_key,
     },
     config::LightpoolExecClientConfig,
+    http::clob_index::ClobIndexHttpClient,
 };
 
 pub struct LightpoolExecutionClient {
     core: ExecutionClientCore,
     emitter: ExecutionEventEmitter,
     config: LightpoolExecClientConfig,
-    rpc_client: LightPoolClient,
+    clob_client: ClobIndexHttpClient,
     private_key: Option<String>,
     is_stopped: AtomicBool,
 }
@@ -67,7 +70,7 @@ impl LightpoolExecutionClient {
             core.account_type,
             core.base_currency,
         );
-        let rpc_client = LightPoolClient::new(config.node_rpc_url.clone());
+        let clob_client = ClobIndexHttpClient::new(config.clob_index_http_url.clone());
         let private_key = config
             .resolved_private_key()
             .ok()
@@ -78,7 +81,7 @@ impl LightpoolExecutionClient {
             core,
             emitter,
             config,
-            rpc_client,
+            clob_client,
             private_key,
             is_stopped: AtomicBool::new(false),
         })
@@ -112,7 +115,7 @@ impl LightpoolExecutionClient {
 
         let spot_market = instrument.raw_symbol().to_string();
         let emitter = self.emitter.clone();
-        let rpc_client = self.rpc_client.clone();
+        let clob_client = self.clob_client.clone();
         let ts_event = self.ts_event();
 
         self.emitter.emit_order_submitted(&order);
@@ -125,8 +128,8 @@ impl LightpoolExecutionClient {
                     return;
                 }
             };
-            match submit_limit_order_on_chain(
-                &rpc_client,
+            match submit_limit_order_via_index(
+                &clob_client,
                 &signer,
                 &instrument,
                 &order,
@@ -154,8 +157,8 @@ fn instrument_info(instrument: &InstrumentAny) -> Option<&Params> {
     }
 }
 
-async fn submit_limit_order_on_chain(
-    rpc_client: &LightPoolClient,
+async fn submit_limit_order_via_index(
+    clob_client: &ClobIndexHttpClient,
     signer: &Signer,
     instrument: &InstrumentAny,
     order: &OrderAny,
@@ -167,20 +170,11 @@ async fn submit_limit_order_on_chain(
 
     let price_decimal = order.price().map(|p| p.as_decimal());
     let price_decimal = price_decimal.ok_or_else(|| anyhow::anyhow!("limit order missing price"))?;
-    let cents = (price_decimal * rust_decimal::Decimal::from(100))
-        .round()
-        .to_u64()
-        .ok_or_else(|| anyhow::anyhow!("invalid order price"))?;
-    if cents > 100 {
-        anyhow::bail!("price must be between 0 and 1");
-    }
-    let limit_price = (cents * TOKEN_SCALE) / 100;
+    let tick_size = tick_size_from_instrument_info(instrument_info(instrument));
+    let limit_price = probability_to_limit_price(price_decimal, tick_size)?;
 
     let size_decimal = order.quantity().as_decimal();
-    let amount = (size_decimal * rust_decimal::Decimal::from(TOKEN_SCALE))
-        .round()
-        .to_u64()
-        .ok_or_else(|| anyhow::anyhow!("invalid order size"))?;
+    let amount = decimal_to_raw_amount(size_decimal)?;
     if amount == 0 {
         anyhow::bail!("order size must be greater than 0");
     }
@@ -226,7 +220,7 @@ async fn submit_limit_order_on_chain(
         .add_action(action)
         .build_and_sign_only(signer)?;
 
-    let response = rpc_client.submit_transaction(tx).await?;
+    let response = clob_client.submit_transaction(tx).await?;
     if !response.receipt.is_success() {
         anyhow::bail!("place_order failed: {:?}", response.receipt.status);
     }
@@ -300,8 +294,9 @@ impl ExecutionClient for LightpoolExecutionClient {
             Some(private_key) => match signer_from_private_key(private_key) {
                 Ok(signer) => {
                     log::info!(
-                        "Lightpool execution client signer address={}",
-                        signer.address()
+                        "Lightpool execution client signer address={} clob_index={}",
+                        signer.address(),
+                        self.config.clob_index_http_url,
                     );
                 }
                 Err(e) => log::warn!("Lightpool execution client invalid private key: {e:#}"),
@@ -366,7 +361,7 @@ impl ExecutionClient for LightpoolExecutionClient {
             .as_str()
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid venue order id: {e}"))?;
-        let rpc_client = self.rpc_client.clone();
+        let clob_client = self.clob_client.clone();
         let emitter = self.emitter.clone();
         let ts_event = self.ts_event();
 
@@ -383,7 +378,8 @@ impl ExecutionClient for LightpoolExecutionClient {
                     return;
                 }
             };
-            match cancel_order_on_chain(&rpc_client, &signer, &spot_market, chain_order_id).await {
+            match cancel_order_via_index(&clob_client, &signer, &spot_market, chain_order_id).await
+            {
                 Ok(()) => emitter.emit_order_canceled(&order, Some(venue_order_id), ts_event),
                 Err(e) => emitter.emit_order_cancel_rejected(
                     &order,
@@ -395,10 +391,99 @@ impl ExecutionClient for LightpoolExecutionClient {
         });
         Ok(())
     }
+
+    fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
+        let private_key = self
+            .private_key
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("LIGHTPOOL_PRIVATE_KEY not configured"))?;
+        let order = self
+            .core
+            .cache()
+            .order(&cmd.client_order_id)
+            .ok_or_else(|| anyhow::anyhow!("order not found: {}", cmd.client_order_id))?
+            .clone();
+
+        if cmd.price.is_some() {
+            self.emitter.emit_order_modify_rejected(
+                &order,
+                cmd.venue_order_id,
+                "LightPool update_order only supports quantity changes",
+                self.ts_event(),
+            );
+            return Ok(());
+        }
+
+        let Some(new_quantity) = cmd.quantity else {
+            return Ok(());
+        };
+
+        let venue_order_id = order
+            .venue_order_id()
+            .or(cmd.venue_order_id)
+            .ok_or_else(|| anyhow::anyhow!("order has no venue order id"))?;
+        let instrument = self
+            .core
+            .cache()
+            .instrument(&order.instrument_id())
+            .ok_or_else(|| anyhow::anyhow!("instrument not found"))?
+            .clone();
+        let spot_market = instrument.raw_symbol().to_string();
+        let chain_order_id: u64 = venue_order_id
+            .as_str()
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid venue order id: {e}"))?;
+        let clob_client = self.clob_client.clone();
+        let emitter = self.emitter.clone();
+        let ts_event = self.ts_event();
+
+        get_runtime().spawn(async move {
+            let signer = match signer_from_private_key(&private_key) {
+                Ok(signer) => signer,
+                Err(e) => {
+                    emitter.emit_order_modify_rejected(
+                        &order,
+                        Some(venue_order_id),
+                        &format!("invalid signer: {e:#}"),
+                        ts_event,
+                    );
+                    return;
+                }
+            };
+            match update_order_via_index(
+                &clob_client,
+                &signer,
+                &instrument,
+                &order,
+                &spot_market,
+                chain_order_id,
+                new_quantity,
+            )
+            .await
+            {
+                Ok(()) => emitter.emit_order_updated(
+                    &order,
+                    venue_order_id,
+                    new_quantity,
+                    None,
+                    None,
+                    None,
+                    ts_event,
+                ),
+                Err(e) => emitter.emit_order_modify_rejected(
+                    &order,
+                    Some(venue_order_id),
+                    &e.to_string(),
+                    ts_event,
+                ),
+            }
+        });
+        Ok(())
+    }
 }
 
-async fn cancel_order_on_chain(
-    rpc_client: &LightPoolClient,
+async fn cancel_order_via_index(
+    clob_client: &ClobIndexHttpClient,
     signer: &Signer,
     spot_market: &str,
     chain_order_id: u64,
@@ -414,9 +499,71 @@ async fn cancel_order_on_chain(
         .expiration(u64::MAX)
         .add_action(action)
         .build_and_sign_only(signer)?;
-    let response = rpc_client.submit_transaction(tx).await?;
+    let response = clob_client.submit_transaction(tx).await?;
     if !response.receipt.is_success() {
         anyhow::bail!("cancel_order failed: {:?}", response.receipt.status);
+    }
+    Ok(())
+}
+
+fn token_address_for_order(
+    instrument: &InstrumentAny,
+    order: &OrderAny,
+    spot_market_str: &str,
+) -> anyhow::Result<lightpool_sdk::ContractAddress> {
+    let side = order.order_side();
+    let info = instrument_info(instrument);
+    let spot_market_display = spot_market_str.to_string();
+
+    if side == NautilusOrderSide::Buy {
+        let collateral = info
+            .and_then(|params| params.get("collateral_token"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        parse_token_contract(collateral)
+            .or_else(|_| parse_token_contract(&spot_market_display))
+            .map_err(|e| anyhow::anyhow!("missing collateral token for buy order: {e}"))
+    } else {
+        let outcome_token = info
+            .and_then(|params| params.get("outcome_token"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(&spot_market_display);
+        parse_token_contract(outcome_token)
+            .map_err(|e| anyhow::anyhow!("missing outcome token for sell order: {e}"))
+    }
+}
+
+async fn update_order_via_index(
+    clob_client: &ClobIndexHttpClient,
+    signer: &Signer,
+    instrument: &InstrumentAny,
+    order: &OrderAny,
+    spot_market_str: &str,
+    chain_order_id: u64,
+    new_quantity: nautilus_model::types::Quantity,
+) -> anyhow::Result<()> {
+    let spot_market = parse_token_contract(spot_market_str)
+        .map_err(|e| anyhow::anyhow!("invalid spot market: {e}"))?;
+    let amount = decimal_to_raw_amount(new_quantity.as_decimal())?;
+    if amount == 0 {
+        anyhow::bail!("order size must be greater than 0");
+    }
+
+    let token_address = token_address_for_order(instrument, order, spot_market_str)?;
+    let params = UpdateOrderParams {
+        order_id: chain_order_id,
+        amount,
+        token_address,
+    };
+    let action = ActionBuilder::update_order(spot_market, params)?;
+    let tx = TransactionBuilder::new()
+        .sender(signer.address())
+        .expiration(u64::MAX)
+        .add_action(action)
+        .build_and_sign_only(signer)?;
+    let response = clob_client.submit_transaction(tx).await?;
+    if !response.receipt.is_success() {
+        anyhow::bail!("update_order failed: {:?}", response.receipt.status);
     }
     Ok(())
 }

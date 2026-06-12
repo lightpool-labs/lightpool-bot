@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Liquidity maker strategy: subscribe Polymarket + LightPool book deltas and read cache books.
+//! Liquidity maker strategy: subscribe Polymarket book deltas and mirror onto LightPool via orders.
 
 use std::fmt::Debug;
 use std::num::NonZeroUsize;
@@ -23,6 +23,7 @@ use nautilus_common::actor::DataActor;
 use nautilus_model::{
     data::OrderBookDeltas,
     enums::BookType,
+    events::{OrderAccepted, OrderCanceled, OrderFilled, OrderUpdated},
     identifiers::InstrumentId,
     instruments::{Instrument, InstrumentAny},
     orderbook::OrderBook,
@@ -38,10 +39,10 @@ use super::markets::{
 const POLYMARKET_VENUE: &str = "POLYMARKET";
 const LIGHTPOOL_VENUE: &str = "LIGHTPOOL";
 
-/// Subscribes to Polymarket and LightPool `OrderBookDeltas` and reads managed books from cache.
+/// Subscribes to Polymarket `OrderBookDeltas` and mirrors depth onto LightPool using own orders.
 ///
 /// Requires `managed_book = true` so the data engine `BookUpdater` maintains
-/// `cache.order_book()` while deltas stream in.
+/// Polymarket `cache.order_book()` while deltas stream in.
 pub struct LiquidityMaker {
     pub(super) core: StrategyCore,
     pub(super) config: LiquidityMakerConfig,
@@ -149,12 +150,14 @@ impl LiquidityMaker {
             self.subscribe_market(&market, depth, "Polymarket");
         }
 
-        if self.config.lightpool_enabled {
-            let lightpool_markets: Vec<SlugMarketIds> =
-                self.lightpool_markets.values().cloned().collect();
-            for market in lightpool_markets {
-                self.subscribe_market(&market, depth, "Lightpool");
-            }
+    }
+
+    fn maybe_reconcile_lightpool(&mut self, instrument_id: InstrumentId) {
+        if !self.config.trading_enabled || instrument_id.venue.as_str() != LIGHTPOOL_VENUE {
+            return;
+        }
+        if let Err(e) = self.reconcile_from_lightpool_order_event(instrument_id) {
+            log::warn!("Failed to reconcile after LightPool order event {instrument_id}: {e:#}");
         }
     }
 
@@ -225,8 +228,8 @@ impl LiquidityMaker {
     fn venue_logging_enabled(&self, instrument_id: InstrumentId) -> bool {
         match instrument_id.venue.as_str() {
             POLYMARKET_VENUE => self.config.log_polymarket,
-            LIGHTPOOL_VENUE => true,
-            _ => true,
+            LIGHTPOOL_VENUE => false,
+            _ => false,
         }
     }
 
@@ -269,7 +272,15 @@ fn format_book_side(book: &OrderBook, bids: bool, depth: usize) -> String {
     }
 }
 
-nautilus_strategy!(LiquidityMaker);
+nautilus_strategy!(LiquidityMaker, {
+    fn on_order_accepted(&mut self, event: OrderAccepted) {
+        self.maybe_reconcile_lightpool(event.instrument_id);
+    }
+
+    fn on_order_updated(&mut self, event: OrderUpdated) {
+        self.maybe_reconcile_lightpool(event.instrument_id);
+    }
+});
 
 impl Debug for LiquidityMaker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -346,13 +357,11 @@ impl DataActor for LiquidityMaker {
         let instrument_id = deltas.instrument_id;
         let venue = instrument_id.venue.as_str();
 
-        if venue == POLYMARKET_VENUE {
-            if self.config.trading_enabled {
-                if let Err(e) = self.reconcile_from_polymarket_delta(instrument_id) {
-                    log::warn!(
-                        "Failed to reconcile LightPool liquidity for {instrument_id}: {e:#}"
-                    );
-                }
+        if venue == POLYMARKET_VENUE && self.config.trading_enabled {
+            if let Err(e) = self.reconcile_from_polymarket_delta(instrument_id) {
+                log::warn!(
+                    "Failed to reconcile LightPool liquidity for {instrument_id}: {e:#}"
+                );
             }
         }
 
@@ -373,6 +382,16 @@ impl DataActor for LiquidityMaker {
             self.log_cache_book(instrument_id, batch);
         }
 
+        Ok(())
+    }
+
+    fn on_order_canceled(&mut self, event: &OrderCanceled) -> anyhow::Result<()> {
+        self.maybe_reconcile_lightpool(event.instrument_id);
+        Ok(())
+    }
+
+    fn on_order_filled(&mut self, event: &OrderFilled) -> anyhow::Result<()> {
+        self.maybe_reconcile_lightpool(event.instrument_id);
         Ok(())
     }
 }

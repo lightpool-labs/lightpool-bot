@@ -2,8 +2,8 @@ use std::fmt::Debug;
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::consts::{
-    DEFAULT_CLOB_INDEX_HTTP, DEFAULT_CLOB_INDEX_WS, DEFAULT_NODE_RPC,
+use crate::common::{
+    consts::{DEFAULT_CLOB_INDEX_HTTP, DEFAULT_CLOB_INDEX_WS},
 };
 
 fn nonempty_env(var: &str) -> Option<String> {
@@ -21,11 +21,6 @@ pub fn clob_index_http_from_env() -> String {
 #[must_use]
 pub fn clob_index_ws_from_env() -> String {
     nonempty_env("LIGHTPOOL_CLOB_INDEX_WS").unwrap_or_else(|| DEFAULT_CLOB_INDEX_WS.into())
-}
-
-#[must_use]
-pub fn node_rpc_from_env() -> String {
-    nonempty_env("LIGHTPOOL_NODE_RPC").unwrap_or_else(|| DEFAULT_NODE_RPC.into())
 }
 
 #[must_use]
@@ -74,7 +69,6 @@ impl LightpoolDataClientConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LightpoolExecClientConfig {
-    pub node_rpc_url: String,
     pub clob_index_http_url: String,
     pub private_key: Option<String>,
 }
@@ -82,7 +76,6 @@ pub struct LightpoolExecClientConfig {
 impl Default for LightpoolExecClientConfig {
     fn default() -> Self {
         Self {
-            node_rpc_url: node_rpc_from_env(),
             clob_index_http_url: clob_index_http_from_env(),
             private_key: private_key_from_env(),
         }

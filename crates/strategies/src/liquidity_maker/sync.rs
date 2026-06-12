@@ -1,17 +1,22 @@
-//! Reconcile LightPool resting liquidity against Polymarket cache books.
+//! Reconcile LightPool resting liquidity against Polymarket cache books using bot-owned orders.
 
 use indexmap::IndexMap;
 use nautilus_model::{
     enums::OrderSide,
-    identifiers::{InstrumentId, Venue},
+    identifiers::{ClientOrderId, InstrumentId, Venue},
     orderbook::OrderBook,
-    orders::Order,
+    orders::{Order, OrderAny},
     types::{Price, Quantity},
 };
 use nautilus_trading::strategy::Strategy;
 use rust_decimal::Decimal;
 
+use super::markets::{
+    format_decimal_levels, instrument_outcome_side, instrument_spot_market, resolve_yes_no_pair,
+    warn_outcome_price_mismatch,
+};
 use super::strategy::LiquidityMaker;
+use crate::SlugMarketIds;
 
 const LIGHTPOOL_VENUE: &str = "LIGHTPOOL";
 
@@ -29,6 +34,31 @@ impl BookSideSnapshot {
         };
         Self { levels }
     }
+
+    fn from_orders(orders: &[OrderAny], depth: usize, bids: bool) -> Self {
+        let side = if bids {
+            OrderSide::Buy
+        } else {
+            OrderSide::Sell
+        };
+        let mut totals: IndexMap<Decimal, Decimal> = IndexMap::new();
+        for order in orders {
+            if order.order_side() != side {
+                continue;
+            }
+            let Some(price) = order.price().map(|p| p.as_decimal()) else {
+                continue;
+            };
+            let qty = order.quantity().as_decimal();
+            if qty.is_zero() {
+                continue;
+            }
+            *totals.entry(price).or_insert(Decimal::ZERO) += qty;
+        }
+        Self {
+            levels: trim_side_levels(totals, depth, bids),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,47 +74,198 @@ impl BookSnapshot {
             asks: BookSideSnapshot::from_book(book, depth, false),
         }
     }
+
+    fn from_open_orders(orders: &[OrderAny], depth: usize) -> Self {
+        Self {
+            bids: BookSideSnapshot::from_orders(orders, depth, true),
+            asks: BookSideSnapshot::from_orders(orders, depth, false),
+        }
+    }
+}
+
+fn trim_side_levels(
+    levels: IndexMap<Decimal, Decimal>,
+    depth: usize,
+    bids: bool,
+) -> IndexMap<Decimal, Decimal> {
+    let mut keys: Vec<Decimal> = levels.keys().copied().collect();
+    if bids {
+        keys.sort_by(|a, b| b.cmp(a));
+    } else {
+        keys.sort();
+    }
+    keys.truncate(depth);
+    keys.into_iter()
+        .filter_map(|price| {
+            levels
+                .get(&price)
+                .copied()
+                .map(|size| (price, size))
+        })
+        .collect()
 }
 
 pub(super) fn books_match(reference: &BookSnapshot, actual: &BookSnapshot) -> bool {
     reference.bids.levels == actual.bids.levels && reference.asks.levels == actual.asks.levels
 }
 
-pub(super) struct MirrorLevel {
-    pub side: OrderSide,
-    pub price: Price,
-    pub quantity: Quantity,
+#[derive(Debug, Clone)]
+struct LevelOrder {
+    client_order_id: ClientOrderId,
+    quantity: Quantity,
+    has_venue_id: bool,
 }
 
-pub(super) fn mirror_levels(book: &OrderBook, depth: usize) -> Vec<MirrorLevel> {
-    let mut levels = Vec::new();
-    for level in book.bids(Some(depth)) {
-        let Ok(quantity) = Quantity::from_decimal(level.size_decimal()) else {
-            continue;
-        };
-        if quantity.is_zero() {
+#[derive(Debug, Default)]
+struct OrdersByLevel {
+    bids: IndexMap<Decimal, Vec<LevelOrder>>,
+    asks: IndexMap<Decimal, Vec<LevelOrder>>,
+}
+
+impl OrdersByLevel {
+    fn from_open_orders(orders: &[OrderAny]) -> Self {
+        let mut grouped = Self::default();
+        for order in orders {
+            let Some(price) = order.price().map(|p| p.as_decimal()) else {
+                continue;
+            };
+            let entry = LevelOrder {
+                client_order_id: order.client_order_id(),
+                quantity: order.quantity(),
+                has_venue_id: order.venue_order_id().is_some(),
+            };
+            match order.order_side() {
+                OrderSide::Buy => grouped.bids.entry(price).or_default().push(entry),
+                OrderSide::Sell => grouped.asks.entry(price).or_default().push(entry),
+                _ => {}
+            }
+        }
+        grouped
+    }
+}
+
+#[derive(Debug)]
+enum ReconcileAction {
+    Place {
+        side: OrderSide,
+        price: Price,
+        quantity: Quantity,
+    },
+    Cancel {
+        client_order_id: ClientOrderId,
+    },
+    Modify {
+        client_order_id: ClientOrderId,
+        quantity: Quantity,
+    },
+}
+
+fn diff_side(
+    side: OrderSide,
+    reference: &IndexMap<Decimal, Decimal>,
+    actual: &IndexMap<Decimal, Decimal>,
+    orders: &IndexMap<Decimal, Vec<LevelOrder>>,
+    actions: &mut Vec<ReconcileAction>,
+) {
+    let mut prices: Vec<Decimal> = reference.keys().chain(actual.keys()).copied().collect();
+    prices.sort();
+    prices.dedup();
+
+    for price in prices {
+        let ref_qty = reference.get(&price).copied().unwrap_or(Decimal::ZERO);
+        let act_qty = actual.get(&price).copied().unwrap_or(Decimal::ZERO);
+        if ref_qty == act_qty {
             continue;
         }
-        levels.push(MirrorLevel {
-            side: OrderSide::Buy,
-            price: level.price.value,
-            quantity,
-        });
-    }
-    for level in book.asks(Some(depth)) {
-        let Ok(quantity) = Quantity::from_decimal(level.size_decimal()) else {
+
+        let level_orders = orders.get(&price).cloned().unwrap_or_default();
+        let Ok(price_value) = Price::from_decimal(price) else {
             continue;
         };
-        if quantity.is_zero() {
+
+        if act_qty.is_zero() {
+            let Ok(quantity) = Quantity::from_decimal(ref_qty) else {
+                continue;
+            };
+            if quantity.is_zero() {
+                continue;
+            }
+            actions.push(ReconcileAction::Place {
+                side,
+                price: price_value,
+                quantity,
+            });
             continue;
         }
-        levels.push(MirrorLevel {
-            side: OrderSide::Sell,
-            price: level.price.value,
-            quantity,
-        });
+
+        if ref_qty.is_zero() {
+            for order in level_orders {
+                if order.has_venue_id {
+                    actions.push(ReconcileAction::Cancel {
+                        client_order_id: order.client_order_id,
+                    });
+                }
+            }
+            continue;
+        }
+
+        let actionable: Vec<_> = level_orders
+            .into_iter()
+            .filter(|order| order.has_venue_id)
+            .collect();
+        if actionable.len() == 1 {
+            let Ok(quantity) = Quantity::from_decimal(ref_qty) else {
+                continue;
+            };
+            if quantity.is_zero() {
+                continue;
+            }
+            actions.push(ReconcileAction::Modify {
+                client_order_id: actionable[0].client_order_id,
+                quantity,
+            });
+            continue;
+        }
+
+        for order in actionable {
+            actions.push(ReconcileAction::Cancel {
+                client_order_id: order.client_order_id,
+            });
+        }
+        let Ok(quantity) = Quantity::from_decimal(ref_qty) else {
+            continue;
+        };
+        if !quantity.is_zero() {
+            actions.push(ReconcileAction::Place {
+                side,
+                price: price_value,
+                quantity,
+            });
+        }
     }
-    levels
+}
+
+fn build_reconcile_actions(
+    reference: &BookSnapshot,
+    actual: &BookSnapshot,
+    orders_by_level: &OrdersByLevel,
+) -> Vec<ReconcileAction> {
+    let mut actions = Vec::new();
+    diff_side(
+        OrderSide::Buy,
+        &reference.bids.levels,
+        &actual.bids.levels,
+        &orders_by_level.bids,
+        &mut actions,
+    );
+    diff_side(
+        OrderSide::Sell,
+        &reference.asks.levels,
+        &actual.asks.levels,
+        &orders_by_level.asks,
+        &mut actions,
+    );
+    actions
 }
 
 impl LiquidityMaker {
@@ -107,31 +288,184 @@ impl LiquidityMaker {
             return;
         };
 
-        for pm_market in pm_markets.values() {
-            self.pm_to_lp.insert(pm_market.yes_id, lp_market.yes_id);
-            self.pm_to_lp.insert(pm_market.no_id, lp_market.no_id);
+        let lp_market = lp_market.clone();
+        let pm_markets: Vec<SlugMarketIds> = pm_markets.values().cloned().collect();
+
+        let new_pairs = {
+            let cache = self.cache();
+            let Some((lp_yes_id, lp_no_id)) = resolve_yes_no_pair(&cache, &lp_market) else {
+                return;
+            };
+            let lp_yes_outcome = instrument_outcome_side(&cache, lp_yes_id);
+            let lp_no_outcome = instrument_outcome_side(&cache, lp_no_id);
+            let lp_yes_spot = instrument_spot_market(&cache, lp_yes_id);
+            let lp_no_spot = instrument_spot_market(&cache, lp_no_id);
+
+            log::info!(
+                "LightPool pair slug={lp_slug} yes_id={lp_yes_id} ({}) spot={} \
+                 no_id={lp_no_id} ({}) spot={}",
+                lp_yes_outcome.as_str(),
+                lp_yes_spot.as_deref().unwrap_or("-"),
+                lp_no_outcome.as_str(),
+                lp_no_spot.as_deref().unwrap_or("-"),
+            );
+
+            if lp_yes_spot.is_some() && lp_yes_spot == lp_no_spot {
+                log::warn!(
+                    "LightPool YES and NO instruments share the same spot_market={:?}; \
+                     books will mix YES (~16c) and NO (~84c) prices",
+                    lp_yes_spot,
+                );
+            }
+
+            let mut pairs = Vec::new();
+            for pm_market in &pm_markets {
+                let Some((pm_yes_id, pm_no_id)) = resolve_yes_no_pair(&cache, pm_market) else {
+                    continue;
+                };
+                let pm_yes_outcome = instrument_outcome_side(&cache, pm_yes_id);
+                let pm_no_outcome = instrument_outcome_side(&cache, pm_no_id);
+
+                if pm_yes_outcome != lp_yes_outcome || pm_no_outcome != lp_no_outcome {
+                    log::warn!(
+                        "PM/LP outcome label mismatch for condition={} \
+                         pm_yes={pm_yes_id} ({}) -> lp_yes={lp_yes_id} ({}) \
+                         pm_no={pm_no_id} ({}) -> lp_no={lp_no_id} ({})",
+                        pm_market.condition_id,
+                        pm_yes_outcome.as_str(),
+                        lp_yes_outcome.as_str(),
+                        pm_no_outcome.as_str(),
+                        lp_no_outcome.as_str(),
+                    );
+                }
+
+                log::info!(
+                    "pm_to_lp mapping condition={} \
+                     pm_yes={pm_yes_id} -> lp_yes={lp_yes_id} \
+                     pm_no={pm_no_id} -> lp_no={lp_no_id}",
+                    pm_market.condition_id,
+                );
+
+                pairs.push((pm_yes_id, lp_yes_id));
+                pairs.push((pm_no_id, lp_no_id));
+            }
+            pairs
+        };
+
+        for (pm_id, lp_id) in new_pairs {
+            self.pm_to_lp.insert(pm_id, lp_id);
         }
+    }
+
+    fn lightpool_for_polymarket(&self, polymarket_instrument_id: InstrumentId) -> Option<InstrumentId> {
+        self.pm_to_lp.get(&polymarket_instrument_id).copied()
+    }
+
+    fn polymarket_for_lightpool(&self, lightpool_instrument_id: InstrumentId) -> Option<InstrumentId> {
+        self.pm_to_lp
+            .iter()
+            .find_map(|(pm, lp)| (*lp == lightpool_instrument_id).then_some(*pm))
     }
 
     pub(super) fn reconcile_from_polymarket_delta(
         &mut self,
         polymarket_instrument_id: InstrumentId,
     ) -> anyhow::Result<()> {
-        if !self.config.trading_enabled || !self.config.lightpool_enabled {
-            return Ok(());
-        }
-
-        let Some(lightpool_instrument_id) = self.pm_to_lp.get(&polymarket_instrument_id).copied()
+        let Some(lightpool_instrument_id) =
+            self.lightpool_for_polymarket(polymarket_instrument_id)
         else {
             return Ok(());
         };
+        self.reconcile_pair(polymarket_instrument_id, lightpool_instrument_id)
+    }
+
+    pub(super) fn reconcile_from_lightpool_order_event(
+        &mut self,
+        lightpool_instrument_id: InstrumentId,
+    ) -> anyhow::Result<()> {
+        let Some(polymarket_instrument_id) =
+            self.polymarket_for_lightpool(lightpool_instrument_id)
+        else {
+            return Ok(());
+        };
+        self.reconcile_pair(polymarket_instrument_id, lightpool_instrument_id)
+    }
+
+    fn audit_book_snapshot(
+        cache: &nautilus_common::cache::Cache,
+        context: &str,
+        instrument_id: InstrumentId,
+        snapshot: &BookSnapshot,
+    ) {
+        let outcome = instrument_outcome_side(cache, instrument_id);
+        let spot = instrument_spot_market(cache, instrument_id);
+        for price in snapshot
+            .bids
+            .levels
+            .keys()
+            .chain(snapshot.asks.levels.keys())
+        {
+            warn_outcome_price_mismatch(context, outcome, *price, instrument_id, spot.as_deref());
+        }
+    }
+
+    fn audit_open_orders(
+        cache: &nautilus_common::cache::Cache,
+        instrument_id: InstrumentId,
+        orders: &[OrderAny],
+    ) {
+        let outcome = instrument_outcome_side(cache, instrument_id);
+        let spot = instrument_spot_market(cache, instrument_id);
+        for order in orders {
+            let Some(price) = order.price().map(|p| p.as_decimal()) else {
+                continue;
+            };
+            warn_outcome_price_mismatch(
+                "lp_open_order",
+                outcome,
+                price,
+                instrument_id,
+                spot.as_deref(),
+            );
+        }
+    }
+
+    fn audit_place_actions(
+        cache: &nautilus_common::cache::Cache,
+        lightpool_instrument_id: InstrumentId,
+        actions: &[ReconcileAction],
+    ) {
+        let outcome = instrument_outcome_side(cache, lightpool_instrument_id);
+        let spot = instrument_spot_market(cache, lightpool_instrument_id);
+        for action in actions {
+            let ReconcileAction::Place { price, .. } = action else {
+                continue;
+            };
+            warn_outcome_price_mismatch(
+                "reconcile_place",
+                outcome,
+                price.as_decimal(),
+                lightpool_instrument_id,
+                spot.as_deref(),
+            );
+        }
+    }
+
+    fn reconcile_pair(
+        &mut self,
+        polymarket_instrument_id: InstrumentId,
+        lightpool_instrument_id: InstrumentId,
+    ) -> anyhow::Result<()> {
+        if !self.config.trading_enabled || !self.config.lightpool_enabled {
+            return Ok(());
+        }
 
         let depth = self.config.depth.max(1);
         let strategy_id = self.core.strategy_id();
         let client_id = self.config.lightpool_client_id;
         let venue = Venue::from(LIGHTPOOL_VENUE);
 
-        let plan = {
+        let (reference, actual, actions) = {
             let cache = self.cache();
             let Some(polymarket_book) = cache.order_book(&polymarket_instrument_id) else {
                 log::warn!(
@@ -139,18 +473,6 @@ impl LiquidityMaker {
                 );
                 return Ok(());
             };
-            let Some(lightpool_book) = cache.order_book(&lightpool_instrument_id) else {
-                log::warn!(
-                    "LightPool book missing in cache for {lightpool_instrument_id}; skip reconcile"
-                );
-                return Ok(());
-            };
-
-            let reference = BookSnapshot::from_book(polymarket_book, depth);
-            let actual = BookSnapshot::from_book(lightpool_book, depth);
-            if books_match(&reference, &actual) {
-                return Ok(());
-            }
 
             let Some(strategy_id) = strategy_id else {
                 return Ok(());
@@ -181,48 +503,117 @@ impl LiquidityMaker {
                     None,
                 )
                 .into_iter()
-                .map(|order| order.client_order_id())
+                .map(|order| order.cloned())
                 .collect::<Vec<_>>();
 
-            if !open_orders.is_empty() {
-                ReconcilePlan::Cancel(open_orders)
-            } else {
-                ReconcilePlan::Place(mirror_levels(polymarket_book, depth))
+            let reference = BookSnapshot::from_book(polymarket_book, depth);
+            let actual = BookSnapshot::from_open_orders(&open_orders, depth);
+
+            Self::audit_book_snapshot(&cache, "pm_reference", polymarket_instrument_id, &reference);
+            Self::audit_book_snapshot(
+                &cache,
+                "lp_open_orders_agg",
+                lightpool_instrument_id,
+                &actual,
+            );
+            Self::audit_open_orders(&cache, lightpool_instrument_id, &open_orders);
+
+            if books_match(&reference, &actual) {
+                return Ok(());
             }
+
+            let orders_by_level = OrdersByLevel::from_open_orders(&open_orders);
+            let actions = build_reconcile_actions(&reference, &actual, &orders_by_level);
+            (reference, actual, actions)
         };
 
-        match plan {
-            ReconcilePlan::Cancel(open_orders) => {
-                log::info!(
-                    "Cancelling {} LightPool orders before mirroring Polymarket book \
-                     polymarket_instrument_id={polymarket_instrument_id} \
-                     lightpool_instrument_id={lightpool_instrument_id}",
-                    open_orders.len(),
-                );
-                for client_order_id in open_orders {
+        if actions.is_empty() {
+            return Ok(());
+        }
+
+        {
+            let cache = self.cache();
+            Self::audit_place_actions(&cache, lightpool_instrument_id, &actions);
+        }
+
+        let pm_outcome = instrument_outcome_side(&self.cache(), polymarket_instrument_id);
+        let lp_outcome = instrument_outcome_side(&self.cache(), lightpool_instrument_id);
+        let lp_spot = instrument_spot_market(&self.cache(), lightpool_instrument_id);
+
+        log::info!(
+            "Reconciling LightPool liquidity pm={polymarket_instrument_id} ({}) \
+             lp={lightpool_instrument_id} ({}) spot={} actions={} \
+             pm_ref_bids=[{}] pm_ref_asks=[{}] lp_actual_bids=[{}] lp_actual_asks=[{}]",
+            pm_outcome.as_str(),
+            lp_outcome.as_str(),
+            lp_spot.as_deref().unwrap_or("-"),
+            actions.len(),
+            format_decimal_levels(&reference.bids.levels, 5),
+            format_decimal_levels(&reference.asks.levels, 5),
+            format_decimal_levels(&actual.bids.levels, 5),
+            format_decimal_levels(&actual.asks.levels, 5),
+        );
+
+        for action in actions {
+            match action {
+                ReconcileAction::Cancel { client_order_id } => {
                     if let Err(e) = self.cancel_order(client_order_id, Some(client_id), None) {
                         log::warn!("Failed to cancel {client_order_id}: {e}");
                     }
                 }
-            }
-            ReconcilePlan::Place(levels) => {
-                if levels.is_empty() {
-                    return Ok(());
+                ReconcileAction::Modify {
+                    client_order_id,
+                    quantity,
+                } => {
+                    if let Err(e) = self.modify_order(
+                        client_order_id,
+                        Some(quantity),
+                        None,
+                        None,
+                        Some(client_id),
+                        None,
+                    ) {
+                        log::warn!("Failed to modify {client_order_id}: {e}");
+                    }
                 }
-                log::info!(
-                    "Mirroring Polymarket book to LightPool polymarket_instrument_id={polymarket_instrument_id} \
-                     lightpool_instrument_id={lightpool_instrument_id} levels={}",
-                    levels.len(),
-                );
-                for level in levels {
-                    if level.quantity.is_zero() {
+                ReconcileAction::Place {
+                    side,
+                    price,
+                    quantity,
+                } => {
+                    if quantity.is_zero() {
                         continue;
+                    }
+                    let price_decimal = price.as_decimal();
+                    warn_outcome_price_mismatch(
+                        "order_factory",
+                        lp_outcome,
+                        price_decimal,
+                        lightpool_instrument_id,
+                        lp_spot.as_deref(),
+                    );
+                    warn_outcome_price_mismatch(
+                        "order_factory_pm_ref",
+                        pm_outcome,
+                        price_decimal,
+                        polymarket_instrument_id,
+                        None,
+                    );
+                    if pm_outcome != lp_outcome {
+                        log::warn!(
+                            "order_factory PM/LP outcome mismatch at place: \
+                             pm={polymarket_instrument_id} ({}) lp={lightpool_instrument_id} ({}) \
+                             side={side:?} price={price_decimal} spot={}",
+                            pm_outcome.as_str(),
+                            lp_outcome.as_str(),
+                            lp_spot.as_deref().unwrap_or("-"),
+                        );
                     }
                     let order = self.core.order_factory().limit(
                         lightpool_instrument_id,
-                        level.side,
-                        level.quantity,
-                        level.price,
+                        side,
+                        quantity,
+                        price,
                         None,
                         None,
                         None,
@@ -239,9 +630,9 @@ impl LiquidityMaker {
                     if let Err(e) = self.submit_order(order, None, Some(client_id), None) {
                         log::warn!(
                             "Failed to submit mirror order on {lightpool_instrument_id} {:?} {}@{}: {e}",
-                            level.side,
-                            level.quantity,
-                            level.price,
+                            side,
+                            quantity,
+                            price,
                         );
                     }
                 }
@@ -250,9 +641,4 @@ impl LiquidityMaker {
 
         Ok(())
     }
-}
-
-enum ReconcilePlan {
-    Cancel(Vec<nautilus_model::identifiers::ClientOrderId>),
-    Place(Vec<MirrorLevel>),
 }

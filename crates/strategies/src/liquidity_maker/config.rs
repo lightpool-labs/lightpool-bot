@@ -34,7 +34,7 @@ pub struct LiquidityMakerConfig {
     /// When `true`, subscribe with managed books so the data engine also
     /// maintains an `OrderBook` in cache (`cache.order_book()`).
     pub managed_book: bool,
-    /// When `true`, subscribe to LightPool order books for the same slugs.
+    /// When `true`, resolve LightPool markets for trading (no order book subscription).
     pub lightpool_enabled: bool,
     /// When `true`, print Polymarket order book snapshots from cache.
     pub log_polymarket: bool,

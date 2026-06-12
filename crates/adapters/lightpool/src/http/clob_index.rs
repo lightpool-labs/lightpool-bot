@@ -1,6 +1,12 @@
 use reqwest::Client;
 
-use super::models::{BookSnapshot, Market, MarketsPage, decode_response};
+use super::models::{
+    BookSnapshot, Market, MarketsPage, SubmitTxRequest, SubmitTxResponse, decode_response,
+};
+use lightpool_sdk::{
+    lightpool_types::SignedTransaction,
+    types::SubmitTransactionResponse,
+};
 
 #[derive(Debug, Clone)]
 pub struct ClobIndexHttpClient {
@@ -39,6 +45,15 @@ impl ClobIndexHttpClient {
         decode_response(response).await
     }
 
+    pub async fn fetch_spot_info(&self, spot_market: &str) -> anyhow::Result<super::models::SpotMarketInfo> {
+        let url = format!(
+            "{}/api/spot/{spot_market}/info?account=0x0000000000000000000000000000000000000000",
+            self.base_url
+        );
+        let response = self.client.get(&url).send().await?;
+        decode_response(response).await
+    }
+
     pub async fn fetch_markets_by_slugs(&self, slugs: &[String]) -> anyhow::Result<Vec<Market>> {
         if slugs.is_empty() {
             return Ok(Vec::new());
@@ -52,5 +67,23 @@ impl ClobIndexHttpClient {
         let response = self.client.get(&url).send().await?;
         let page: MarketsPage = decode_response(response).await?;
         Ok(page.markets)
+    }
+
+    pub async fn submit_transaction(
+        &self,
+        tx: SignedTransaction,
+    ) -> anyhow::Result<SubmitTransactionResponse> {
+        let url = format!("{}/api/tx/submit", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .json(&SubmitTxRequest { tx })
+            .send()
+            .await?;
+        let body: SubmitTxResponse = decode_response(response).await?;
+        Ok(SubmitTransactionResponse {
+            digest: body.digest,
+            receipt: body.receipt,
+        })
     }
 }

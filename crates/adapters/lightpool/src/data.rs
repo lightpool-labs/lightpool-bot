@@ -3,6 +3,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use std::collections::HashMap;
+
 use ahash::AHashMap;
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -28,6 +30,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    common::amounts::parse_token_amount_str,
     common::consts::LIGHTPOOL_VENUE,
     config::LightpoolDataClientConfig,
     http::clob_index::ClobIndexHttpClient,
@@ -80,9 +83,36 @@ impl LightpoolDataClient {
             .await?;
         let ts_init = self.clock.get_time_ns();
         let mut count = 0usize;
+        let mut tick_by_spot = HashMap::new();
+
+        for market in &markets {
+            for spot_market in [&market.yes_spot_market, &market.no_spot_market] {
+                if tick_by_spot.contains_key(spot_market) {
+                    continue;
+                }
+                let tick_size_raw = match self.http_client.fetch_spot_info(spot_market).await {
+                    Ok(info) => parse_token_amount_str(&info.tick_size).unwrap_or(1_000),
+                    Err(error) => {
+                        log::warn!(
+                            "Failed to load tick_size for {spot_market}; defaulting to 0.001: {error}"
+                        );
+                        1_000
+                    }
+                };
+                tick_by_spot.insert(spot_market.clone(), tick_size_raw);
+            }
+        }
 
         for market in markets {
-            for instrument in instruments_for_market(&market, ts_init)? {
+            let yes_tick = tick_by_spot
+                .get(&market.yes_spot_market)
+                .copied()
+                .unwrap_or(1_000);
+            let no_tick = tick_by_spot
+                .get(&market.no_spot_market)
+                .copied()
+                .unwrap_or(1_000);
+            for instrument in instruments_for_market(&market, yes_tick, no_tick, ts_init)? {
                 let instrument_id = instrument.id();
                 let spot_market = instrument.raw_symbol().to_string();
                 self.spot_market_by_instrument

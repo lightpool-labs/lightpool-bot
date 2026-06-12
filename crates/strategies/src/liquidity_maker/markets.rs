@@ -6,6 +6,7 @@ use nautilus_model::{
     identifiers::{InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
 };
+use rust_decimal::Decimal;
 
 /// YES/NO instrument ids for a single prediction market.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,4 +173,125 @@ pub fn assign_markets_to_slugs(
         }
     }
     new_count
+}
+
+fn outcome_price_split() -> Decimal {
+    Decimal::new(55, 2)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OutcomeSide {
+    Yes,
+    No,
+    Unknown,
+}
+
+impl OutcomeSide {
+    fn from_label(label: &str) -> Self {
+        match label {
+            "yes" | "up" => Self::Yes,
+            "no" | "down" => Self::No,
+            _ => Self::Unknown,
+        }
+    }
+
+    #[must_use]
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Yes => "yes",
+            Self::No => "no",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+pub(super) fn instrument_outcome_side(cache: &Cache, instrument_id: InstrumentId) -> OutcomeSide {
+    let Some(InstrumentAny::BinaryOption(opt)) = cache.instrument(&instrument_id) else {
+        return OutcomeSide::Unknown;
+    };
+    OutcomeSide::from_label(
+        &opt.outcome
+            .map(|v| v.to_string().to_lowercase())
+            .unwrap_or_default(),
+    )
+}
+
+pub(super) fn instrument_spot_market(cache: &Cache, instrument_id: InstrumentId) -> Option<String> {
+    let instrument = cache.instrument(&instrument_id)?;
+    Some(instrument.raw_symbol().to_string())
+}
+
+/// Resolve YES/NO ids using live instrument outcome labels (not slot names alone).
+pub(super) fn resolve_yes_no_pair(
+    cache: &Cache,
+    pair: &SlugMarketIds,
+) -> Option<(InstrumentId, InstrumentId)> {
+    let yes_slot = instrument_outcome_side(cache, pair.yes_id);
+    let no_slot = instrument_outcome_side(cache, pair.no_id);
+
+    match (yes_slot, no_slot) {
+        (OutcomeSide::Yes, OutcomeSide::No) => Some((pair.yes_id, pair.no_id)),
+        (OutcomeSide::No, OutcomeSide::Yes) => {
+            log::warn!(
+                "YES/NO instrument ids appear swapped in cache for market_key={} \
+                 yes_slot={} no_slot={}; correcting by outcome label",
+                pair.condition_id,
+                pair.yes_id,
+                pair.no_id,
+            );
+            Some((pair.no_id, pair.yes_id))
+        }
+        _ => {
+            log::warn!(
+                "Could not confirm YES/NO outcomes for market_key={} \
+                 yes_slot={} ({}) no_slot={} ({}); using cache slots as-is",
+                pair.condition_id,
+                pair.yes_id,
+                yes_slot.as_str(),
+                pair.no_id,
+                no_slot.as_str(),
+            );
+            Some((pair.yes_id, pair.no_id))
+        }
+    }
+}
+
+pub(super) fn price_matches_outcome(outcome: OutcomeSide, price: Decimal) -> bool {
+    let split = outcome_price_split();
+    match outcome {
+        OutcomeSide::Yes => price <= split,
+        OutcomeSide::No => price >= split,
+        OutcomeSide::Unknown => true,
+    }
+}
+
+pub(super) fn warn_outcome_price_mismatch(
+    context: &str,
+    outcome: OutcomeSide,
+    price: Decimal,
+    instrument_id: InstrumentId,
+    spot_market: Option<&str>,
+) {
+    if price_matches_outcome(outcome, price) {
+        return;
+    }
+    let spot = spot_market.unwrap_or("-");
+    log::warn!(
+        "Outcome/price mismatch [{context}] outcome={} price={price} \
+         instrument_id={instrument_id} spot_market={spot} \
+         (expected YES ~16c / NO ~84c; check pm_to_lp mapping)",
+        outcome.as_str(),
+    );
+}
+
+pub(super) fn format_decimal_levels(
+    levels: &indexmap::IndexMap<Decimal, Decimal>,
+    limit: usize,
+) -> String {
+    levels
+        .iter()
+        .take(limit)
+        .map(|(price, size)| format!("{size}@{price}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
