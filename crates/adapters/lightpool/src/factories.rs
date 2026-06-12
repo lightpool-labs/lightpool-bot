@@ -10,11 +10,10 @@ use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
     enums::{AccountType, OmsType},
     identifiers::ClientId,
-    types::Currency,
 };
 
 use crate::{
-    common::consts::LIGHTPOOL,
+    common::{consts::LIGHTPOOL, currency::collateral_currency},
     config::{LightpoolDataClientConfig, LightpoolExecClientConfig},
     data::LightpoolDataClient,
     execution::{LightpoolExecutionClient, default_account_id},
@@ -97,7 +96,7 @@ impl ExecutionClientFactory for LightpoolExecutionClientFactory {
             OmsType::Netting,
             account_id,
             AccountType::Cash,
-            Some(Currency::from(crate::common::consts::LPUSD)),
+            Some(collateral_currency()),
             cache,
         );
         Ok(Box::new(LightpoolExecutionClient::new(core, lightpool_config)?))

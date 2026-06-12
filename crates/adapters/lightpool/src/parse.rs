@@ -6,13 +6,16 @@ use nautilus_model::{
     enums::{AssetClass, BookAction, OrderSide, RecordFlag},
     identifiers::{InstrumentId, Symbol},
     instruments::{BinaryOption, InstrumentAny},
-    types::{Currency, Price, Quantity},
+    types::{Price, Quantity},
 };
 use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use crate::{
-    common::consts::{LIGHTPOOL_VENUE, LPUSD, MAX_PRICE, MIN_PRICE, PRICE_TICK},
+    common::{
+        consts::{LIGHTPOOL_VENUE, MAX_PRICE, MIN_PRICE, PRICE_TICK},
+        currency::collateral_currency,
+    },
     http::models::{BookLevel, BookSnapshot, Market},
 };
 
@@ -32,18 +35,6 @@ impl LightpoolOutcome {
     }
 }
 
-use nautilus_model::enums::CurrencyType;
-
-fn get_currency(code: &str) -> Currency {
-    Currency::try_from_str(code).unwrap_or_else(|| {
-        let currency = Currency::new(code, 6, 0, code, CurrencyType::Crypto);
-        if let Err(e) = Currency::register(currency, false) {
-            log::error!("Failed to register currency '{code}': {e}");
-        }
-        currency
-    })
-}
-
 pub fn create_instrument(
     market: &Market,
     outcome: LightpoolOutcome,
@@ -57,7 +48,7 @@ pub fn create_instrument(
     let symbol = Symbol::new(format!("{}-{}", market.slug, suffix));
     let instrument_id = InstrumentId::new(symbol, *LIGHTPOOL_VENUE);
     let raw_symbol = Symbol::new(spot_market);
-    let currency = get_currency(LPUSD);
+    let currency = collateral_currency();
     let price_increment = Price::from(PRICE_TICK);
     let size_increment = Quantity::from("0.000001");
 

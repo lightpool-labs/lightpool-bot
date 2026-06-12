@@ -21,12 +21,15 @@ use nautilus_model::{
     identifiers::{AccountId, ClientId, Venue, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
-    types::{AccountBalance, MarginBalance},
+    types::{AccountBalance, MarginBalance, Money},
 };
 use rust_decimal::prelude::ToPrimitive;
 
 use crate::{
-    common::consts::LPUSD,
+    common::{
+        currency::collateral_currency_code,
+        signer::signer_from_private_key,
+    },
     config::LightpoolExecClientConfig,
 };
 
@@ -85,6 +88,12 @@ impl LightpoolExecutionClient {
         get_atomic_clock_realtime().get_time_ns()
     }
 
+    fn initial_account_balances(&self) -> Vec<AccountBalance> {
+        let code = collateral_currency_code();
+        let zero = Money::from(format!("0 {code}"));
+        vec![AccountBalance::new(zero.clone(), zero.clone(), zero)]
+    }
+
     fn submit_limit_order(&self, order: OrderAny) {
         let Some(private_key) = self.private_key.clone() else {
             self.emitter
@@ -109,10 +118,10 @@ impl LightpoolExecutionClient {
         self.emitter.emit_order_submitted(&order);
 
         get_runtime().spawn(async move {
-            let signer = match Signer::from_secret_key_base64(&private_key) {
+            let signer = match signer_from_private_key(&private_key) {
                 Ok(signer) => signer,
                 Err(e) => {
-                    emitter.emit_order_denied(&order, &format!("invalid signer: {e}"));
+                    emitter.emit_order_denied(&order, &format!("invalid signer: {e:#}"));
                     return;
                 }
             };
@@ -255,11 +264,13 @@ impl ExecutionClient for LightpoolExecutionClient {
 
     fn generate_account_state(
         &self,
-        _balances: Vec<AccountBalance>,
-        _margins: Vec<MarginBalance>,
-        _reported: bool,
-        _ts_event: nautilus_core::UnixNanos,
+        balances: Vec<AccountBalance>,
+        margins: Vec<MarginBalance>,
+        reported: bool,
+        ts_event: nautilus_core::UnixNanos,
     ) -> anyhow::Result<()> {
+        self.emitter
+            .emit_account_state(balances, margins, reported, ts_event);
         Ok(())
     }
 
@@ -280,9 +291,29 @@ impl ExecutionClient for LightpoolExecutionClient {
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
-        if self.private_key.is_none() {
-            log::warn!("Lightpool execution client started without signer; submits will be denied");
+        match self.private_key.as_deref() {
+            None => {
+                log::warn!(
+                    "Lightpool execution client started without signer; submits will be denied"
+                );
+            }
+            Some(private_key) => match signer_from_private_key(private_key) {
+                Ok(signer) => {
+                    log::info!(
+                        "Lightpool execution client signer address={}",
+                        signer.address()
+                    );
+                }
+                Err(e) => log::warn!("Lightpool execution client invalid private key: {e:#}"),
+            },
         }
+        let ts_event = self.ts_event();
+        self.generate_account_state(self.initial_account_balances(), vec![], false, ts_event)?;
+        log::info!(
+            "Registered LightPool account_id={} collateral={}",
+            self.account_id(),
+            collateral_currency_code(),
+        );
         self.core.set_connected();
         Ok(())
     }
@@ -340,13 +371,13 @@ impl ExecutionClient for LightpoolExecutionClient {
         let ts_event = self.ts_event();
 
         get_runtime().spawn(async move {
-            let signer = match Signer::from_secret_key_base64(&private_key) {
+            let signer = match signer_from_private_key(&private_key) {
                 Ok(signer) => signer,
                 Err(e) => {
                     emitter.emit_order_cancel_rejected(
                         &order,
                         Some(venue_order_id),
-                        &format!("invalid signer: {e}"),
+                        &format!("invalid signer: {e:#}"),
                         ts_event,
                     );
                     return;
@@ -391,5 +422,5 @@ async fn cancel_order_on_chain(
 }
 
 pub fn default_account_id() -> AccountId {
-    AccountId::new(format!("LIGHTPOOL-{}", LPUSD).as_str())
+    AccountId::new(format!("LIGHTPOOL-{}", collateral_currency_code()).as_str())
 }

@@ -6639,6 +6639,7 @@ dependencies = [
  "dashmap",
  "dotenvy",
  "futures-util",
+ "hex",
  "lightpool-sdk",
  "log",
  "nautilus-common",
