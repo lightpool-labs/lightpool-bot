@@ -516,7 +516,7 @@ impl LiquidityMaker {
                 lightpool_instrument_id,
                 &actual,
             );
-            Self::audit_open_orders(&cache, lightpool_instrument_id, &open_orders);
+            // Self::audit_open_orders(&cache, lightpool_instrument_id, &open_orders);
 
             if books_match(&reference, &actual) {
                 return Ok(());
@@ -531,16 +531,16 @@ impl LiquidityMaker {
             return Ok(());
         }
 
-        {
-            let cache = self.cache();
-            Self::audit_place_actions(&cache, lightpool_instrument_id, &actions);
-        }
+        // {
+        //     let cache = self.cache();
+        //     Self::audit_place_actions(&cache, lightpool_instrument_id, &actions);
+        // }
 
         let pm_outcome = instrument_outcome_side(&self.cache(), polymarket_instrument_id);
         let lp_outcome = instrument_outcome_side(&self.cache(), lightpool_instrument_id);
         let lp_spot = instrument_spot_market(&self.cache(), lightpool_instrument_id);
 
-        log::info!(
+        log::debug!(
             "Reconciling LightPool liquidity pm={polymarket_instrument_id} ({}) \
              lp={lightpool_instrument_id} ({}) spot={} actions={} \
              pm_ref_bids=[{}] pm_ref_asks=[{}] lp_actual_bids=[{}] lp_actual_asks=[{}]",
@@ -557,9 +557,9 @@ impl LiquidityMaker {
         for action in actions {
             match action {
                 ReconcileAction::Cancel { client_order_id } => {
-                    if let Err(e) = self.cancel_order(client_order_id, Some(client_id), None) {
-                        log::warn!("Failed to cancel {client_order_id}: {e}");
-                    }
+                    // if let Err(e) = self.cancel_order(client_order_id, Some(client_id), None) {
+                    //     log::warn!("Failed to cancel {client_order_id}: {e}");
+                    // }
                 }
                 ReconcileAction::Modify {
                     client_order_id,
@@ -585,30 +585,20 @@ impl LiquidityMaker {
                         continue;
                     }
                     let price_decimal = price.as_decimal();
-                    warn_outcome_price_mismatch(
-                        "order_factory",
-                        lp_outcome,
-                        price_decimal,
-                        lightpool_instrument_id,
-                        lp_spot.as_deref(),
-                    );
-                    warn_outcome_price_mismatch(
-                        "order_factory_pm_ref",
-                        pm_outcome,
-                        price_decimal,
-                        polymarket_instrument_id,
-                        None,
-                    );
-                    if pm_outcome != lp_outcome {
-                        log::warn!(
-                            "order_factory PM/LP outcome mismatch at place: \
-                             pm={polymarket_instrument_id} ({}) lp={lightpool_instrument_id} ({}) \
-                             side={side:?} price={price_decimal} spot={}",
-                            pm_outcome.as_str(),
-                            lp_outcome.as_str(),
-                            lp_spot.as_deref().unwrap_or("-"),
-                        );
-                    }
+                    // warn_outcome_price_mismatch(
+                    //     "order_factory",
+                    //     lp_outcome,
+                    //     price_decimal,
+                    //     lightpool_instrument_id,
+                    //     lp_spot.as_deref(),
+                    // );
+                    // warn_outcome_price_mismatch(
+                    //     "order_factory_pm_ref",
+                    //     pm_outcome,
+                    //     price_decimal,
+                    //     polymarket_instrument_id,
+                    //     None,
+                    // );
                     let order = self.core.order_factory().limit(
                         lightpool_instrument_id,
                         side,

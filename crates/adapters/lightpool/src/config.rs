@@ -13,14 +13,29 @@ fn nonempty_env(var: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn reject_lightpool_node_endpoint(name: &str, url: &str) {
+    if url.contains(":26300") || url.contains(":26400") {
+        log::warn!(
+            "{name}={url} looks like a lightpool node endpoint; \
+             point it at lightpool-clob-index instead (default http://127.0.0.1:3002)"
+        );
+    }
+}
+
 #[must_use]
 pub fn clob_index_http_from_env() -> String {
-    nonempty_env("LIGHTPOOL_CLOB_INDEX_HTTP").unwrap_or_else(|| DEFAULT_CLOB_INDEX_HTTP.into())
+    let url =
+        nonempty_env("LIGHTPOOL_CLOB_INDEX_HTTP").unwrap_or_else(|| DEFAULT_CLOB_INDEX_HTTP.into());
+    reject_lightpool_node_endpoint("LIGHTPOOL_CLOB_INDEX_HTTP", &url);
+    url
 }
 
 #[must_use]
 pub fn clob_index_ws_from_env() -> String {
-    nonempty_env("LIGHTPOOL_CLOB_INDEX_WS").unwrap_or_else(|| DEFAULT_CLOB_INDEX_WS.into())
+    let url =
+        nonempty_env("LIGHTPOOL_CLOB_INDEX_WS").unwrap_or_else(|| DEFAULT_CLOB_INDEX_WS.into());
+    reject_lightpool_node_endpoint("LIGHTPOOL_CLOB_INDEX_WS", &url);
+    url
 }
 
 #[must_use]

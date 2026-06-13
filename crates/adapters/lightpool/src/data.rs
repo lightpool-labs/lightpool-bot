@@ -3,8 +3,6 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use std::collections::HashMap;
-
 use ahash::AHashMap;
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -30,8 +28,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    common::amounts::parse_token_amount_str,
-    common::consts::LIGHTPOOL_VENUE,
+    common::consts::{DEFAULT_TICK_SIZE_RAW, LIGHTPOOL_VENUE},
     config::LightpoolDataClientConfig,
     http::clob_index::ClobIndexHttpClient,
     parse::{instruments_for_market, parse_book_delta, parse_book_snapshot},
@@ -83,36 +80,14 @@ impl LightpoolDataClient {
             .await?;
         let ts_init = self.clock.get_time_ns();
         let mut count = 0usize;
-        let mut tick_by_spot = HashMap::new();
-
-        for market in &markets {
-            for spot_market in [&market.yes_spot_market, &market.no_spot_market] {
-                if tick_by_spot.contains_key(spot_market) {
-                    continue;
-                }
-                let tick_size_raw = match self.http_client.fetch_spot_info(spot_market).await {
-                    Ok(info) => parse_token_amount_str(&info.tick_size).unwrap_or(1_000),
-                    Err(error) => {
-                        log::warn!(
-                            "Failed to load tick_size for {spot_market}; defaulting to 0.001: {error}"
-                        );
-                        1_000
-                    }
-                };
-                tick_by_spot.insert(spot_market.clone(), tick_size_raw);
-            }
-        }
 
         for market in markets {
-            let yes_tick = tick_by_spot
-                .get(&market.yes_spot_market)
-                .copied()
-                .unwrap_or(1_000);
-            let no_tick = tick_by_spot
-                .get(&market.no_spot_market)
-                .copied()
-                .unwrap_or(1_000);
-            for instrument in instruments_for_market(&market, yes_tick, no_tick, ts_init)? {
+            for instrument in instruments_for_market(
+                &market,
+                DEFAULT_TICK_SIZE_RAW,
+                DEFAULT_TICK_SIZE_RAW,
+                ts_init,
+            )? {
                 let instrument_id = instrument.id();
                 let spot_market = instrument.raw_symbol().to_string();
                 self.spot_market_by_instrument
@@ -146,7 +121,6 @@ impl LightpoolDataClient {
         };
 
         let depth = self.config.book_depth;
-        let http_client = self.http_client.clone();
         let ws_client = self.ws_client.clone();
         let data_sender = self.data_sender.clone();
         let clock = self.clock;
@@ -155,18 +129,6 @@ impl LightpoolDataClient {
         let active_delta_subs = self.active_delta_subs.clone();
 
         let handle = get_runtime().spawn(async move {
-            if let Ok(snapshot) = http_client.fetch_book_snapshot(&spot_market, depth).await {
-                let ts_init = clock.get_time_ns();
-                match parse_book_snapshot(&snapshot, instrument_id, ts_init) {
-                    Ok(deltas) => {
-                        let _ = data_sender.send(DataEvent::Data(NautilusData::Deltas(
-                            OrderBookDeltas_API::new(deltas),
-                        )));
-                    }
-                    Err(e) => log::warn!("Failed to parse book snapshot for {instrument_id}: {e}"),
-                }
-            }
-
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
             if let Err(e) = ws_client
                 .subscribe_orderbook(spot_market, depth, tx, cancel.clone())
@@ -280,7 +242,7 @@ impl DataClient for LightpoolDataClient {
         if self.is_connected() {
             return Ok(());
         }
-        log::info!("Connecting Lightpool data client");
+        log::info!("Connecting Lightpool data client via clob-index http={} ws={}", self.config.clob_index_http_url, self.config.clob_index_ws_url);
         self.cancellation_token = CancellationToken::new();
         self.bootstrap_instruments().await?;
         self.is_connected.store(true, Ordering::Relaxed);

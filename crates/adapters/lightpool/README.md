@@ -2,8 +2,10 @@
 
 LightPool adapter for NautilusTrader / lightpool-bot.
 
-- **Data**: clob-index HTTP book snapshots + WebSocket `orderbook_delta`
-- **Execution**: on-chain `place_order` / `cancel_order` via `lightpool-sdk`
+- **Data**: clob-index HTTP market bootstrap + WebSocket `orderbook_delta`
+- **Execution**: signed transactions submitted via clob-index `/api/tx/submit`
+
+The bot does not connect to the lightpool node directly. Run `lightpool-clob-index` separately; it owns the node RPC/WS connection.
 
 ## Example
 
@@ -18,5 +20,4 @@ Environment:
 
 - `LIGHTPOOL_CLOB_INDEX_HTTP` (default `http://127.0.0.1:3002`)
 - `LIGHTPOOL_CLOB_INDEX_WS` (default `ws://127.0.0.1:3002`)
-- `LIGHTPOOL_NODE_RPC` (execution only, default `http://127.0.0.1:9000`)
 - `LIGHTPOOL_PRIVATE_KEY` (execution only, base64 secret key)

@@ -39,8 +39,33 @@ pub fn probability_to_limit_price(price: Decimal, tick_size: u64) -> anyhow::Res
     Ok(aligned)
 }
 
+pub fn format_token_amount(raw: u64) -> String {
+    let whole = raw / TOKEN_SCALE;
+    let frac = raw % TOKEN_SCALE;
+    if frac == 0 {
+        return whole.to_string();
+    }
+    format!("{whole}.{frac:06}", frac = frac)
+}
+
 pub fn tick_size_from_instrument_info(info: Option<&nautilus_core::Params>) -> u64 {
     info.and_then(|params| params.get("tick_size_raw"))
         .and_then(|value| value.as_u64())
         .unwrap_or(1_000)
+}
+
+pub fn format_price_pieces(raw: u64) -> String {
+    let numerator = raw.saturating_mul(100);
+    let whole = numerator / TOKEN_SCALE;
+    let frac = numerator % TOKEN_SCALE;
+    if frac == 0 {
+        return whole.to_string();
+    }
+    let frac_str = format!("{frac:06}");
+    let trimmed = frac_str.trim_end_matches('0');
+    format!("{whole}.{trimmed}")
+}
+
+pub fn limit_price_string(price: Decimal, tick_size: u64) -> anyhow::Result<String> {
+    Ok(format_price_pieces(probability_to_limit_price(price, tick_size)?))
 }

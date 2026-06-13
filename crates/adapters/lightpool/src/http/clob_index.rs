@@ -1,7 +1,8 @@
 use reqwest::Client;
 
 use super::models::{
-    BookSnapshot, Market, MarketsPage, SubmitTxRequest, SubmitTxResponse, decode_response,
+    BookSnapshot, Market, MarketsPage, OrderQueryResponse, SubmitTxRequest, SubmitTxResponse,
+    decode_response,
 };
 use lightpool_sdk::{
     lightpool_types::SignedTransaction,
@@ -85,5 +86,50 @@ impl ClobIndexHttpClient {
             digest: body.digest,
             receipt: body.receipt,
         })
+    }
+
+    pub async fn query_order_by_chain_id(
+        &self,
+        spot_market: &str,
+        chain_order_id: &str,
+        user_address: Option<&str>,
+    ) -> anyhow::Result<Option<OrderQueryResponse>> {
+        let mut url = reqwest::Url::parse(&format!("{}/api/orders/query", self.base_url))?;
+        url.query_pairs_mut()
+            .append_pair("spot_market", spot_market)
+            .append_pair("chain_order_id", chain_order_id);
+        if let Some(user_address) = user_address {
+            url.query_pairs_mut()
+                .append_pair("user_address", user_address);
+        }
+
+        let response = self.client.get(url).send().await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(decode_response(response).await?))
+    }
+
+    pub async fn query_open_order_match(
+        &self,
+        spot_market: &str,
+        user_address: &str,
+        side: &str,
+        price: &str,
+        size_raw: u64,
+    ) -> anyhow::Result<Option<OrderQueryResponse>> {
+        let mut url = reqwest::Url::parse(&format!("{}/api/orders/query", self.base_url))?;
+        url.query_pairs_mut()
+            .append_pair("spot_market", spot_market)
+            .append_pair("user_address", user_address)
+            .append_pair("side", side)
+            .append_pair("price", price)
+            .append_pair("size_raw", &size_raw.to_string());
+
+        let response = self.client.get(url).send().await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(decode_response(response).await?))
     }
 }

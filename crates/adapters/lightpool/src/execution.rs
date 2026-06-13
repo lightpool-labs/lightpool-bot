@@ -1,8 +1,10 @@
 use std::sync::{
     atomic::{AtomicBool, Ordering},
+    Arc,
 };
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 use lightpool_sdk::{
     spot_events::extract_order_id_from_events, ActionBuilder, CancelOrderParams,
     OrderParamsType, OrderSide, PlaceOrderParams, Signer, TimeInForce, TransactionBuilder,
@@ -11,30 +13,39 @@ use lightpool_sdk::{
 use nautilus_common::{
     clients::ExecutionClient,
     live::{get_runtime, runner::get_exec_event_sender},
-    messages::execution::{CancelOrder, ModifyOrder, SubmitOrder},
+    messages::execution::{CancelOrder, ModifyOrder, QueryOrder, SubmitOrder},
 };
 use nautilus_core::{Params, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
 use nautilus_model::{
     accounts::AccountAny,
-    enums::{OmsType, OrderSide as NautilusOrderSide, OrderType},
-    identifiers::{AccountId, ClientId, Venue, VenueOrderId},
+    enums::{OmsType, OrderSide as NautilusOrderSide, OrderStatus, OrderType},
+    identifiers::{AccountId, ClientId, ClientOrderId, Venue, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
-    types::{AccountBalance, MarginBalance, Money},
+    reports::OrderStatusReport,
+    types::{AccountBalance, MarginBalance, Money, Quantity},
 };
 
 use crate::{
     common::{
         amounts::{
-            decimal_to_raw_amount, probability_to_limit_price, tick_size_from_instrument_info,
+            decimal_to_raw_amount, format_token_amount, limit_price_string,
+            probability_to_limit_price, tick_size_from_instrument_info,
         },
         currency::collateral_currency_code,
         signer::signer_from_private_key,
     },
     config::LightpoolExecClientConfig,
-    http::clob_index::ClobIndexHttpClient,
+    http::{clob_index::ClobIndexHttpClient, models::OrderQueryResponse},
 };
+
+#[derive(Debug, Clone)]
+enum SubmitOutcome {
+    Pending,
+    Accepted { chain_order_id: String },
+    Denied { reason: String },
+}
 
 pub struct LightpoolExecutionClient {
     core: ExecutionClientCore,
@@ -42,6 +53,7 @@ pub struct LightpoolExecutionClient {
     config: LightpoolExecClientConfig,
     clob_client: ClobIndexHttpClient,
     private_key: Option<String>,
+    pending_submits: Arc<DashMap<ClientOrderId, SubmitOutcome>>,
     is_stopped: AtomicBool,
 }
 
@@ -83,6 +95,7 @@ impl LightpoolExecutionClient {
             config,
             clob_client,
             private_key,
+            pending_submits: Arc::new(DashMap::new()),
             is_stopped: AtomicBool::new(false),
         })
     }
@@ -117,14 +130,20 @@ impl LightpoolExecutionClient {
         let emitter = self.emitter.clone();
         let clob_client = self.clob_client.clone();
         let ts_event = self.ts_event();
+        let client_order_id = order.client_order_id();
+        let pending_submits = self.pending_submits.clone();
 
+        self.pending_submits
+            .insert(client_order_id, SubmitOutcome::Pending);
         self.emitter.emit_order_submitted(&order);
 
         get_runtime().spawn(async move {
             let signer = match signer_from_private_key(&private_key) {
                 Ok(signer) => signer,
                 Err(e) => {
-                    emitter.emit_order_denied(&order, &format!("invalid signer: {e:#}"));
+                    let reason = format!("invalid signer: {e:#}");
+                    pending_submits.insert(client_order_id, SubmitOutcome::Denied { reason: reason.clone() });
+                    emitter.emit_order_denied(&order, &reason);
                     return;
                 }
             };
@@ -138,13 +157,26 @@ impl LightpoolExecutionClient {
             .await
             {
                 Ok(chain_order_id) => {
+                    pending_submits.insert(
+                        client_order_id,
+                        SubmitOutcome::Accepted {
+                            chain_order_id: chain_order_id.clone(),
+                        },
+                    );
                     emitter.emit_order_accepted(
                         &order,
                         VenueOrderId::from(chain_order_id.as_str()),
                         ts_event,
                     );
                 }
-                Err(e) => emitter.emit_order_denied(&order, &e.to_string()),
+                Err(e) => {
+                    let reason = e.to_string();
+                    pending_submits.insert(
+                        client_order_id,
+                        SubmitOutcome::Denied { reason: reason.clone() },
+                    );
+                    emitter.emit_order_denied(&order, &reason);
+                }
             }
         });
     }
@@ -155,6 +187,86 @@ fn instrument_info(instrument: &InstrumentAny) -> Option<&Params> {
         InstrumentAny::BinaryOption(binary_option) => binary_option.info.as_ref(),
         _ => None,
     }
+}
+
+fn order_side_label(side: NautilusOrderSide) -> Option<&'static str> {
+    match side {
+        NautilusOrderSide::Buy => Some("buy"),
+        NautilusOrderSide::Sell => Some("sell"),
+        _ => None,
+    }
+}
+
+fn map_index_status(status: &str, filled_raw: u64) -> OrderStatus {
+    match status {
+        "filled" => OrderStatus::Filled,
+        "cancelled" => OrderStatus::Canceled,
+        "partial_filled" => OrderStatus::PartiallyFilled,
+        "open" if filled_raw > 0 => OrderStatus::PartiallyFilled,
+        "open" => OrderStatus::Accepted,
+        _ => OrderStatus::Accepted,
+    }
+}
+
+fn build_order_status_report(
+    account_id: AccountId,
+    order: &OrderAny,
+    query: &OrderQueryResponse,
+    ts_init: UnixNanos,
+    ts_event: UnixNanos,
+) -> anyhow::Result<OrderStatusReport> {
+    let quantity = Quantity::from(query.order.size.as_str());
+    let filled_qty = Quantity::from(format_token_amount(query.filled_raw).as_str());
+    Ok(OrderStatusReport::new(
+        account_id,
+        order.instrument_id(),
+        Some(order.client_order_id()),
+        VenueOrderId::from(query.chain_order_id.as_str()),
+        order.order_side(),
+        order.order_type(),
+        order.time_in_force(),
+        map_index_status(&query.order.status, query.filled_raw),
+        quantity,
+        filled_qty,
+        order.ts_accepted().unwrap_or(ts_event),
+        ts_event,
+        ts_init,
+        None,
+    ))
+}
+
+async fn query_order_from_index(
+    clob_client: &ClobIndexHttpClient,
+    instrument: &InstrumentAny,
+    order: &OrderAny,
+    spot_market: &str,
+    venue_order_id: Option<VenueOrderId>,
+    user_address: Option<&str>,
+) -> anyhow::Result<Option<OrderQueryResponse>> {
+    if let Some(venue_order_id) = venue_order_id {
+        return clob_client
+            .query_order_by_chain_id(spot_market, venue_order_id.as_str(), user_address)
+            .await;
+    }
+
+    let Some(user_address) = user_address else {
+        return Ok(None);
+    };
+    let Some(side) = order_side_label(order.order_side()) else {
+        return Ok(None);
+    };
+    let price_decimal = order
+        .price()
+        .ok_or_else(|| anyhow::anyhow!("limit order missing price"))?
+        .as_decimal();
+    let price = limit_price_string(
+        price_decimal,
+        tick_size_from_instrument_info(instrument_info(instrument)),
+    )?;
+    let size_raw = decimal_to_raw_amount(order.quantity().as_decimal())?;
+    clob_client
+        .query_open_order_match(spot_market, user_address, side, &price, size_raw)
+        .await
 }
 
 async fn submit_limit_order_via_index(
@@ -478,6 +590,107 @@ impl ExecutionClient for LightpoolExecutionClient {
                 ),
             }
         });
+        Ok(())
+    }
+
+    fn query_order(&self, cmd: QueryOrder) -> anyhow::Result<()> {
+        log::debug!("query_order: client_order_id={}", cmd.client_order_id);
+
+        let order = {
+            let cache = self.core.cache();
+            let Some(order_ref) = cache.order(&cmd.client_order_id) else {
+                log::debug!("query_order: order not in cache {}", cmd.client_order_id);
+                return Ok(());
+            };
+            order_ref.cloned()
+        };
+
+        if let Some(outcome) = self.pending_submits.get(&cmd.client_order_id) {
+            match outcome.value() {
+                SubmitOutcome::Denied { reason } => {
+                    self.emitter.emit_order_denied(&order, reason);
+                    self.pending_submits.remove(&cmd.client_order_id);
+                    return Ok(());
+                }
+                SubmitOutcome::Accepted { chain_order_id } => {
+                    if order.venue_order_id().is_none() {
+                        self.emitter.emit_order_accepted(
+                            &order,
+                            VenueOrderId::from(chain_order_id.as_str()),
+                            self.ts_event(),
+                        );
+                    }
+                    self.pending_submits.remove(&cmd.client_order_id);
+                    return Ok(());
+                }
+                SubmitOutcome::Pending => {}
+            }
+        }
+
+        let instrument = match self.core.cache().instrument(&order.instrument_id()) {
+            Some(instrument) => instrument.clone(),
+            None => {
+                log::debug!(
+                    "query_order: instrument not found for {}",
+                    order.instrument_id()
+                );
+                return Ok(());
+            }
+        };
+
+        let spot_market = instrument.raw_symbol().to_string();
+        let venue_order_id = cmd.venue_order_id.or(order.venue_order_id());
+        let private_key = self.private_key.clone();
+        let clob_client = self.clob_client.clone();
+        let emitter = self.emitter.clone();
+        let account_id = self.core.account_id;
+        let ts_init = cmd.ts_init;
+        let ts_event = self.ts_event();
+
+        get_runtime().spawn(async move {
+            let user_address = private_key
+                .as_deref()
+                .and_then(|key| signer_from_private_key(key).ok())
+                .map(|signer| signer.address().to_string());
+
+            let result = query_order_from_index(
+                &clob_client,
+                &instrument,
+                &order,
+                &spot_market,
+                venue_order_id,
+                user_address.as_deref(),
+            )
+            .await;
+
+            match result {
+                Ok(Some(query)) => {
+                    match build_order_status_report(account_id, &order, &query, ts_init, ts_event) {
+                        Ok(report) => emitter.send_order_status_report(report),
+                        Err(error) => log::warn!(
+                            "query_order: failed to build status report for {}: {error:#}",
+                            order.client_order_id()
+                        ),
+                    }
+                    if order.venue_order_id().is_none() {
+                        emitter.emit_order_accepted(
+                            &order,
+                            VenueOrderId::from(query.chain_order_id.as_str()),
+                            ts_event,
+                        );
+                    }
+                }
+                Ok(None) => log::debug!(
+                    "query_order: no indexed order found for {}",
+                    order.client_order_id()
+                ),
+                Err(error) => log::warn!(
+                    "query_order: clob-index lookup failed for {}: {error:#}",
+                    order.client_order_id()
+                ),
+            }
+        });
+
         Ok(())
     }
 }

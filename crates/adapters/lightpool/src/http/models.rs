@@ -55,6 +55,30 @@ pub struct MarketsPage {
     pub offset: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexedOrder {
+    pub id: Uuid,
+    pub market_id: Uuid,
+    #[serde(default)]
+    pub market_slug: String,
+    pub question: String,
+    pub outcome: String,
+    pub side: String,
+    pub price: String,
+    pub size: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderQueryResponse {
+    pub order: IndexedOrder,
+    pub chain_order_id: String,
+    pub spot_market: String,
+    pub user_address: String,
+    pub size_raw: u64,
+    pub filled_raw: u64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct SubmitTxRequest {
     pub tx: SignedTransaction,

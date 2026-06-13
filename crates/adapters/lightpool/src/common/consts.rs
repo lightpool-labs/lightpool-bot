@@ -20,3 +20,6 @@ pub const PRICE_TICK: &str = "0.001";
 
 pub const DEFAULT_CLOB_INDEX_HTTP: &str = "http://127.0.0.1:3002";
 pub const DEFAULT_CLOB_INDEX_WS: &str = "ws://127.0.0.1:3002";
+
+/// Default spot tick size (0.001) in raw token units.
+pub const DEFAULT_TICK_SIZE_RAW: u64 = 1_000;

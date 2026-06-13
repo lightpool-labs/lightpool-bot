@@ -152,6 +152,11 @@ async fn main() -> Result<()> {
     if lightpool_enabled {
         let lightpool_data_config = LightpoolDataClientConfig::new(lightpool_slugs.clone())
             .with_book_depth(u32::try_from(args.depth).unwrap_or(10));
+        log::info!(
+            "LightPool data via clob-index http={} ws={}",
+            lightpool_data_config.clob_index_http_url,
+            lightpool_data_config.clob_index_ws_url,
+        );
         node_builder = node_builder
             .add_data_client(
                 None,
@@ -163,6 +168,10 @@ async fn main() -> Result<()> {
 
     if trading_enabled {
         let lightpool_exec_config = LightpoolExecClientConfig::default();
+        log::info!(
+            "LightPool execution via clob-index http={}",
+            lightpool_exec_config.clob_index_http_url,
+        );
         node_builder = node_builder
             .add_exec_client(
                 None,

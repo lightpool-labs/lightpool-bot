@@ -214,7 +214,7 @@ impl LiquidityMaker {
             )
         };
 
-        log::info!(
+        log::debug!(
             "{venue_label} cache order book slug={slug} market_key={market_key} \
              instrument_id={instrument_id} batch={batch} sequence={} update_count={} \
              bids=[{}] asks=[{}]",
