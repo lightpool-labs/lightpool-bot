@@ -301,7 +301,7 @@ impl LiquidityMaker {
             let lp_yes_spot = instrument_spot_market(&cache, lp_yes_id);
             let lp_no_spot = instrument_spot_market(&cache, lp_no_id);
 
-            log::info!(
+            log::debug!(
                 "LightPool pair slug={lp_slug} yes_id={lp_yes_id} ({}) spot={} \
                  no_id={lp_no_id} ({}) spot={}",
                 lp_yes_outcome.as_str(),
@@ -339,7 +339,7 @@ impl LiquidityMaker {
                     );
                 }
 
-                log::info!(
+                log::debug!(
                     "pm_to_lp mapping condition={} \
                      pm_yes={pm_yes_id} -> lp_yes={lp_yes_id} \
                      pm_no={pm_no_id} -> lp_no={lp_no_id}",
@@ -456,7 +456,7 @@ impl LiquidityMaker {
         polymarket_instrument_id: InstrumentId,
         lightpool_instrument_id: InstrumentId,
     ) -> anyhow::Result<()> {
-        if !self.config.trading_enabled || !self.config.lightpool_enabled {
+        if self.shutdown_requested || !self.config.trading_enabled || !self.config.lightpool_enabled {
             return Ok(());
         }
 

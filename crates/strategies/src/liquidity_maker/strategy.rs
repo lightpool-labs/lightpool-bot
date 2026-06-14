@@ -59,6 +59,8 @@ pub struct LiquidityMaker {
     pub(super) delta_batches: AHashMap<InstrumentId, u64>,
     /// Polymarket instrument id -> paired LightPool instrument id.
     pub(super) pm_to_lp: AHashMap<InstrumentId, InstrumentId>,
+    /// Set in `on_stop` so reconcile does not emit new orders during shutdown.
+    pub(super) shutdown_requested: bool,
 }
 
 impl LiquidityMaker {
@@ -76,6 +78,7 @@ impl LiquidityMaker {
             subscribed_instruments: AHashSet::new(),
             delta_batches: AHashMap::new(),
             pm_to_lp: AHashMap::new(),
+            shutdown_requested: false,
         }
     }
 
@@ -153,7 +156,7 @@ impl LiquidityMaker {
     }
 
     fn maybe_reconcile_lightpool(&mut self, instrument_id: InstrumentId) {
-        if !self.config.trading_enabled || instrument_id.venue.as_str() != LIGHTPOOL_VENUE {
+        if self.shutdown_requested || !self.config.trading_enabled || instrument_id.venue.as_str() != LIGHTPOOL_VENUE {
             return;
         }
         if let Err(e) = self.reconcile_from_lightpool_order_event(instrument_id) {
@@ -343,6 +346,8 @@ impl DataActor for LiquidityMaker {
     }
 
     fn on_stop(&mut self) -> anyhow::Result<()> {
+        self.shutdown_requested = true;
+        log::info!("LiquidityMaker stopping; disabling LightPool order reconciliation");
         for instrument_id in self.subscribed_instruments.clone() {
             self.unsubscribe_book_deltas(instrument_id, None, None);
         }
@@ -351,13 +356,13 @@ impl DataActor for LiquidityMaker {
 
     fn on_book_deltas(&mut self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
         self.sync_markets_from_cache();
-        self.reconcile_subscriptions();
-        self.rebuild_instrument_pairs();
+        //self.reconcile_subscriptions();
+        //self.rebuild_instrument_pairs();
 
         let instrument_id = deltas.instrument_id;
         let venue = instrument_id.venue.as_str();
 
-        if venue == POLYMARKET_VENUE && self.config.trading_enabled {
+        if venue == POLYMARKET_VENUE && self.config.trading_enabled && !self.shutdown_requested {
             if let Err(e) = self.reconcile_from_polymarket_delta(instrument_id) {
                 log::warn!(
                     "Failed to reconcile LightPool liquidity for {instrument_id}: {e:#}"

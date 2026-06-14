@@ -1,8 +1,13 @@
+use std::time::Duration;
+
 use reqwest::Client;
 
 use super::models::{
     BookSnapshot, Market, MarketsPage, OrderQueryResponse, SubmitTxRequest, SubmitTxResponse,
     decode_response,
+};
+use crate::config::{
+    clob_index_http_connect_timeout_secs_from_env, clob_index_http_timeout_secs_from_env,
 };
 use lightpool_sdk::{
     lightpool_types::SignedTransaction,
@@ -17,14 +22,20 @@ pub struct ClobIndexHttpClient {
 
 impl ClobIndexHttpClient {
     pub fn new(base_url: impl Into<String>) -> Self {
+        let connect_timeout_secs = clob_index_http_connect_timeout_secs_from_env();
+        let timeout_secs = clob_index_http_timeout_secs_from_env();
+        let base_url = base_url.into().trim_end_matches('/').to_string();
         let client = Client::builder()
             .http1_only()
+            .connect_timeout(Duration::from_secs(connect_timeout_secs))
+            .timeout(Duration::from_secs(timeout_secs))
             .build()
             .unwrap_or_else(|_| Client::new());
-        Self {
-            client,
-            base_url: base_url.into().trim_end_matches('/').to_string(),
-        }
+        log::info!(
+            "ClobIndexHttpClient base_url={base_url} connect_timeout_secs={connect_timeout_secs} \
+             request_timeout_secs={timeout_secs}"
+        );
+        Self { client, base_url }
     }
 
     pub async fn get_market_by_slug(&self, slug: &str) -> anyhow::Result<Market> {

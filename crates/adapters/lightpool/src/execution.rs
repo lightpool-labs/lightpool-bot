@@ -54,7 +54,7 @@ pub struct LightpoolExecutionClient {
     clob_client: ClobIndexHttpClient,
     private_key: Option<String>,
     pending_submits: Arc<DashMap<ClientOrderId, SubmitOutcome>>,
-    is_stopped: AtomicBool,
+    stopped: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for LightpoolExecutionClient {
@@ -64,7 +64,7 @@ impl std::fmt::Debug for LightpoolExecutionClient {
             .field("emitter", &self.emitter)
             .field("config", &self.config)
             .field("has_private_key", &self.private_key.is_some())
-            .field("is_stopped", &self.is_stopped)
+            .field("stopped", &self.stopped.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -96,8 +96,12 @@ impl LightpoolExecutionClient {
             clob_client,
             private_key,
             pending_submits: Arc::new(DashMap::new()),
-            is_stopped: AtomicBool::new(false),
+            stopped: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
     }
 
     fn ts_event(&self) -> UnixNanos {
@@ -111,6 +115,12 @@ impl LightpoolExecutionClient {
     }
 
     fn submit_limit_order(&self, order: OrderAny) {
+        if self.is_stopped() {
+            self.emitter
+                .emit_order_denied(&order, "Lightpool execution client stopped");
+            return;
+        }
+
         let Some(private_key) = self.private_key.clone() else {
             self.emitter
                 .emit_order_denied(&order, "LIGHTPOOL_PRIVATE_KEY not configured");
@@ -132,12 +142,17 @@ impl LightpoolExecutionClient {
         let ts_event = self.ts_event();
         let client_order_id = order.client_order_id();
         let pending_submits = self.pending_submits.clone();
+        let stopped = self.stopped.clone();
 
         self.pending_submits
             .insert(client_order_id, SubmitOutcome::Pending);
         self.emitter.emit_order_submitted(&order);
 
         get_runtime().spawn(async move {
+            if stopped.load(Ordering::Acquire) {
+                emitter.emit_order_denied(&order, "Lightpool execution client stopped");
+                return;
+            }
             let signer = match signer_from_private_key(&private_key) {
                 Ok(signer) => signer,
                 Err(e) => {
@@ -388,9 +403,10 @@ impl ExecutionClient for LightpoolExecutionClient {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
-        if self.is_stopped.swap(true, Ordering::AcqRel) {
+        if self.stopped.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
+        log::info!("Lightpool execution client stopped; rejecting new execution commands");
         self.core.set_stopped();
         self.core.set_disconnected();
         Ok(())
@@ -426,11 +442,23 @@ impl ExecutionClient for LightpoolExecutionClient {
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
-        self.core.set_disconnected();
+        self.stop()?;
         Ok(())
     }
 
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
+        if self.is_stopped() {
+            let order = self
+                .core
+                .cache()
+                .order(&cmd.client_order_id)
+                .ok_or_else(|| anyhow::anyhow!("order not found: {}", cmd.client_order_id))?
+                .clone();
+            self.emitter
+                .emit_order_denied(&order, "Lightpool execution client stopped");
+            return Ok(());
+        }
+
         let order = self
             .core
             .cache()
@@ -449,10 +477,6 @@ impl ExecutionClient for LightpoolExecutionClient {
     }
 
     fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
-        let private_key = self
-            .private_key
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("LIGHTPOOL_PRIVATE_KEY not configured"))?;
         let order = self
             .core
             .cache()
@@ -462,6 +486,21 @@ impl ExecutionClient for LightpoolExecutionClient {
         let venue_order_id = order
             .venue_order_id()
             .ok_or_else(|| anyhow::anyhow!("order has no venue order id"))?;
+
+        if self.is_stopped() {
+            self.emitter.emit_order_cancel_rejected(
+                &order,
+                Some(venue_order_id),
+                "Lightpool execution client stopped",
+                self.ts_event(),
+            );
+            return Ok(());
+        }
+
+        let private_key = self
+            .private_key
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("LIGHTPOOL_PRIVATE_KEY not configured"))?;
         let instrument = self
             .core
             .cache()
@@ -476,8 +515,18 @@ impl ExecutionClient for LightpoolExecutionClient {
         let clob_client = self.clob_client.clone();
         let emitter = self.emitter.clone();
         let ts_event = self.ts_event();
+        let stopped = self.stopped.clone();
 
         get_runtime().spawn(async move {
+            if stopped.load(Ordering::Acquire) {
+                emitter.emit_order_cancel_rejected(
+                    &order,
+                    Some(venue_order_id),
+                    "Lightpool execution client stopped",
+                    ts_event,
+                );
+                return;
+            }
             let signer = match signer_from_private_key(&private_key) {
                 Ok(signer) => signer,
                 Err(e) => {
@@ -505,16 +554,27 @@ impl ExecutionClient for LightpoolExecutionClient {
     }
 
     fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
-        let private_key = self
-            .private_key
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("LIGHTPOOL_PRIVATE_KEY not configured"))?;
         let order = self
             .core
             .cache()
             .order(&cmd.client_order_id)
             .ok_or_else(|| anyhow::anyhow!("order not found: {}", cmd.client_order_id))?
             .clone();
+
+        if self.is_stopped() {
+            self.emitter.emit_order_modify_rejected(
+                &order,
+                cmd.venue_order_id.or(order.venue_order_id()),
+                "Lightpool execution client stopped",
+                self.ts_event(),
+            );
+            return Ok(());
+        }
+
+        let private_key = self
+            .private_key
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("LIGHTPOOL_PRIVATE_KEY not configured"))?;
 
         if cmd.price.is_some() {
             self.emitter.emit_order_modify_rejected(
@@ -545,11 +605,34 @@ impl ExecutionClient for LightpoolExecutionClient {
             .as_str()
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid venue order id: {e}"))?;
+        log::info!(
+            "modify_order: start client_order_id={} venue_order_id={} instrument_id={} spot_market={} new_quantity={}",
+            order.client_order_id(),
+            venue_order_id,
+            order.instrument_id(),
+            spot_market,
+            new_quantity,
+        );
         let clob_client = self.clob_client.clone();
         let emitter = self.emitter.clone();
         let ts_event = self.ts_event();
+        let stopped = self.stopped.clone();
 
         get_runtime().spawn(async move {
+            if stopped.load(Ordering::Acquire) {
+                log::warn!(
+                    "modify_order: rejected client_order_id={} venue_order_id={} reason=execution_client_stopped",
+                    order.client_order_id(),
+                    venue_order_id,
+                );
+                emitter.emit_order_modify_rejected(
+                    &order,
+                    Some(venue_order_id),
+                    "Lightpool execution client stopped",
+                    ts_event,
+                );
+                return;
+            }
             let signer = match signer_from_private_key(&private_key) {
                 Ok(signer) => signer,
                 Err(e) => {
@@ -573,21 +656,38 @@ impl ExecutionClient for LightpoolExecutionClient {
             )
             .await
             {
-                Ok(()) => emitter.emit_order_updated(
-                    &order,
-                    venue_order_id,
-                    new_quantity,
-                    None,
-                    None,
-                    None,
-                    ts_event,
-                ),
-                Err(e) => emitter.emit_order_modify_rejected(
-                    &order,
-                    Some(venue_order_id),
-                    &e.to_string(),
-                    ts_event,
-                ),
+                Ok(digest) => {
+                    log::info!(
+                        "modify_order: receipt received client_order_id={} venue_order_id={} chain_order_id={} digest={digest} new_quantity={}",
+                        order.client_order_id(),
+                        venue_order_id,
+                        chain_order_id,
+                        new_quantity,
+                    );
+                    emitter.emit_order_updated(
+                        &order,
+                        venue_order_id,
+                        new_quantity,
+                        None,
+                        None,
+                        None,
+                        ts_event,
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "modify_order: failed client_order_id={} venue_order_id={} chain_order_id={} error={e:#}",
+                        order.client_order_id(),
+                        venue_order_id,
+                        chain_order_id,
+                    );
+                    emitter.emit_order_modify_rejected(
+                        &order,
+                        Some(venue_order_id),
+                        &e.to_string(),
+                        ts_event,
+                    );
+                }
             }
         });
         Ok(())
@@ -754,7 +854,7 @@ async fn update_order_via_index(
     spot_market_str: &str,
     chain_order_id: u64,
     new_quantity: nautilus_model::types::Quantity,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let spot_market = parse_token_contract(spot_market_str)
         .map_err(|e| anyhow::anyhow!("invalid spot market: {e}"))?;
     let amount = decimal_to_raw_amount(new_quantity.as_decimal())?;
@@ -774,11 +874,20 @@ async fn update_order_via_index(
         .expiration(u64::MAX)
         .add_action(action)
         .build_and_sign_only(signer)?;
+    let digest = hex::encode(tx.digest().as_bytes());
+    log::info!(
+        "modify_order: submitting HTTP update_order client_order_id={} chain_order_id={} spot_market={} digest={} amount_raw={}",
+        order.client_order_id(),
+        chain_order_id,
+        spot_market_str,
+        digest,
+        amount,
+    );
     let response = clob_client.submit_transaction(tx).await?;
     if !response.receipt.is_success() {
         anyhow::bail!("update_order failed: {:?}", response.receipt.status);
     }
-    Ok(())
+    Ok(response.digest)
 }
 
 pub fn default_account_id() -> AccountId {

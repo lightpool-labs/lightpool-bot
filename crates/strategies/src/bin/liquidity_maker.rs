@@ -34,7 +34,7 @@ use lightpool_strategies::{LiquidityMaker, LiquidityMakerConfig};
 use log::LevelFilter;
 use nautilus_common::{enums::Environment, logging::logger::LoggerConfig};
 use nautilus_lightpool::{
-    config::{LightpoolDataClientConfig, LightpoolExecClientConfig},
+    config::{LightpoolDataClientConfig, LightpoolExecClientConfig, resolve_private_key},
     factories::{LightpoolDataClientFactory, LightpoolExecutionClientFactory},
 };
 use nautilus_live::node::LiveNode;
@@ -82,6 +82,12 @@ fn require_non_empty(name: &str, value: &str) -> Result<String> {
     Ok(trimmed)
 }
 
+const DEFAULT_PROXY: &str = "http://127.0.0.1:8118";
+
+fn proxy_url() -> Option<String> {
+    proxy_url_from_env().or_else(|| Some(DEFAULT_PROXY.to_string()))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -101,7 +107,7 @@ async fn main() -> Result<()> {
     };
     let lightpool_slugs = lightpool_slug.iter().cloned().collect::<Vec<_>>();
 
-    let proxy_url = proxy_url_from_env();
+    let proxy_url = proxy_url();
 
     let environment = Environment::Live;
     let trader_id = TraderId::from("LIQUIDITY-MAKER-001");
@@ -167,7 +173,12 @@ async fn main() -> Result<()> {
     }
 
     if trading_enabled {
-        let lightpool_exec_config = LightpoolExecClientConfig::default();
+        let private_key = resolve_private_key()
+            .context("failed to load LightPool private key for execution")?;
+        let lightpool_exec_config = LightpoolExecClientConfig {
+            private_key: Some(private_key),
+            ..Default::default()
+        };
         log::info!(
             "LightPool execution via clob-index http={}",
             lightpool_exec_config.clob_index_http_url,

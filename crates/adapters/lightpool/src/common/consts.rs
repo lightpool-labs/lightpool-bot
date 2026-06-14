@@ -21,5 +21,11 @@ pub const PRICE_TICK: &str = "0.001";
 pub const DEFAULT_CLOB_INDEX_HTTP: &str = "http://127.0.0.1:3002";
 pub const DEFAULT_CLOB_INDEX_WS: &str = "ws://127.0.0.1:3002";
 
+/// Total HTTP request timeout when calling lightpool-clob-index (submit waits for receipt).
+pub const DEFAULT_CLOB_INDEX_HTTP_TIMEOUT_SECS: u64 = 90;
+
+/// TCP connect timeout for lightpool-clob-index HTTP.
+pub const DEFAULT_CLOB_INDEX_HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
+
 /// Default spot tick size (0.001) in raw token units.
 pub const DEFAULT_TICK_SIZE_RAW: u64 = 1_000;
