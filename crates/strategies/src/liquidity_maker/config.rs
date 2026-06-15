@@ -34,7 +34,7 @@ pub struct LiquidityMakerConfig {
     /// When `true`, subscribe with managed books so the data engine also
     /// maintains an `OrderBook` in cache (`cache.order_book()`).
     pub managed_book: bool,
-    /// When `true`, subscribe to LightPool order books for the same slugs.
+    /// When `true`, resolve LightPool markets for trading (no order book subscription).
     pub lightpool_enabled: bool,
     /// When `true`, print Polymarket order book snapshots from cache.
     pub log_polymarket: bool,
@@ -42,6 +42,8 @@ pub struct LiquidityMakerConfig {
     pub trading_enabled: bool,
     /// Execution client id for LightPool order submission.
     pub lightpool_client_id: ClientId,
+    /// Number of Polymarket book deltas to batch before reconciling once.
+    pub reconcile_delta_batch_size: u64,
 }
 
 impl LiquidityMakerConfig {
@@ -63,6 +65,7 @@ impl LiquidityMakerConfig {
             log_polymarket: true,
             trading_enabled: false,
             lightpool_client_id: ClientId::from("LIGHTPOOL"),
+            reconcile_delta_batch_size: 10,
         }
     }
 
@@ -117,6 +120,12 @@ impl LiquidityMakerConfig {
     #[must_use]
     pub fn with_lightpool_client_id(mut self, client_id: ClientId) -> Self {
         self.lightpool_client_id = client_id;
+        self
+    }
+
+    #[must_use]
+    pub fn with_reconcile_delta_batch_size(mut self, reconcile_delta_batch_size: u64) -> Self {
+        self.reconcile_delta_batch_size = reconcile_delta_batch_size.max(1);
         self
     }
 }

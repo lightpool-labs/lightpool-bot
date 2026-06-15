@@ -34,7 +34,7 @@ use lightpool_strategies::{LiquidityMaker, LiquidityMakerConfig};
 use log::LevelFilter;
 use nautilus_common::{enums::Environment, logging::logger::LoggerConfig};
 use nautilus_lightpool::{
-    config::{LightpoolDataClientConfig, LightpoolExecClientConfig},
+    config::{LightpoolDataClientConfig, LightpoolExecClientConfig, resolve_private_key},
     factories::{LightpoolDataClientFactory, LightpoolExecutionClientFactory},
 };
 use nautilus_live::node::LiveNode;
@@ -72,6 +72,9 @@ struct Args {
     /// Disable LightPool order mirroring (data/logging only).
     #[arg(long, default_value_t = false)]
     no_trading: bool,
+    /// Number of Polymarket book deltas to batch before reconciling once.
+    #[arg(long, default_value_t = 10)]
+    reconcile_delta_batch_size: u64,
 }
 
 fn require_non_empty(name: &str, value: &str) -> Result<String> {
@@ -80,6 +83,12 @@ fn require_non_empty(name: &str, value: &str) -> Result<String> {
         bail!("{name} must be non-empty");
     }
     Ok(trimmed)
+}
+
+const DEFAULT_PROXY: &str = "http://127.0.0.1:8118";
+
+fn proxy_url() -> Option<String> {
+    proxy_url_from_env().or_else(|| Some(DEFAULT_PROXY.to_string()))
 }
 
 #[tokio::main]
@@ -101,7 +110,7 @@ async fn main() -> Result<()> {
     };
     let lightpool_slugs = lightpool_slug.iter().cloned().collect::<Vec<_>>();
 
-    let proxy_url = proxy_url_from_env();
+    let proxy_url = proxy_url();
 
     let environment = Environment::Live;
     let trader_id = TraderId::from("LIQUIDITY-MAKER-001");
@@ -152,6 +161,11 @@ async fn main() -> Result<()> {
     if lightpool_enabled {
         let lightpool_data_config = LightpoolDataClientConfig::new(lightpool_slugs.clone())
             .with_book_depth(u32::try_from(args.depth).unwrap_or(10));
+        log::info!(
+            "LightPool data via clob-index http={} ws={}",
+            lightpool_data_config.clob_index_http_url,
+            lightpool_data_config.clob_index_ws_url,
+        );
         node_builder = node_builder
             .add_data_client(
                 None,
@@ -162,7 +176,17 @@ async fn main() -> Result<()> {
     }
 
     if trading_enabled {
-        let lightpool_exec_config = LightpoolExecClientConfig::default();
+        let private_key = resolve_private_key()
+            .context("failed to load LightPool private key for execution")?;
+        let lightpool_exec_config = LightpoolExecClientConfig {
+            private_key: Some(private_key),
+            market_slugs: lightpool_slugs.clone(),
+            ..Default::default()
+        };
+        log::info!(
+            "LightPool execution via clob-index http={}",
+            lightpool_exec_config.clob_index_http_url,
+        );
         node_builder = node_builder
             .add_exec_client(
                 None,
@@ -181,6 +205,7 @@ async fn main() -> Result<()> {
         .with_lightpool_enabled(lightpool_enabled)
         .with_log_polymarket(!args.no_polymarket_log)
         .with_trading_enabled(trading_enabled)
+        .with_reconcile_delta_batch_size(args.reconcile_delta_batch_size)
         .with_strategy_id(strategy_id);
 
     log::info!(

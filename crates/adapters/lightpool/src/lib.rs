@@ -4,7 +4,8 @@
 
 //! NautilusTrader adapter for [LightPool](https://github.com/lightpool) prediction markets.
 //!
-//! Reads order books from `lightpool-clob-index` and submits orders on-chain via `lightpool-sdk`.
+//! Reads order books from `lightpool-clob-index` and submits signed transactions through clob-index.
+//! The bot never opens RPC/WS connections to the lightpool node itself.
 
 #![warn(rustc::all)]
 #![deny(unsafe_code)]

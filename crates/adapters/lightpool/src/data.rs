@@ -28,7 +28,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    common::consts::LIGHTPOOL_VENUE,
+    common::consts::{DEFAULT_TICK_SIZE_RAW, LIGHTPOOL_VENUE},
     config::LightpoolDataClientConfig,
     http::clob_index::ClobIndexHttpClient,
     parse::{instruments_for_market, parse_book_delta, parse_book_snapshot},
@@ -82,7 +82,12 @@ impl LightpoolDataClient {
         let mut count = 0usize;
 
         for market in markets {
-            for instrument in instruments_for_market(&market, ts_init)? {
+            for instrument in instruments_for_market(
+                &market,
+                DEFAULT_TICK_SIZE_RAW,
+                DEFAULT_TICK_SIZE_RAW,
+                ts_init,
+            )? {
                 let instrument_id = instrument.id();
                 let spot_market = instrument.raw_symbol().to_string();
                 self.spot_market_by_instrument
@@ -116,7 +121,6 @@ impl LightpoolDataClient {
         };
 
         let depth = self.config.book_depth;
-        let http_client = self.http_client.clone();
         let ws_client = self.ws_client.clone();
         let data_sender = self.data_sender.clone();
         let clock = self.clock;
@@ -125,18 +129,6 @@ impl LightpoolDataClient {
         let active_delta_subs = self.active_delta_subs.clone();
 
         let handle = get_runtime().spawn(async move {
-            if let Ok(snapshot) = http_client.fetch_book_snapshot(&spot_market, depth).await {
-                let ts_init = clock.get_time_ns();
-                match parse_book_snapshot(&snapshot, instrument_id, ts_init) {
-                    Ok(deltas) => {
-                        let _ = data_sender.send(DataEvent::Data(NautilusData::Deltas(
-                            OrderBookDeltas_API::new(deltas),
-                        )));
-                    }
-                    Err(e) => log::warn!("Failed to parse book snapshot for {instrument_id}: {e}"),
-                }
-            }
-
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
             if let Err(e) = ws_client
                 .subscribe_orderbook(spot_market, depth, tx, cancel.clone())
@@ -250,7 +242,7 @@ impl DataClient for LightpoolDataClient {
         if self.is_connected() {
             return Ok(());
         }
-        log::info!("Connecting Lightpool data client");
+        log::info!("Connecting Lightpool data client via clob-index http={} ws={}", self.config.clob_index_http_url, self.config.clob_index_ws_url);
         self.cancellation_token = CancellationToken::new();
         self.bootstrap_instruments().await?;
         self.is_connected.store(true, Ordering::Relaxed);
