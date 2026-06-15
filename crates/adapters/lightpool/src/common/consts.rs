@@ -13,6 +13,9 @@ pub static LIGHTPOOL_CLIENT_ID: LazyLock<ClientId> =
 /// Collateral token symbol used for LightPool spot markets (quote currency).
 pub const DEFAULT_COLLATERAL_CURRENCY: &str = "USDT";
 
+/// Default on-chain collateral token when `LIGHTPOOL_COLLATERAL_TOKEN` is unset.
+pub const DEFAULT_COLLATERAL_TOKEN: &str = "0x0200000000000001";
+
 /// LightPool spot prices are quoted in USDT probability (0-1).
 pub const MIN_PRICE: &str = "0";
 pub const MAX_PRICE: &str = "1";

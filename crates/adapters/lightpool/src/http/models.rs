@@ -79,6 +79,26 @@ pub struct OrderQueryResponse {
     pub filled_raw: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BalanceEntry {
+    pub token: String,
+    pub symbol: String,
+    pub total: String,
+    pub locked: String,
+    pub available: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BalancesRequest {
+    pub tokens: Vec<BalanceTokenSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BalanceTokenSpec {
+    pub symbol: String,
+    pub address: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct SubmitTxRequest {
     pub tx: SignedTransaction,

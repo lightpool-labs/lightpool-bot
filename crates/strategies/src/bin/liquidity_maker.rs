@@ -177,6 +177,7 @@ async fn main() -> Result<()> {
             .context("failed to load LightPool private key for execution")?;
         let lightpool_exec_config = LightpoolExecClientConfig {
             private_key: Some(private_key),
+            market_slugs: lightpool_slugs.clone(),
             ..Default::default()
         };
         log::info!(

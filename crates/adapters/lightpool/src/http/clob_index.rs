@@ -3,8 +3,8 @@ use std::time::Duration;
 use reqwest::Client;
 
 use super::models::{
-    BookSnapshot, Market, MarketsPage, OrderQueryResponse, SubmitTxRequest, SubmitTxResponse,
-    decode_response,
+    BalanceEntry, BalanceTokenSpec, BookSnapshot, Market, MarketsPage, OrderQueryResponse,
+    SubmitTxRequest, SubmitTxResponse, decode_response,
 };
 use crate::config::{
     clob_index_http_connect_timeout_secs_from_env, clob_index_http_timeout_secs_from_env,
@@ -63,6 +63,24 @@ impl ClobIndexHttpClient {
             self.base_url
         );
         let response = self.client.get(&url).send().await?;
+        decode_response(response).await
+    }
+
+    pub async fn get_balances(
+        &self,
+        address: &str,
+        tokens: &[BalanceTokenSpec],
+    ) -> anyhow::Result<Vec<BalanceEntry>> {
+        let address = address.trim();
+        let url = format!("{}/api/accounts/{address}/balances", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .json(&super::models::BalancesRequest {
+                tokens: tokens.clone(),
+            })
+            .send()
+            .await?;
         decode_response(response).await
     }
 

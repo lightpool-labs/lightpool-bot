@@ -13,7 +13,7 @@ use lightpool_sdk::{
 use nautilus_common::{
     clients::ExecutionClient,
     live::{get_runtime, runner::get_exec_event_sender},
-    messages::execution::{CancelOrder, ModifyOrder, QueryOrder, SubmitOrder},
+    messages::execution::{CancelOrder, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder},
 };
 use nautilus_core::{Params, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
@@ -33,6 +33,7 @@ use crate::{
             decimal_to_raw_amount, format_token_amount, limit_price_string,
             probability_to_limit_price, tick_size_from_instrument_info,
         },
+        balances::fetch_account_balances,
         currency::collateral_currency_code,
         signer::signer_from_private_key,
     },
@@ -108,10 +109,29 @@ impl LightpoolExecutionClient {
         get_atomic_clock_realtime().get_time_ns()
     }
 
-    fn initial_account_balances(&self) -> Vec<AccountBalance> {
+    fn placeholder_account_balances(&self) -> Vec<AccountBalance> {
         let code = collateral_currency_code();
         let zero = Money::from(format!("0 {code}"));
         vec![AccountBalance::new(zero.clone(), zero.clone(), zero)]
+    }
+
+    fn spawn_account_state_refresh(&self) {
+        if self.is_stopped() {
+            return;
+        }
+
+        let Some(private_key) = self.private_key.clone() else {
+            return;
+        };
+
+        spawn_account_balance_refresh(
+            private_key,
+            self.clob_client.clone(),
+            self.emitter.clone(),
+            self.core.cache(),
+            self.config.market_slugs.clone(),
+            self.stopped.clone(),
+        );
     }
 
     fn submit_limit_order(&self, order: OrderAny) {
@@ -143,6 +163,8 @@ impl LightpoolExecutionClient {
         let client_order_id = order.client_order_id();
         let pending_submits = self.pending_submits.clone();
         let stopped = self.stopped.clone();
+        let refresh_cache = self.core.cache();
+        let refresh_market_slugs = self.config.market_slugs.clone();
 
         self.pending_submits
             .insert(client_order_id, SubmitOutcome::Pending);
@@ -182,6 +204,14 @@ impl LightpoolExecutionClient {
                         &order,
                         VenueOrderId::from(chain_order_id.as_str()),
                         ts_event,
+                    );
+                    spawn_account_balance_refresh(
+                        private_key.clone(),
+                        clob_client.clone(),
+                        emitter.clone(),
+                        refresh_cache,
+                        refresh_market_slugs.clone(),
+                        stopped.clone(),
                     );
                 }
                 Err(e) => {
@@ -431,7 +461,39 @@ impl ExecutionClient for LightpoolExecutionClient {
             },
         }
         let ts_event = self.ts_event();
-        self.generate_account_state(self.initial_account_balances(), vec![], false, ts_event)?;
+        let mut balances_reported = false;
+
+        if let Some(private_key) = self.private_key.as_deref() {
+            if let Ok(signer) = signer_from_private_key(private_key) {
+                let address = signer.address().to_string();
+                match fetch_account_balances(
+                    &self.clob_client,
+                    &self.core.cache(),
+                    &self.config.market_slugs,
+                    &address,
+                )
+                .await
+                {
+                    Ok(balances) => {
+                        log::info!(
+                            "Lightpool account balances loaded address={address} entries={}",
+                            balances.len()
+                        );
+                        self.generate_account_state(balances, vec![], true, ts_event)?;
+                        balances_reported = true;
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to load Lightpool balances at connect address={address}: {e:#}"
+                        );
+                    }
+                }
+            }
+        }
+
+        if !balances_reported {
+            self.generate_account_state(self.placeholder_account_balances(), vec![], false, ts_event)?;
+        }
         log::info!(
             "Registered LightPool account_id={} collateral={}",
             self.account_id(),
@@ -516,6 +578,8 @@ impl ExecutionClient for LightpoolExecutionClient {
         let emitter = self.emitter.clone();
         let ts_event = self.ts_event();
         let stopped = self.stopped.clone();
+        let refresh_cache = self.core.cache();
+        let refresh_market_slugs = self.config.market_slugs.clone();
 
         get_runtime().spawn(async move {
             if stopped.load(Ordering::Acquire) {
@@ -541,7 +605,17 @@ impl ExecutionClient for LightpoolExecutionClient {
             };
             match cancel_order_via_index(&clob_client, &signer, &spot_market, chain_order_id).await
             {
-                Ok(()) => emitter.emit_order_canceled(&order, Some(venue_order_id), ts_event),
+                Ok(()) => {
+                    emitter.emit_order_canceled(&order, Some(venue_order_id), ts_event);
+                    spawn_account_balance_refresh(
+                        private_key.clone(),
+                        clob_client.clone(),
+                        emitter.clone(),
+                        refresh_cache,
+                        refresh_market_slugs.clone(),
+                        stopped.clone(),
+                    );
+                }
                 Err(e) => emitter.emit_order_cancel_rejected(
                     &order,
                     Some(venue_order_id),
@@ -605,7 +679,7 @@ impl ExecutionClient for LightpoolExecutionClient {
             .as_str()
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid venue order id: {e}"))?;
-        log::info!(
+        log::debug!(
             "modify_order: start client_order_id={} venue_order_id={} instrument_id={} spot_market={} new_quantity={}",
             order.client_order_id(),
             venue_order_id,
@@ -617,6 +691,8 @@ impl ExecutionClient for LightpoolExecutionClient {
         let emitter = self.emitter.clone();
         let ts_event = self.ts_event();
         let stopped = self.stopped.clone();
+        let refresh_cache = self.core.cache();
+        let refresh_market_slugs = self.config.market_slugs.clone();
 
         get_runtime().spawn(async move {
             if stopped.load(Ordering::Acquire) {
@@ -657,7 +733,7 @@ impl ExecutionClient for LightpoolExecutionClient {
             .await
             {
                 Ok(digest) => {
-                    log::info!(
+                    log::debug!(
                         "modify_order: receipt received client_order_id={} venue_order_id={} chain_order_id={} digest={digest} new_quantity={}",
                         order.client_order_id(),
                         venue_order_id,
@@ -672,6 +748,14 @@ impl ExecutionClient for LightpoolExecutionClient {
                         None,
                         None,
                         ts_event,
+                    );
+                    spawn_account_balance_refresh(
+                        private_key.clone(),
+                        clob_client.clone(),
+                        emitter.clone(),
+                        refresh_cache,
+                        refresh_market_slugs.clone(),
+                        stopped.clone(),
                     );
                 }
                 Err(e) => {
@@ -690,6 +774,11 @@ impl ExecutionClient for LightpoolExecutionClient {
                 }
             }
         });
+        Ok(())
+    }
+
+    fn query_account(&self, _cmd: QueryAccount) -> anyhow::Result<()> {
+        self.spawn_account_state_refresh();
         Ok(())
     }
 
@@ -875,7 +964,7 @@ async fn update_order_via_index(
         .add_action(action)
         .build_and_sign_only(signer)?;
     let digest = hex::encode(tx.digest().as_bytes());
-    log::info!(
+    log::debug!(
         "modify_order: submitting HTTP update_order client_order_id={} chain_order_id={} spot_market={} digest={} amount_raw={}",
         order.client_order_id(),
         chain_order_id,
@@ -888,6 +977,46 @@ async fn update_order_via_index(
         anyhow::bail!("update_order failed: {:?}", response.receipt.status);
     }
     Ok(response.digest)
+}
+
+fn spawn_account_balance_refresh(
+    private_key: String,
+    clob_client: ClobIndexHttpClient,
+    emitter: ExecutionEventEmitter,
+    cache: nautilus_common::cache::CacheView,
+    market_slugs: Vec<String>,
+    stopped: Arc<AtomicBool>,
+) {
+    get_runtime().spawn(async move {
+        if stopped.load(Ordering::Acquire) {
+            return;
+        }
+
+        let signer = match signer_from_private_key(&private_key) {
+            Ok(signer) => signer,
+            Err(e) => {
+                log::warn!("account state refresh skipped: invalid signer: {e:#}");
+                return;
+            }
+        };
+        let address = signer.address().to_string();
+
+        match fetch_account_balances(&clob_client, &cache, &market_slugs, &address).await {
+            Ok(balances) => {
+                let ts_event = get_atomic_clock_realtime().get_time_ns();
+                emitter.emit_account_state(balances, vec![], true, ts_event);
+                log::debug!(
+                    "Lightpool account balances refreshed address={address} entries={}",
+                    balances.len()
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "Lightpool account balance refresh failed address={address}: {e:#}"
+                );
+            }
+        }
+    });
 }
 
 pub fn default_account_id() -> AccountId {

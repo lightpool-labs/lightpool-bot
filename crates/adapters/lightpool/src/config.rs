@@ -2,11 +2,9 @@ use std::{fmt::Debug, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::{
-    consts::{
-        DEFAULT_CLOB_INDEX_HTTP, DEFAULT_CLOB_INDEX_HTTP_CONNECT_TIMEOUT_SECS,
-        DEFAULT_CLOB_INDEX_HTTP_TIMEOUT_SECS, DEFAULT_CLOB_INDEX_WS,
-    },
+use crate::common::consts::{
+    DEFAULT_COLLATERAL_TOKEN, DEFAULT_CLOB_INDEX_HTTP, DEFAULT_CLOB_INDEX_HTTP_CONNECT_TIMEOUT_SECS,
+    DEFAULT_CLOB_INDEX_HTTP_TIMEOUT_SECS, DEFAULT_CLOB_INDEX_WS,
 };
 
 fn nonempty_env(var: &str) -> Option<String> {
@@ -62,6 +60,17 @@ pub fn clob_index_http_connect_timeout_secs_from_env() -> u64 {
 #[must_use]
 pub fn private_key_from_env() -> Option<String> {
     nonempty_env("LIGHTPOOL_PRIVATE_KEY")
+}
+
+#[must_use]
+pub fn collateral_token_from_env() -> Option<String> {
+    nonempty_env("LIGHTPOOL_COLLATERAL_TOKEN")
+}
+
+/// Resolve collateral token contract: `LIGHTPOOL_COLLATERAL_TOKEN` or [`DEFAULT_COLLATERAL_TOKEN`].
+#[must_use]
+pub fn resolve_collateral_token() -> String {
+    collateral_token_from_env().unwrap_or_else(|| DEFAULT_COLLATERAL_TOKEN.to_string())
 }
 
 fn cli_wallet_path() -> Option<PathBuf> {
@@ -141,6 +150,8 @@ impl LightpoolDataClientConfig {
 pub struct LightpoolExecClientConfig {
     pub clob_index_http_url: String,
     pub private_key: Option<String>,
+    /// Market slugs used to resolve collateral and outcome token addresses before cache is warm.
+    pub market_slugs: Vec<String>,
 }
 
 impl Default for LightpoolExecClientConfig {
@@ -148,6 +159,7 @@ impl Default for LightpoolExecClientConfig {
         Self {
             clob_index_http_url: clob_index_http_from_env(),
             private_key: private_key_from_env(),
+            market_slugs: Vec::new(),
         }
     }
 }
