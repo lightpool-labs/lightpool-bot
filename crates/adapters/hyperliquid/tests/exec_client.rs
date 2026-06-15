@@ -1042,14 +1042,11 @@ fn create_test_exec_config(addr: SocketAddr) -> HyperliquidExecClientConfig {
     }
 }
 
-fn assert_adapter_cloid_marker(cloid: &str) {
+fn assert_valid_cloid(cloid: &str) {
     assert!(cloid.starts_with("0x"));
     assert_eq!(cloid.len(), 34);
-    assert_eq!(&cloid[2..6], "6e42");
     assert!(cloid[2..].chars().all(|c| c.is_ascii_hexdigit()));
     assert!(cloid[2..].chars().all(|c| !c.is_ascii_uppercase()));
-    assert_eq!(cloid.as_bytes()[14], b'4');
-    assert!(matches!(cloid.as_bytes()[18], b'8' | b'9' | b'a' | b'b'));
 }
 
 async fn create_test_trade_signer(addr: SocketAddr) -> HyperliquidHttpClient {
@@ -1133,7 +1130,7 @@ async fn test_ws_trading_submit_order_sends_builder_and_cloid() {
             .and_then(|v| v.as_u64()),
         Some(0),
     );
-    assert_adapter_cloid_marker(cloid);
+    assert_valid_cloid(cloid);
     assert_eq!(
         signer
             .cached_client_order_id_cloid(&client_order_id)
@@ -1141,6 +1138,59 @@ async fn test_ws_trading_submit_order_sends_builder_and_cloid() {
             .to_hex(),
         cloid
     );
+
+    ws_client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ws_trading_submit_order_omits_builder_when_attribution_disabled() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let mut signer = create_test_trade_signer(addr).await;
+    signer.set_include_builder_attribution(false);
+    let mut ws_client = HyperliquidWebSocketClient::new(
+        Some(format!("ws://{addr}/ws")),
+        HyperliquidEnvironment::Mainnet,
+        None,
+        TransportBackend::default(),
+        None,
+    );
+    ws_client.set_post_timeout(Duration::from_secs(1));
+    ws_client.connect().await.unwrap();
+
+    ws_client
+        .submit_order(
+            &signer,
+            InstrumentId::from(HYPERLIQUID_TEST_INSTRUMENT),
+            ClientOrderId::new("O-WS-ATTRIBUTION-OFF"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            Quantity::from("0.0001"),
+            TimeInForce::Gtc,
+            Some(Price::from("56730.0")),
+            None,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let action = state
+        .last_exchange_action
+        .lock()
+        .await
+        .clone()
+        .expect("missing WS action");
+    let order = &action["orders"][0];
+    let cloid = order
+        .get("c")
+        .and_then(|v| v.as_str())
+        .expect("order should include cloid");
+
+    assert_eq!(action.get("type").and_then(|v| v.as_str()), Some("order"));
+    assert!(action.get("builder").is_none());
+    assert_valid_cloid(cloid);
 
     ws_client.disconnect().await.unwrap();
 }
@@ -1197,7 +1247,7 @@ async fn test_ws_trading_cancel_and_modify_send_expected_actions() {
             .and_then(|v| v.as_str()),
         Some(cancel_cloid_hex.as_str()),
     );
-    assert_adapter_cloid_marker(&cancel_cloid_hex);
+    assert_valid_cloid(&cancel_cloid_hex);
 
     let modify_coid = ClientOrderId::new("O-WS-MODIFY");
     ws_client
@@ -1253,7 +1303,7 @@ async fn test_ws_trading_cancel_and_modify_send_expected_actions() {
         modify_order.get("c").and_then(|v| v.as_str()),
         Some(modify_cloid.as_str()),
     );
-    assert_adapter_cloid_marker(&modify_cloid);
+    assert_valid_cloid(&modify_cloid);
     assert_eq!(
         ws_client.get_cloid_mapping(&Ustr::from(&modify_cloid)),
         Some(modify_coid),
@@ -1703,6 +1753,16 @@ fn create_test_execution_client(
     tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
     Rc<RefCell<Cache>>,
 ) {
+    create_test_execution_client_from_config(create_test_exec_config(addr))
+}
+
+fn create_test_execution_client_from_config(
+    config: HyperliquidExecClientConfig,
+) -> (
+    HyperliquidExecutionClient,
+    tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    Rc<RefCell<Cache>>,
+) {
     let trader_id = TraderId::from("TESTER-001");
     let account_id = AccountId::from("HYPERLIQUID-001");
     let client_id = *HYPERLIQUID_CLIENT_ID;
@@ -1719,8 +1779,6 @@ fn create_test_execution_client(
         None,
         cache.clone(),
     );
-
-    let config = create_test_exec_config(addr);
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     set_exec_event_sender(tx);
@@ -2092,6 +2150,60 @@ async fn test_submit_order_ws_post_includes_builder_attribution() {
             .and_then(|v| v.as_u64()),
         Some(0),
     );
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_submit_order_ws_post_omits_builder_when_attribution_disabled() {
+    let state = TestServerState::default();
+    let exchange_count = state.exchange_request_count.clone();
+    let last_action = state.last_exchange_action.clone();
+    let addr = start_mock_server(state).await;
+    let mut config = create_test_exec_config(addr);
+    config.include_builder_attribution = false;
+
+    let (mut client, _rx, cache) = create_test_execution_client_from_config(config);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.connect().await.unwrap();
+
+    let order = make_limit_order("O-BUILDER-OFF-WS");
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+
+    let cmd = SubmitOrder::from_order(
+        &order,
+        order.trader_id(),
+        Some(*HYPERLIQUID_CLIENT_ID),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+    );
+
+    client.submit_order(cmd).unwrap();
+
+    wait_until_async(
+        move || {
+            let exchange_count = exchange_count.clone();
+            async move { *exchange_count.lock().await >= 1 }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let action = last_action.lock().await.clone().expect("missing WS action");
+    let order = &action["orders"][0];
+    let cloid = order
+        .get("c")
+        .and_then(|v| v.as_str())
+        .expect("order should include cloid");
+
+    assert_eq!(action.get("type").and_then(|v| v.as_str()), Some("order"));
+    assert!(action.get("builder").is_none());
+    assert_valid_cloid(cloid);
 
     client.disconnect().await.unwrap();
 }

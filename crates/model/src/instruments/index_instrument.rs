@@ -22,7 +22,7 @@ use nautilus_core::{
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
-use super::{Instrument, any::InstrumentAny};
+use super::{Instrument, any::InstrumentAny, tick_scheme::check_tick_scheme};
 use crate::{
     enums::{AssetClass, InstrumentClass, OptionKind},
     identifiers::{InstrumentId, Symbol},
@@ -62,6 +62,8 @@ pub struct IndexInstrument {
     pub price_increment: Price,
     /// The minimum size increment.
     pub size_increment: Quantity,
+    /// The registered variable tick scheme name.
+    pub tick_scheme: Option<Ustr>,
     /// Additional instrument metadata as a JSON-serializable dictionary.
     pub info: Option<Params>,
     /// UNIX timestamp (nanoseconds) when the data event occurred.
@@ -73,12 +75,13 @@ pub struct IndexInstrument {
 impl IndexInstrument {
     /// Creates a new [`IndexInstrument`] instance with correctness checking.
     ///
-    /// # Notes
-    ///
-    /// PyO3 requires a `Result` type for proper error handling and stacktrace printing in Python.
     /// # Errors
     ///
     /// Returns an error if any input validation fails.
+    ///
+    /// # Notes
+    ///
+    /// PyO3 requires a `Result` type for proper error handling and stacktrace printing in Python.
     #[expect(clippy::too_many_arguments)]
     pub fn new_checked(
         instrument_id: InstrumentId,
@@ -88,6 +91,7 @@ impl IndexInstrument {
         size_precision: u8,
         price_increment: Price,
         size_increment: Quantity,
+        tick_scheme: Option<Ustr>,
         info: Option<Params>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
@@ -106,6 +110,7 @@ impl IndexInstrument {
         )?;
         check_positive_price(price_increment, stringify!(price_increment))?;
         check_positive_quantity(size_increment, stringify!(size_increment))?;
+        check_tick_scheme(tick_scheme)?;
 
         Ok(Self {
             id: instrument_id,
@@ -115,6 +120,7 @@ impl IndexInstrument {
             size_precision,
             price_increment,
             size_increment,
+            tick_scheme,
             info,
             ts_event,
             ts_init,
@@ -136,6 +142,7 @@ impl IndexInstrument {
         size_precision: u8,
         price_increment: Price,
         size_increment: Quantity,
+        tick_scheme: Option<Ustr>,
         info: Option<Params>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
@@ -148,6 +155,7 @@ impl IndexInstrument {
             size_precision,
             price_increment,
             size_increment,
+            tick_scheme,
             info,
             ts_event,
             ts_init,
@@ -171,6 +179,9 @@ impl Hash for IndexInstrument {
 }
 
 impl Instrument for IndexInstrument {
+    fn tick_scheme(&self) -> Option<Ustr> {
+        self.tick_scheme
+    }
     fn into_any(self) -> InstrumentAny {
         InstrumentAny::IndexInstrument(self)
     }
@@ -327,6 +338,7 @@ mod tests {
             0,
             Price::from("0.01"),
             Quantity::from("1"),
+            None,
             None,
             0.into(),
             0.into(),

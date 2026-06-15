@@ -59,6 +59,7 @@ use nautilus_model::{
         quantity::QuantityRaw,
     },
 };
+use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use crate::{
@@ -2355,10 +2356,10 @@ impl OrderMatchingEngine {
 
     fn option_should_exercise(&self, underlying_price: Price) -> bool {
         let strike = match self.instrument.strike_price() {
-            Some(p) => p.as_f64(),
+            Some(p) => p.as_decimal(),
             None => return false,
         };
-        let spot = underlying_price.as_f64();
+        let spot = underlying_price.as_decimal();
         match self.instrument.option_kind() {
             Some(OptionKind::Call) => spot > strike,
             Some(OptionKind::Put) => strike > spot,
@@ -2375,13 +2376,13 @@ impl OrderMatchingEngine {
             return strike;
         }
 
-        let spot = underlying_price.as_f64();
-        let strike_f = strike.as_f64();
+        let spot = underlying_price.as_decimal();
+        let strike_value = strike.as_decimal();
         let value = match self.instrument.option_kind() {
-            Some(OptionKind::Call) => (spot - strike_f).max(0.0),
-            _ => (strike_f - spot).max(0.0),
+            Some(OptionKind::Call) => (spot - strike_value).max(Decimal::ZERO),
+            _ => (strike_value - spot).max(Decimal::ZERO),
         };
-        Price::new(value, strike.precision)
+        Price::from_decimal_dp(value, strike.precision).expect("Invalid option settlement price")
     }
 
     fn option_exercise_position(
@@ -2441,10 +2442,11 @@ impl OrderMatchingEngine {
         custom_option_price: Option<Price>,
     ) {
         let multiplier = self.instrument.multiplier();
-        let underlying_qty = Quantity::new(
-            position.quantity.as_f64() * multiplier.as_f64(),
+        let underlying_qty = Quantity::from_decimal_dp(
+            position.quantity.as_decimal() * multiplier.as_decimal(),
             underlying_instrument.size_precision(),
-        );
+        )
+        .expect("Invalid underlying settlement quantity");
 
         let underlying_side = if self.instrument.option_kind() == Some(OptionKind::Call) {
             position.side
@@ -2461,8 +2463,8 @@ impl OrderMatchingEngine {
         let close_trade_id = format!("{trade_base}-CLOSE");
         let open_trade_id = format!("{trade_base}-OPEN");
         let settlement_px = self.option_settlement_price(underlying_price, false);
-        let option_close_px = custom_option_price
-            .unwrap_or_else(|| Price::new(0.0, self.instrument.price_precision()));
+        let option_close_px =
+            custom_option_price.unwrap_or_else(|| Price::zero(self.instrument.price_precision()));
         let close_side = OrderCore::closing_side(position.side);
         let underlying_order_side = match underlying_side {
             PositionSide::Long => OrderSide::Buy,
@@ -2515,8 +2517,8 @@ impl OrderMatchingEngine {
     ) {
         let venue = self.venue;
         let trade_id = format!("{venue}-LEG-OTM-{}", &UUID4::new().to_string()[..8]);
-        let close_px = custom_option_price
-            .unwrap_or_else(|| Price::new(0.0, self.instrument.price_precision()));
+        let close_px =
+            custom_option_price.unwrap_or_else(|| Price::zero(self.instrument.price_precision()));
         let close_side = OrderCore::closing_side(position.side);
         self.option_register_settlement_order(
             position,
@@ -2613,7 +2615,7 @@ impl OrderMatchingEngine {
             ts_now,
             false,
             Some(position.id),
-            Some(Money::new(0.0, self.instrument.quote_currency())),
+            Some(Money::zero(self.instrument.quote_currency())),
         )
     }
 
@@ -2651,7 +2653,7 @@ impl OrderMatchingEngine {
             ts_now,
             false,
             None,
-            Some(Money::new(0.0, underlying_instrument.quote_currency())),
+            Some(Money::zero(underlying_instrument.quote_currency())),
         )
     }
 
@@ -4649,6 +4651,16 @@ impl OrderMatchingEngine {
             .unwrap_or_else(|| order.filled_qty());
         let initial_total_filled = total_filled;
         let mut last_fill_px: Option<Price> = None;
+        let mut reduce_only_remaining_raw = None;
+        let mut reduce_only_filled_raw = None;
+
+        if self.config.use_reduce_only
+            && order.is_reduce_only()
+            && let Some(current_position) = position
+        {
+            reduce_only_remaining_raw = Some(current_position.quantity.raw);
+            reduce_only_filled_raw = Some(total_filled.raw);
+        }
 
         for &(fill_px, fill_qty) in fills {
             let Some(mut fill_px) = self.normalize_fill_price(fill_px, order.client_order_id())
@@ -4675,31 +4687,16 @@ impl OrderMatchingEngine {
                 }
             }
 
-            // Check reduce only order
-            // If the incoming simulated fill would exceed the position when reduce-only is honored,
-            // clamp the effective fill size to the adjusted (remaining position) quantity.
             let mut effective_fill_qty = fill_qty;
 
-            if self.config.use_reduce_only
-                && order.is_reduce_only()
-                && let Some(position) = &position
-                && fill_qty > position.quantity
-            {
-                if position.quantity == Quantity::zero(position.quantity.precision) {
-                    // Done
+            if let Some(remaining_raw) = reduce_only_remaining_raw {
+                if remaining_raw == 0 {
                     return;
                 }
 
-                // Adjusted target quantity equals the remaining position size
-                let adjusted_fill_qty =
-                    Quantity::from_raw(position.quantity.raw, fill_qty.precision);
-
-                // Determine the effective fill size for this iteration first
-                effective_fill_qty = min(effective_fill_qty, adjusted_fill_qty);
-
-                // Only emit an update if the order quantity actually changes
-                if order.quantity() != adjusted_fill_qty {
-                    self.generate_order_updated(order, adjusted_fill_qty, None, None, None);
+                if effective_fill_qty.raw > remaining_raw {
+                    effective_fill_qty =
+                        Quantity::from_raw(remaining_raw, effective_fill_qty.precision);
                 }
             }
 
@@ -4718,7 +4715,33 @@ impl OrderMatchingEngine {
                 effective_fill_qty,
                 order.quantity().saturating_sub(total_filled),
             );
+            let reduce_only_exhausts_position = reduce_only_remaining_raw
+                .is_some_and(|remaining_raw| capped_fill_qty.raw >= remaining_raw);
+
+            if reduce_only_exhausts_position {
+                let reduce_only_target_raw = reduce_only_filled_raw
+                    .unwrap_or(initial_total_filled.raw)
+                    .checked_add(capped_fill_qty.raw)
+                    .expect("Overflow occurred when adding reduce-only target quantity");
+                let reduce_only_target =
+                    Quantity::from_raw(reduce_only_target_raw, order.quantity().precision);
+
+                if order.quantity() != reduce_only_target {
+                    self.generate_order_updated(order, reduce_only_target, None, None, None);
+                }
+            }
+
             total_filled = total_filled.add(capped_fill_qty);
+
+            if let Some(remaining_raw) = reduce_only_remaining_raw.as_mut() {
+                *remaining_raw = remaining_raw.saturating_sub(capped_fill_qty.raw);
+            }
+
+            if let Some(filled_raw) = reduce_only_filled_raw.as_mut() {
+                *filled_raw = filled_raw
+                    .checked_add(capped_fill_qty.raw)
+                    .expect("Overflow occurred when adding reduce-only filled quantity");
+            }
 
             self.fill_order(
                 order,
@@ -4732,6 +4755,11 @@ impl OrderMatchingEngine {
 
             if order.order_type() == OrderType::MarketToLimit && initial_market_to_limit_fill {
                 // Filled initial level
+                return;
+            }
+
+            if reduce_only_exhausts_position {
+                self.purge_cached_filled_qty_if_closed(order.client_order_id());
                 return;
             }
         }
@@ -4779,7 +4807,34 @@ impl OrderMatchingEngine {
                 }
             }
 
-            let leaves_qty = order.quantity().saturating_sub(total_filled);
+            let mut leaves_qty = order.quantity().saturating_sub(total_filled);
+
+            if let Some(remaining_raw) = reduce_only_remaining_raw {
+                if remaining_raw == 0 {
+                    return;
+                }
+
+                if leaves_qty.raw > remaining_raw {
+                    leaves_qty = Quantity::from_raw(remaining_raw, leaves_qty.precision);
+                }
+
+                if leaves_qty.raw >= remaining_raw {
+                    let reduce_only_target_raw = reduce_only_filled_raw
+                        .unwrap_or(initial_total_filled.raw)
+                        .checked_add(leaves_qty.raw)
+                        .expect("Overflow occurred when adding reduce-only target quantity");
+                    let reduce_only_target =
+                        Quantity::from_raw(reduce_only_target_raw, order.quantity().precision);
+
+                    if order.quantity() != reduce_only_target {
+                        self.generate_order_updated(order, reduce_only_target, None, None, None);
+                    }
+                }
+            }
+
+            if leaves_qty.is_zero() {
+                return;
+            }
 
             self.fill_order(
                 order,
@@ -4789,6 +4844,7 @@ impl OrderMatchingEngine {
                 venue_position_id,
                 position,
             );
+            self.purge_cached_filled_qty_if_closed(order.client_order_id());
         }
     }
 
@@ -4856,10 +4912,28 @@ impl OrderMatchingEngine {
             return;
         }
 
+        let fee_order;
+        let commission_order = if order.liquidity_side() == Some(liquidity_side) {
+            order
+        } else {
+            fee_order = {
+                let mut cloned = order.clone();
+                cloned.set_liquidity_side(liquidity_side);
+                cloned
+            };
+            &fee_order
+        };
+
         let underlying_px = self.fee_underlying_price();
         let commission = self
             .fee_model
-            .get_commission_with_context(order, last_qty, last_px, &self.instrument, underlying_px)
+            .get_commission_with_context(
+                commission_order,
+                last_qty,
+                last_px,
+                &self.instrument,
+                underlying_px,
+            )
             .unwrap_or_else(|e| {
                 panic!(
                     "Failed to compute commission for {}: {}",
@@ -6194,15 +6268,23 @@ impl BarTickSizes {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
-    use nautilus_model::types::{Quantity, fixed::FIXED_PRECISION, quantity::QuantityRaw};
+    use std::{cell::RefCell, rc::Rc};
+
+    use nautilus_common::{cache::Cache, clock::TestClock};
+    use nautilus_model::{
+        enums::{AccountType, BookType, LiquiditySide, OmsType, OrderSide, OrderType},
+        events::OrderEventAny,
+        identifiers::AccountId,
+        instruments::{Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt},
+        orders::{Order, OrderTestBuilder},
+        types::{Price, Quantity, fixed::FIXED_PRECISION, quantity::QuantityRaw},
+    };
     use rstest::rstest;
 
     use super::{BarTickSizes, OrderMatchingEngine};
+    use crate::models::{fee::FeeModelAny, fill::FillModelAny};
 
     fn assert_valid_bar_tick_sizes(volume: Quantity, size_increment: Quantity) {
         let sizes = BarTickSizes::from_volume(volume, size_increment);
@@ -6229,6 +6311,64 @@ mod tests {
                 volume.raw - total_raw,
             );
         }
+    }
+
+    #[rstest]
+    fn test_fill_order_calculates_commission_from_fill_liquidity_side() {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let mut engine = OrderMatchingEngine::new(
+            instrument.clone(),
+            1,
+            FillModelAny::default(),
+            FeeModelAny::default(),
+            BookType::L1_MBP,
+            OmsType::Netting,
+            AccountType::Margin,
+            clock,
+            cache,
+            Default::default(),
+        );
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let events_handler = Rc::clone(&events);
+        engine.set_event_handler(Rc::new(move |event| {
+            events_handler.borrow_mut().push(event);
+        }));
+
+        let mut order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.000"))
+            .submit(true)
+            .build();
+        order.set_liquidity_side(LiquiditySide::Maker);
+        engine
+            .account_ids
+            .insert(order.trader_id(), AccountId::from("ACCOUNT-001"));
+
+        engine.fill_order(
+            &order,
+            Price::from("1500.00"),
+            Quantity::from("1.000"),
+            LiquiditySide::Taker,
+            None,
+            None,
+        );
+
+        let events = events.borrow();
+        assert_eq!(events.len(), 1);
+        let fill = match &events[0] {
+            OrderEventAny::Filled(fill) => fill,
+            event => panic!("Expected OrderFilled, was {event:?}"),
+        };
+        let commission = fill.commission.expect("expected commission");
+        let expected_commission =
+            fill.last_qty.as_decimal() * fill.last_px.as_decimal() * instrument.taker_fee();
+
+        assert_eq!(fill.liquidity_side, LiquiditySide::Taker);
+        assert_eq!(commission.currency, instrument.quote_currency());
+        assert_eq!(commission.as_decimal(), expected_commission);
     }
 
     #[rstest]

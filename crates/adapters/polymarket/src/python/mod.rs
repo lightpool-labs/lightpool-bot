@@ -14,6 +14,10 @@
 // -------------------------------------------------------------------------------------------------
 
 //! Python bindings from `pyo3`.
+//!
+//! The Python v2 Polymarket boundary is configuration and factory registration.
+//! Provider, data, and execution operations stay in Rust. Add Python here only
+//! to expose Rust adapter types or register factories, not to run adapter logic.
 
 #![expect(
     clippy::missing_errors_doc,
@@ -26,7 +30,7 @@ pub mod sort;
 
 use nautilus_common::factories::{ClientConfig, DataClientFactory, ExecutionClientFactory};
 use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
-use nautilus_model::identifiers::InstrumentId;
+use nautilus_model::{data::ensure_rust_extractor_registered, identifiers::InstrumentId};
 use nautilus_system::get_global_pyo3_registry;
 use pyo3::{prelude::*, types::PyDict};
 
@@ -34,6 +38,10 @@ use crate::{
     common::consts::POLYMARKET,
     config::{
         PolymarketDataClientConfig, PolymarketExecClientConfig, PolymarketInstrumentProviderConfig,
+        PolymarketUpDownEventSlugConfig,
+    },
+    data_types::{
+        PolymarketRtdsCryptoPrice, PolymarketRtdsEquityPrice, register_polymarket_custom_data,
     },
     factories::{PolymarketDataClientFactory, PolymarketExecutionClientFactory},
 };
@@ -106,6 +114,25 @@ fn extract_string_map(
     Ok(map)
 }
 
+fn extract_event_slug_builder(
+    value: &Bound<'_, PyAny>,
+) -> PyResult<PolymarketUpDownEventSlugConfig> {
+    if let Ok(builder) = value.extract::<PolymarketUpDownEventSlugConfig>() {
+        return Ok(builder);
+    }
+
+    if value.extract::<String>().is_ok() {
+        return Err(to_pyvalue_err(
+            "Python callable event_slug_builder is not supported by the Rust Polymarket adapter; \
+             pass event_slugs, market_slugs, or PolymarketUpDownEventSlugConfig",
+        ));
+    }
+
+    Err(to_pyvalue_err(
+        "event_slug_builder must be PolymarketUpDownEventSlugConfig",
+    ))
+}
+
 fn extract_provider_config_from_pyobject(
     obj: &Bound<'_, PyAny>,
 ) -> PyResult<PolymarketInstrumentProviderConfig> {
@@ -131,7 +158,7 @@ fn extract_provider_config_from_pyobject(
         .map(|value| value.extract::<Vec<String>>())
         .transpose()?;
     let event_slug_builder = getattr_optional(obj, "event_slug_builder")?
-        .map(|value| value.extract::<String>())
+        .map(|value| extract_event_slug_builder(&value))
         .transpose()?;
     let log_warnings = getattr_optional(obj, "log_warnings")?
         .map(|value| value.extract::<bool>())
@@ -143,10 +170,7 @@ fn extract_provider_config_from_pyobject(
         .unwrap_or(default.use_gamma_markets);
 
     Ok(PolymarketInstrumentProviderConfig {
-        load_all: load_all
-            || event_slug_builder
-                .as_deref()
-                .is_some_and(|builder| !builder.trim().is_empty()),
+        load_all: load_all || event_slug_builder.is_some(),
         load_ids,
         filters,
         event_slugs,
@@ -174,6 +198,9 @@ fn extract_data_config_from_pyobject(
         .map(|value| value.extract::<String>())
         .transpose()?;
     let base_url_ws = getattr_optional(obj, "base_url_ws")?
+        .map(|value| value.extract::<String>())
+        .transpose()?;
+    let base_url_rtds = getattr_optional(obj, "base_url_rtds")?
         .map(|value| value.extract::<String>())
         .transpose()?;
     let base_url_gamma = getattr_optional(obj, "base_url_gamma")?
@@ -249,6 +276,7 @@ fn extract_data_config_from_pyobject(
         instrument_config,
         base_url_http,
         base_url_ws,
+        base_url_rtds,
         base_url_gamma,
         base_url_data_api,
         http_timeout_secs,
@@ -328,16 +356,23 @@ fn extract_polymarket_exec_config(
 #[pymodule]
 pub fn polymarket(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::common::enums::SignatureType>()?;
+    m.add_class::<PolymarketUpDownEventSlugConfig>()?;
     m.add_class::<PolymarketInstrumentProviderConfig>()?;
     m.add_class::<PolymarketDataClientConfig>()?;
     m.add_class::<PolymarketExecClientConfig>()?;
     m.add_class::<PolymarketDataClientFactory>()?;
     m.add_class::<PolymarketExecutionClientFactory>()?;
+    m.add_class::<PolymarketRtdsCryptoPrice>()?;
+    m.add_class::<PolymarketRtdsEquityPrice>()?;
     m.add_function(pyo3::wrap_pyfunction!(
         sort::py_polymarket_trade_sort_key,
         m
     )?)?;
     m.add_function(pyo3::wrap_pyfunction!(sort::py_polymarket_trade_id, m)?)?;
+
+    register_polymarket_custom_data();
+    let _result = ensure_rust_extractor_registered::<PolymarketRtdsCryptoPrice>();
+    let _result = ensure_rust_extractor_registered::<PolymarketRtdsEquityPrice>();
 
     let registry = get_global_pyo3_registry();
 
@@ -380,10 +415,22 @@ pub fn polymarket(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(all(test, feature = "python"))]
 mod tests {
+    use std::sync::Arc;
+
+    use nautilus_core::Params;
+    use nautilus_model::{
+        data::{CustomData, DataType, custom::CustomDataTrait, ensure_rust_extractor_registered},
+        types::Price,
+    };
     use pyo3::{prelude::*, types::PyDict};
     use rstest::rstest;
+    use serde_json::json;
 
     use super::extract_data_config_from_pyobject;
+    use crate::{
+        config::PolymarketUpDownEventSlugConfig,
+        data_types::{PolymarketRtdsCryptoPrice, register_polymarket_custom_data},
+    };
 
     #[rstest]
     fn extract_data_config_supports_python_style_namespace() {
@@ -391,10 +438,20 @@ mod tests {
         Python::attach(|py| {
             let types = py.import("types").expect("types");
             let namespace = types.getattr("SimpleNamespace").expect("SimpleNamespace");
+            let event_slug_builder = Py::new(
+                py,
+                PolymarketUpDownEventSlugConfig {
+                    assets: vec!["btc".to_string(), "eth".to_string()],
+                    interval_mins: 5,
+                    periods: 2,
+                    start_offset_periods: 0,
+                },
+            )
+            .expect("event slug builder should convert to Python object");
 
             let instrument_kwargs = PyDict::new(py);
             instrument_kwargs
-                .set_item("event_slug_builder", "pkg.module:build_event_slugs")
+                .set_item("event_slug_builder", event_slug_builder)
                 .unwrap();
             instrument_kwargs
                 .set_item("event_slugs", vec!["event-a", "event-b"])
@@ -423,6 +480,9 @@ mod tests {
                 .unwrap();
             config_kwargs
                 .set_item("base_url_gamma", "https://gamma.example")
+                .unwrap();
+            config_kwargs
+                .set_item("base_url_rtds", "wss://ws-live-data.example")
                 .unwrap();
             config_kwargs
                 .set_item("base_url_data_api", "https://data.example")
@@ -468,10 +528,16 @@ mod tests {
                 instrument_config.load_all,
                 "event_slug_builder should imply scoped load_all bootstrap"
             );
+            let event_slug_builder = instrument_config
+                .event_slug_builder
+                .expect("event_slug_builder should be extracted");
             assert_eq!(
-                instrument_config.event_slug_builder.as_deref(),
-                Some("pkg.module:build_event_slugs")
+                event_slug_builder.assets,
+                ["btc".to_string(), "eth".to_string()]
             );
+            assert_eq!(event_slug_builder.interval_mins, 5);
+            assert_eq!(event_slug_builder.periods, 2);
+            assert_eq!(event_slug_builder.start_offset_periods, 0);
             assert_eq!(
                 instrument_config.event_slugs.as_deref(),
                 Some(&["event-a".to_string(), "event-b".to_string()][..])
@@ -489,6 +555,10 @@ mod tests {
                 Some("https://gamma.example")
             );
             assert_eq!(
+                rust_config.base_url_rtds.as_deref(),
+                Some("wss://ws-live-data.example")
+            );
+            assert_eq!(
                 rust_config.base_url_data_api.as_deref(),
                 Some("https://data.example")
             );
@@ -498,6 +568,39 @@ mod tests {
             assert_eq!(rust_config.resolve_poll_interval_secs, 45);
             assert_eq!(rust_config.resolve_poll_grace_secs, 12);
             assert_eq!(rust_config.resolve_poll_max_wait_secs, 2400);
+        });
+    }
+
+    #[rstest]
+    fn extract_data_config_rejects_python_callable_event_slug_builder() {
+        Python::initialize();
+        Python::attach(|py| {
+            let types = py.import("types").expect("types");
+            let namespace = types.getattr("SimpleNamespace").expect("SimpleNamespace");
+
+            let instrument_kwargs = PyDict::new(py);
+            instrument_kwargs
+                .set_item("event_slug_builder", "pkg.module:build_event_slugs")
+                .unwrap();
+            let instrument_config = namespace
+                .call((), Some(&instrument_kwargs))
+                .expect("instrument namespace");
+
+            let config_kwargs = PyDict::new(py);
+            config_kwargs
+                .set_item("instrument_config", instrument_config)
+                .unwrap();
+            let config_obj = namespace
+                .call((), Some(&config_kwargs))
+                .expect("config namespace");
+
+            let err = extract_data_config_from_pyobject(py, &config_obj.unbind())
+                .expect_err("Python callable event_slug_builder should be rejected");
+
+            assert!(
+                err.to_string()
+                    .contains("Python callable event_slug_builder is not supported")
+            );
         });
     }
 
@@ -519,6 +622,59 @@ mod tests {
                 .expect("extract rust config");
 
             assert_eq!(rust_config.update_instruments_interval_mins, None);
+        });
+    }
+
+    #[rstest]
+    fn custom_data_getter_unwraps_rtds_payload_to_python_class() {
+        Python::initialize();
+        Python::attach(|py| {
+            register_polymarket_custom_data();
+            let _result = ensure_rust_extractor_registered::<PolymarketRtdsCryptoPrice>();
+
+            let mut metadata = Params::new();
+            metadata.insert("symbol".to_string(), json!("btcusdt"));
+            let payload = Arc::new(PolymarketRtdsCryptoPrice::new(
+                "btcusdt".to_string(),
+                Price::from("67234.50"),
+                1_753_314_088_395,
+                1_753_314_088_421,
+                nautilus_core::UnixNanos::from_millis(1_753_314_088_395),
+                nautilus_core::UnixNanos::from_millis(1_753_314_088_421),
+            ));
+            let custom = CustomData::new(
+                payload,
+                DataType::new(
+                    PolymarketRtdsCryptoPrice::type_name_static(),
+                    Some(metadata),
+                    None,
+                ),
+            );
+
+            let py_custom = Py::new(py, custom).expect("create Python CustomData");
+            let py_payload = py_custom.bind(py).getattr("data").expect("CustomData.data");
+
+            assert_eq!(
+                py_payload.get_type().name().expect("type name"),
+                "PolymarketRtdsCryptoPrice"
+            );
+            assert_eq!(
+                py_payload
+                    .getattr("symbol")
+                    .expect("symbol")
+                    .extract::<String>()
+                    .expect("extract symbol"),
+                "btcusdt"
+            );
+            assert_eq!(
+                py_payload
+                    .getattr("value")
+                    .expect("value")
+                    .str()
+                    .expect("value str")
+                    .to_string(),
+                "67234.50"
+            );
         });
     }
 }

@@ -137,15 +137,23 @@ The contract holds only when all of the following are true:
 
 ## Static enforcement
 
-A pre-commit hook named `check-dst-conventions` enforces the structural conditions in source.
+Static enforcement has two layers:
+
+- Clippy policy in `clippy.toml` and `[workspace.lints.clippy]` blocks APIs that are invalid
+  across the workspace DST contract: direct `getrandom::{fill,u32,u64}` calls and
+  `tokio::task::LocalSet`.
+- A pre-commit hook named `check-dst-conventions` enforces scoped, path-aware, and cfg-aware
+  structural checks that Clippy cannot express cleanly.
+
 The hook lives at `.pre-commit-hooks/check_dst_conventions.sh`, runs as part of the standard
 pre-commit suite, and runs in continuous integration. It covers the 16 in-scope workspace crates
 and fails the commit when it detects any of:
 
-- Raw `std::time::Instant::now()` or `SystemTime::now()` reads, including bare forms when the
-  enclosing file imports the type from `std::time`.
+- Raw `std::time::Instant::now()`, `SystemTime::now()`, or `chrono::Utc::now()` reads,
+  including bare forms when the enclosing file imports the type from `std::time`, or from
+  `chrono` for `Utc`.
 - Raw RNG usage (`rand::thread_rng`, `rand::rng()`, `fastrand::`, `getrandom::`, `OsRng`)
-  without cfg gating.
+  or `Uuid::new_v4()` without cfg gating.
 - `tokio::select!` blocks missing `biased;` within the first three lines.
 - `std::thread::spawn`, `std::thread::Builder::new`, or `tokio::task::spawn_blocking` calls that
   lack a preceding `#[cfg(test)]`, `#[cfg(not(madsim))]`, or
@@ -178,6 +186,40 @@ The hook applies to the 16 workspace crates in the transitive closure of `nautil
 
 Adapter crates and infrastructure crates (Redis, Postgres) are out of scope. Their DST
 suitability requires a separate audit before they enter the DST path.
+
+## Network seed soaks
+
+The `nautilus-network` Turmoil tests use two layers:
+
+- Fixed-seed tests run in the nightly test suite. These cover connect, reconnect, partition,
+  close during reconnect, close during backoff, and repeated server-drop scenarios with
+  reproducible seeds.
+- An ignored reconnect soak sweeps Turmoil seeds until stopped, or until
+  `NAUTILUS_TURMOIL_SOAK_COUNT` seeds have run. Each seed runs the Tungstenite WebSocket backend
+  first and the Sockudo backend second when `transport-sockudo` is enabled, so both backends see
+  the same schedule search path.
+
+Run the continuous soak with:
+
+```bash
+scripts/soak-network-turmoil.sh
+```
+
+Run a bounded soak with:
+
+```bash
+env NAUTILUS_TURMOIL_SOAK_COUNT=100 scripts/soak-network-turmoil.sh
+```
+
+The soak uses deterministic seed sweep, random node order, randomized link latency, repeated
+server-side drops, reconnect state cycling, and exact application-message order checks. It does
+not enable Turmoil `fail_rate`: for TCP, that breaks links without a retransmit model, which
+would overstate the client delivery contract for an order-preservation test.
+
+These Turmoil tests run against the simulated network and are not gated to Linux. Several real
+localhost socket and WebSocket unit tests use `target_os = "linux"` for CI stability, so macOS
+local runs do not exercise that host TCP coverage. Use macOS for the Turmoil seed sweep and use
+Linux CI, or a Linux workstation, before treating the full network test set as covered.
 
 ## Implementation notes
 

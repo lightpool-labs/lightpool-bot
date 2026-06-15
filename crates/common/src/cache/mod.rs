@@ -389,6 +389,11 @@ impl Cache {
             .map(|(id, position)| (id, SharedCell::new(position)))
             .collect();
 
+        if let Some(db) = &self.database {
+            self.index.order_position = db.load_index_order_position()?;
+            self.index.order_client = db.load_index_order_client()?;
+        }
+
         self.assign_position_ids_to_contingencies();
         Ok(())
     }
@@ -479,6 +484,11 @@ impl Cache {
                 .collect(),
             None => AHashMap::new(),
         };
+
+        if let Some(db) = &self.database {
+            self.index.order_position = db.load_index_order_position()?;
+            self.index.order_client = db.load_index_order_client()?;
+        }
 
         log::info!("Cached {} orders from database", self.general.len());
 
@@ -717,7 +727,7 @@ impl Cache {
         // Use exit price for mark-to-market: longs exit at bid, shorts exit at ask
         let last = match position.side {
             PositionSide::Flat | PositionSide::NoPositionSide => {
-                return Some(Money::new(0.0, position.settlement_currency));
+                return Some(Money::zero(position.settlement_currency));
             }
             PositionSide::Long => quote.bid_price,
             PositionSide::Short => quote.ask_price,
@@ -2384,33 +2394,13 @@ impl Cache {
                 continue;
             };
 
-            // In-memory index updates only. The persistent index entry (if any) was written by
-            // the original fill-time `add_position_id` call; replaying the database write here
-            // would invoke `CacheDatabaseAdapter::index_order_position`, which is currently
-            // `todo!()` on both the Redis and SQL adapters. Until those land, the load-time
-            // recovery is in-memory-only: sufficient for the current process to operate, but
-            // not durable across another restart.
-            self.index
-                .order_position
-                .insert(client_order_id, position_id);
-            self.index
-                .position_strategy
-                .insert(position_id, strategy_id);
-            self.index
-                .position_orders
-                .entry(position_id)
-                .or_default()
-                .insert(client_order_id);
-            self.index
-                .strategy_positions
-                .entry(strategy_id)
-                .or_default()
-                .insert(position_id);
-            self.index
-                .venue_positions
-                .entry(venue)
-                .or_default()
-                .insert(position_id);
+            // Re-indexing through `add_position_id` also replays the database write, making the
+            // recovered assignment durable across another restart.
+            if let Err(e) =
+                self.add_position_id(&position_id, &venue, &client_order_id, &strategy_id)
+            {
+                log::error!("Failed to re-index {client_order_id} -> {position_id}: {e}");
+            }
         }
     }
 
@@ -2868,8 +2858,8 @@ impl Cache {
     pub fn snapshot_position_state(
         &mut self,
         position: &Position,
-        // ts_snapshot: u64,
-        // unrealized_pnl: Option<Money>,
+        ts_snapshot: UnixNanos,
+        unrealized_pnl: Option<Money>,
         open_only: Option<bool>,
     ) -> anyhow::Result<()> {
         let open_only = open_only.unwrap_or(true);
@@ -2879,13 +2869,15 @@ impl Cache {
         }
 
         if let Some(database) = &mut self.database {
-            database.snapshot_position_state(position).map_err(|e| {
-                log::error!(
-                    "Failed to snapshot position state for {}: {e:?}",
-                    position.id
-                );
-                e
-            })?;
+            database
+                .snapshot_position_state(position, ts_snapshot, unrealized_pnl)
+                .map_err(|e| {
+                    log::error!(
+                        "Failed to snapshot position state for {}: {e:?}",
+                        position.id
+                    );
+                    e
+                })?;
         } else {
             log::warn!(
                 "Cannot snapshot position state for {} (no database configured)",
@@ -2893,8 +2885,7 @@ impl Cache {
             );
         }
 
-        // Ok(())
-        todo!()
+        Ok(())
     }
 
     /// Gets the OMS type for the `position_id`.
@@ -4898,6 +4889,11 @@ impl Cache {
     // -- DATA QUERIES ----------------------------------------------------------------------------
 
     /// Returns the price for the `instrument_id` and `price_type` (if found).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `price_type` is [`PriceType::Mid`] and the quote price precision is already at
+    /// the maximum fixed precision.
     #[must_use]
     pub fn price(&self, instrument_id: &InstrumentId, price_type: PriceType) -> Option<Price> {
         match price_type {
@@ -4911,10 +4907,11 @@ impl Cache {
                 .and_then(|quotes| quotes.front().map(|quote| quote.ask_price)),
             PriceType::Mid => self.quotes.get(instrument_id).and_then(|quotes| {
                 quotes.front().map(|quote| {
-                    Price::new(
-                        f64::midpoint(quote.ask_price.as_f64(), quote.bid_price.as_f64()),
-                        quote.bid_price.precision + 1,
-                    )
+                    let mid = (quote.ask_price.as_decimal() + quote.bid_price.as_decimal())
+                        / Decimal::TWO;
+
+                    Price::from_decimal_dp(mid, quote.bid_price.precision + 1)
+                        .expect("Invalid mid price for Cache::price")
                 })
             }),
             PriceType::Last => self

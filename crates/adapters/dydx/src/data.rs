@@ -1287,7 +1287,7 @@ impl DydxDataClient {
                 log::debug!("Ignoring block height on data client");
             }
             DydxWsOutputMessage::Error(err) => {
-                log::error!("dYdX WS error: {err}");
+                log::warn!("dYdX WS error: {err}");
             }
             DydxWsOutputMessage::Reconnected => {
                 ctx.pending_bars.clear();
@@ -1853,6 +1853,7 @@ mod tests {
             8,                   // size_precision (wide enough to reveal f64 rounding)
             Price::new(0.01, 2), // price_increment
             Quantity::new(0.00000001, 8),
+            None,
             None,
             None,
             None,

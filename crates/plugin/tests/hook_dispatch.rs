@@ -44,8 +44,8 @@ use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     data::{
         Bar, FundingRateUpdate, IndexPriceUpdate, InstrumentClose, InstrumentStatus,
-        MarkPriceUpdate, OptionChainSlice, OptionGreeks, OrderBookDelta, OrderBookDeltas,
-        OrderBookDepth10, QuoteTick, TradeTick,
+        MarkPriceUpdate, OptionChainSlice, OptionGreekValues, OptionGreeks, OrderBookDelta,
+        OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
         stubs::{
             stub_bar, stub_deltas, stub_depth10, stub_instrument_close, stub_instrument_status,
             stub_trade_ethusdt_buyer,
@@ -94,7 +94,10 @@ macro_rules! generated_slot {
 
 // The `On` prefix mirrors the trait method names; clippy's
 // `enum_variant_names` would otherwise object to the shared prefix.
-#[allow(clippy::enum_variant_names)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "variants mirror actor hook method names"
+)]
 #[repr(usize)]
 #[derive(Clone, Copy, Debug)]
 enum ActorHook {
@@ -144,7 +147,7 @@ fn dispatch_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn reset_actor_counters() {
@@ -361,7 +364,10 @@ impl PluginActor for HookCountingActor {
 }
 
 // See note above on ActorHook regarding the `On` prefix lint.
-#[allow(clippy::enum_variant_names)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "variants mirror strategy hook method names"
+)]
 #[repr(usize)]
 #[derive(Clone, Copy, Debug)]
 enum StrategyHook {
@@ -727,7 +733,10 @@ impl PluginStrategy for HookCountingStrategy {
 }
 
 // See note above on ActorHook regarding the `On` prefix lint.
-#[allow(clippy::enum_variant_names)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "variants mirror controller hook method names"
+)]
 #[repr(usize)]
 #[derive(Clone, Copy, Debug)]
 enum ControllerHook {
@@ -982,7 +991,7 @@ fn option_greeks_value() -> OptionGreeks {
     OptionGreeks {
         instrument_id: instrument_id(),
         convention: GreeksConvention::BlackScholes,
-        greeks: Default::default(),
+        greeks: OptionGreekValues::default(),
         mark_iv: Some(0.25),
         bid_iv: Some(0.24),
         ask_iv: Some(0.26),
@@ -2127,7 +2136,7 @@ fn controller_lifecycle_thunk_dispatches_to_its_method(#[case] hook: ControllerH
         ControllerHook::OnDispose => unsafe { generated_slot!(vt, on_dispose)(handle) },
         ControllerHook::OnDegrade => unsafe { generated_slot!(vt, on_degrade)(handle) },
         ControllerHook::OnFault => unsafe { generated_slot!(vt, on_fault)(handle) },
-        _ => panic!("non-lifecycle hook"),
+        ControllerHook::OnTimeEvent => panic!("non-lifecycle hook"),
     };
     r.into_result().expect("lifecycle thunk failed");
     assert_only_controller_hook(hook);

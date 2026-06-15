@@ -881,6 +881,158 @@ fn test_rust_write_trade_ticks() {
     assert!(!files.is_empty());
 }
 
+// Non-ASCII ids are stored percent-encoded on disk; queries must resolve the on-disk name.
+#[rstest]
+fn test_query_round_trip_non_ascii_instrument_id() {
+    let (_temp_dir, mut catalog) = create_temp_catalog();
+
+    let id = InstrumentId::from("CAFÉ.SIM");
+    let trade = TradeTick::new(
+        id,
+        Price::new(1987.0, 1),
+        Quantity::new(0.1, 1),
+        AggressorSide::Buyer,
+        TradeId::from("123456"),
+        UnixNanos::from(0),
+        UnixNanos::from(1),
+    );
+    catalog
+        .write_to_parquet(vec![trade], None, None, None)
+        .unwrap();
+
+    let files = catalog.query_files("trades", None, None, None).unwrap();
+    assert_eq!(files.len(), 1);
+
+    let ids = Some(vec![id.to_string()]);
+
+    // Both directory-based (optimize=true) and per-file (optimize=false) registration
+    // must resolve the percent-encoded on-disk directory, with and without an id filter.
+    for optimize in [true, false] {
+        for identifiers in [None, ids.clone()] {
+            let ticks: Vec<TradeTick> = catalog
+                .query_typed_data(identifiers, None, None, None, None, optimize)
+                .unwrap();
+            assert_eq!(ticks.len(), 1, "optimize={optimize}");
+            assert_eq!(ticks[0].instrument_id, id);
+        }
+    }
+}
+
+// filter_files must match a non-ASCII id against the percent-encoded on-disk directory.
+#[rstest]
+fn test_filter_files_non_ascii_instrument_id() {
+    let (_temp_dir, catalog) = create_temp_catalog();
+
+    let id = InstrumentId::from("CAFÉ.SIM");
+    let trade = TradeTick::new(
+        id,
+        Price::new(1987.0, 1),
+        Quantity::new(0.1, 1),
+        AggressorSide::Buyer,
+        TradeId::from("123456"),
+        UnixNanos::from(0),
+        UnixNanos::from(1),
+    );
+    catalog
+        .write_to_parquet(vec![trade], None, None, None)
+        .unwrap();
+
+    let all_files = catalog.query_files("trades", None, None, None).unwrap();
+    let filtered = catalog
+        .filter_files("trades", all_files, Some(vec![id.to_string()]), None, None)
+        .unwrap();
+
+    assert_eq!(filtered.len(), 1);
+}
+
+// query_instruments_filtered must match a non-ASCII id against the percent-encoded directory.
+#[rstest]
+fn test_query_instruments_filtered_non_ascii_instrument_id() {
+    let (_temp_dir, catalog) = create_temp_catalog();
+
+    let instrument_id = InstrumentId::from("CAFÉ.SIM");
+    let currency_pair = CurrencyPair::new(
+        instrument_id,
+        Symbol::from("CAFÉ"),
+        Currency::from("AUD"),
+        Currency::from("USD"),
+        5,
+        0,
+        Price::new(0.00001, 5),
+        Quantity::new(1.0, 0),
+        None, // multiplier
+        None, // lot_size
+        None, // max_quantity
+        None, // min_quantity
+        None, // max_notional
+        None, // min_notional
+        None, // max_price
+        None, // min_price
+        None, // margin_init
+        None, // margin_maint
+        None, // maker_fee
+        None, // taker_fee
+        None, // tick_scheme
+        None, // info
+        UnixNanos::default(),
+        UnixNanos::default(),
+    );
+    catalog
+        .write_instruments(vec![InstrumentAny::CurrencyPair(currency_pair)])
+        .unwrap();
+
+    let ids = vec![instrument_id.to_string()];
+    let read = catalog.query_instruments(Some(&ids)).unwrap();
+
+    assert_eq!(read.len(), 1);
+    assert_eq!(Instrument::id(&read[0]), instrument_id);
+}
+
+// Bars match by partial (instrument-id) match against the percent-encoded bar-type
+// directory; a non-ASCII id must still resolve through that branch.
+#[rstest]
+fn test_query_bars_non_ascii_instrument_id_partial_match() {
+    let (_temp_dir, mut catalog) = create_temp_catalog();
+
+    let instrument_id = InstrumentId::from("CAFÉ.SIM");
+    let bar_type = BarType::new(
+        instrument_id,
+        BarSpecification::new(1, BarAggregation::Minute, PriceType::Bid),
+        AggregationSource::External,
+    );
+    let bar = Bar::new(
+        bar_type,
+        Price::new(1.00001, 5),
+        Price::new(1.1, 1),
+        Price::new(1.00000, 5),
+        Price::new(1.00000, 5),
+        Quantity::new(100_000.0, 0),
+        UnixNanos::from(0),
+        UnixNanos::from(1),
+    );
+    catalog
+        .write_to_parquet(vec![bar], None, None, None)
+        .unwrap();
+
+    // Querying by the bare instrument id only matches via the bars partial-match
+    // branch, since the directory name is the full bar-type string.
+    let ids = vec![instrument_id.to_string()];
+
+    let all_files = catalog.query_files("bars", None, None, None).unwrap();
+    let filtered = catalog
+        .filter_files("bars", all_files, Some(ids.clone()), None, None)
+        .unwrap();
+    assert_eq!(filtered.len(), 1);
+
+    for optimize in [true, false] {
+        let bars: Vec<Bar> = catalog
+            .query_typed_data(Some(ids.clone()), None, None, None, None, optimize)
+            .unwrap();
+        assert_eq!(bars.len(), 1, "optimize={optimize}");
+        assert_eq!(bars[0].bar_type.instrument_id(), instrument_id);
+    }
+}
+
 #[rstest]
 fn test_rust_write_order_book_deltas() {
     let (_temp_dir, catalog) = create_temp_catalog();
@@ -1990,8 +2142,8 @@ fn test_extract_data_cls_and_identifier_from_path_moved() {
     assert_eq!(identifier, None);
 }
 
-/// Ensures custom data path built by make_path_custom_data (via custom module) matches
-/// the format expected by extract_data_cls_and_identifier_from_path (catalog behavior unchanged after extraction).
+/// Ensures custom data path built by `make_path_custom_data` (via custom module) matches
+/// the format expected by `extract_data_cls_and_identifier_from_path`.
 #[rstest]
 fn test_make_path_custom_data_roundtrip() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2095,7 +2247,7 @@ fn test_prepare_consolidation_queries_basic_moved() {
 
     // Test basic period consolidation
     let intervals = vec![(1000, 5000), (5001, 10000)];
-    let period_nanos = 86400000000000; // 1 day
+    let period_nanos = 86_400_000_000_000; // 1 day
 
     let queries = catalog
         .prepare_consolidation_queries("quotes", None, &intervals, period_nanos, None, None, true)
@@ -2123,7 +2275,7 @@ fn test_prepare_consolidation_queries_with_splits_moved() {
     // File: [1000, 5000], Request: start=2000, end=4000
     // Should result in split queries for [1000, 1999] and [4001, 5000], plus consolidation for [2000, 4000]
     let intervals = vec![(1000, 5000)];
-    let period_nanos = 86400000000000; // 1 day
+    let period_nanos = 86_400_000_000_000; // 1 day
     let start = Some(UnixNanos::from(2000));
     let end = Some(UnixNanos::from(4000));
 
@@ -3749,8 +3901,9 @@ fn test_rust_custom_data_roundtrip_with_hashmap_price_field() {
     }
 }
 
-/// Regression: write_data_enum groups custom data by full DataType (type_name + identifier + metadata).
-/// Same type_name with different identifiers must produce separate batches and be readable back.
+/// Regression: `write_data_enum` groups custom data by full `DataType`
+/// (`type_name` + identifier + metadata).
+/// Same `type_name` with different identifiers must produce separate batches and be readable back.
 #[rstest]
 #[ignore = "Slow regression test (>120s) for custom data identifier batching; run manually when changing catalog custom data write/query paths"]
 fn test_write_data_enum_mixed_custom_data_identifiers() {
@@ -4726,6 +4879,7 @@ fn test_instrument_roundtrip_with_info_params() {
         Some(Decimal::from(3) / Decimal::from(100)),
         Some(Decimal::from(2) / Decimal::from(100_000)),
         Some(Decimal::from(2) / Decimal::from(100_000)),
+        None,
         Some(info.clone()),
         UnixNanos::default(),
         UnixNanos::default(),
@@ -4882,6 +5036,7 @@ fn test_instrument_roundtrip_with_unregistered_base_currency() {
         None,
         Some(Decimal::from(2) / Decimal::from(10_000)),
         Some(Decimal::from(4) / Decimal::from(10_000)),
+        None,
         None,
         UnixNanos::default(),
         UnixNanos::default(),

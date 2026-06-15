@@ -75,79 +75,21 @@ use crate::{
     },
     websocket::{
         client::LighterWebSocketClient,
-        error::LighterWsError,
         messages::{LighterMarketSelection, LighterWsChannel, NautilusWsMessage},
     },
 };
 
-/// Maximum `limit` accepted by `GET /api/v1/orderBookOrders` (venue-imposed).
-const LIGHTER_BOOK_ORDERS_MAX_LIMIT: u16 = 250;
-const DEFAULT_BOOK_SNAPSHOT_LIMIT: u16 = LIGHTER_BOOK_ORDERS_MAX_LIMIT;
-const DEFAULT_TRADES_LIMIT: u16 = 100;
+mod limits;
+mod market_stats;
 
-/// Which slice of the Lighter `market_stats` payload a caller has subscribed to.
-///
-/// The venue streams mark price, index price, and funding rate through the same
-/// `market_stats` channel, so a single subscription can fan out to up to three
-/// Nautilus subscriptions. [`MarketStatsFlags`] tracks which ones are active.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum MarketStatsKind {
-    MarkPrice,
-    IndexPrice,
-    FundingRate,
-}
-
-/// Per-instrument fan-out state for the shared `market_stats` subscription.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-struct MarketStatsFlags {
-    mark_price: bool,
-    index_price: bool,
-    funding_rate: bool,
-}
-
-impl MarketStatsFlags {
-    fn is_empty(self) -> bool {
-        !self.mark_price && !self.index_price && !self.funding_rate
-    }
-
-    fn contains(self, kind: MarketStatsKind) -> bool {
-        match kind {
-            MarketStatsKind::MarkPrice => self.mark_price,
-            MarketStatsKind::IndexPrice => self.index_price,
-            MarketStatsKind::FundingRate => self.funding_rate,
-        }
-    }
-
-    fn insert(&mut self, kind: MarketStatsKind) {
-        match kind {
-            MarketStatsKind::MarkPrice => self.mark_price = true,
-            MarketStatsKind::IndexPrice => self.index_price = true,
-            MarketStatsKind::FundingRate => self.funding_rate = true,
-        }
-    }
-
-    fn remove(&mut self, kind: MarketStatsKind) {
-        match kind {
-            MarketStatsKind::MarkPrice => self.mark_price = false,
-            MarketStatsKind::IndexPrice => self.index_price = false,
-            MarketStatsKind::FundingRate => self.funding_rate = false,
-        }
-    }
-}
-
-impl From<MarketStatsKind> for MarketStatsFlags {
-    fn from(kind: MarketStatsKind) -> Self {
-        let mut flags = Self::default();
-        flags.insert(kind);
-        flags
-    }
-}
-
-#[derive(Debug, Clone)]
-struct MarketStatsSubscription {
-    channel: LighterWsChannel,
-    flags: MarketStatsFlags,
-}
+use self::{
+    limits::{clamp_book_snapshot_limit, clamp_recent_trades_limit},
+    market_stats::{
+        MarketStatsKind, MarketStatsSubscription, emit_ws_message as emit_market_stats_ws_message,
+        subscribe_channel as subscribe_market_stats_channel,
+        unsubscribe_channel as unsubscribe_market_stats_channel,
+    },
+};
 
 #[derive(Debug)]
 pub struct LighterDataClient {
@@ -211,13 +153,7 @@ impl LighterDataClient {
         let http_client =
             LighterHttpClient::from_raw_with_registry(raw_http, Arc::clone(&registry));
 
-        let ws_client = LighterWebSocketClient::new(
-            Some(config.ws_url()),
-            config.environment,
-            Arc::clone(&registry),
-            config.transport_backend,
-            config.proxy_url.clone(),
-        );
+        let ws_client = Self::create_ws_client(&config, Arc::clone(&registry));
 
         Ok(Self {
             clock,
@@ -246,6 +182,43 @@ impl LighterDataClient {
     #[must_use]
     pub fn has_credentials(&self) -> bool {
         self.credential.is_some()
+    }
+
+    fn create_ws_client(
+        config: &LighterDataClientConfig,
+        registry: Arc<MarketRegistry>,
+    ) -> LighterWebSocketClient {
+        LighterWebSocketClient::new(
+            Some(config.ws_url()),
+            config.environment,
+            registry,
+            config.transport_backend,
+            config.proxy_url.clone(),
+        )
+    }
+
+    fn take_ws_client(&mut self) -> LighterWebSocketClient {
+        std::mem::replace(
+            &mut self.ws_client,
+            Self::create_ws_client(&self.config, Arc::clone(&self.registry)),
+        )
+    }
+
+    fn spawn_ws_disconnect(&mut self) {
+        let ws_client = self.take_ws_client();
+        get_runtime().spawn(Self::disconnect_ws_client(ws_client));
+    }
+
+    async fn disconnect_ws_client(mut ws_client: LighterWebSocketClient) {
+        if let Err(e) = ws_client.disconnect().await {
+            log::warn!("Error disconnecting Lighter WebSocket client: {e}");
+        }
+    }
+
+    fn abort_tasks(&mut self) {
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
     }
 
     async fn bootstrap_instruments(&self) -> anyhow::Result<Vec<InstrumentAny>> {
@@ -373,7 +346,7 @@ impl LighterDataClient {
                             // own clone of the WebSocket and routes them.
                             Some(
                                 NautilusWsMessage::ExecutionReports(_)
-                                | NautilusWsMessage::PositionSnapshot(_)
+                                | NautilusWsMessage::PositionSnapshot { .. }
                                 | NautilusWsMessage::AccountState(_)
                                 | NautilusWsMessage::SendTxAck { .. }
                                 | NautilusWsMessage::SendTxRejected { .. }
@@ -541,10 +514,7 @@ impl LighterDataClient {
                 should_subscribe.then(|| subscription.channel.clone())
             }
             Entry::Vacant(entry) => {
-                entry.insert(MarketStatsSubscription {
-                    channel: channel.clone(),
-                    flags: kind.into(),
-                });
+                entry.insert(MarketStatsSubscription::new(channel.clone(), kind));
                 Some(channel)
             }
         };
@@ -693,94 +663,6 @@ fn lighter_market_status_action(status: LighterMarketStatus) -> MarketStatusActi
     }
 }
 
-async fn subscribe_market_stats_channel(
-    ws: LighterWebSocketClient,
-    channel: LighterWsChannel,
-) -> Result<(), LighterWsError> {
-    match channel {
-        LighterWsChannel::MarketStats(selection) => ws.subscribe_market_stats(selection).await,
-        LighterWsChannel::SpotMarketStats(selection) => {
-            ws.subscribe_spot_market_stats(selection).await
-        }
-        _ => unreachable!("market-stats subscription called with non-market-stats channel"),
-    }
-}
-
-async fn unsubscribe_market_stats_channel(
-    ws: LighterWebSocketClient,
-    channel: LighterWsChannel,
-) -> Result<(), LighterWsError> {
-    match channel {
-        LighterWsChannel::MarketStats(selection) => ws.unsubscribe_market_stats(selection).await,
-        LighterWsChannel::SpotMarketStats(selection) => {
-            ws.unsubscribe_spot_market_stats(selection).await
-        }
-        _ => unreachable!("market-stats unsubscription called with non-market-stats channel"),
-    }
-}
-
-fn emit_market_stats_ws_message(
-    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
-    subscriptions: &DashMap<InstrumentId, MarketStatsSubscription>,
-    message: &NautilusWsMessage,
-) -> bool {
-    match message {
-        NautilusWsMessage::MarkPrice(mark_price) => {
-            if !market_stats_is_subscribed(
-                subscriptions,
-                &mark_price.instrument_id,
-                MarketStatsKind::MarkPrice,
-            ) {
-                return false;
-            }
-
-            if let Err(e) = sender.send(DataEvent::Data(Data::MarkPriceUpdate(*mark_price))) {
-                log::error!("Failed to send mark price: {e}");
-            }
-            true
-        }
-        NautilusWsMessage::IndexPrice(index_price) => {
-            if !market_stats_is_subscribed(
-                subscriptions,
-                &index_price.instrument_id,
-                MarketStatsKind::IndexPrice,
-            ) {
-                return false;
-            }
-
-            if let Err(e) = sender.send(DataEvent::Data(Data::IndexPriceUpdate(*index_price))) {
-                log::error!("Failed to send index price: {e}");
-            }
-            true
-        }
-        NautilusWsMessage::FundingRate(funding_rate) => {
-            if !market_stats_is_subscribed(
-                subscriptions,
-                &funding_rate.instrument_id,
-                MarketStatsKind::FundingRate,
-            ) {
-                return false;
-            }
-
-            if let Err(e) = sender.send(DataEvent::FundingRate(*funding_rate)) {
-                log::error!("Failed to send funding rate: {e}");
-            }
-            true
-        }
-        _ => false,
-    }
-}
-
-fn market_stats_is_subscribed(
-    subscriptions: &DashMap<InstrumentId, MarketStatsSubscription>,
-    instrument_id: &InstrumentId,
-    kind: MarketStatsKind,
-) -> bool {
-    subscriptions
-        .get(instrument_id)
-        .is_some_and(|subscription| subscription.flags.contains(kind))
-}
-
 #[async_trait::async_trait(?Send)]
 impl DataClient for LighterDataClient {
     fn client_id(&self) -> ClientId {
@@ -804,6 +686,8 @@ impl DataClient for LighterDataClient {
     fn stop(&mut self) -> anyhow::Result<()> {
         log::info!("Stopping Lighter data client {}", self.client_id);
         self.cancellation_token.cancel();
+        self.abort_tasks();
+        self.spawn_ws_disconnect();
         self.clear_instrument_status_subscriptions();
         self.clear_market_stats_subscriptions();
         self.is_connected.store(false, Ordering::Relaxed);
@@ -812,11 +696,13 @@ impl DataClient for LighterDataClient {
 
     fn reset(&mut self) -> anyhow::Result<()> {
         log::debug!("Resetting Lighter data client {}", self.client_id);
+        self.cancellation_token.cancel();
+        self.abort_tasks();
+        self.spawn_ws_disconnect();
         self.clear_instrument_status_subscriptions();
         self.clear_market_stats_subscriptions();
         self.is_connected.store(false, Ordering::Relaxed);
         self.cancellation_token = CancellationToken::new();
-        self.tasks.clear();
         Ok(())
     }
 
@@ -883,9 +769,8 @@ impl DataClient for LighterDataClient {
             }
         }
 
-        if let Err(e) = self.ws_client.disconnect().await {
-            log::error!("Error disconnecting Lighter WebSocket client: {e}");
-        }
+        let ws_client = self.take_ws_client();
+        Self::disconnect_ws_client(ws_client).await;
 
         self.instruments.store(AHashMap::new());
         self.instrument_statuses.clear();
@@ -1495,9 +1380,7 @@ impl DataClient for LighterDataClient {
         let sender = self.data_sender.clone();
         let request_id = request.request_id;
         let client_id = request.client_id.unwrap_or(self.client_id);
-        let limit = request.limit.map_or(DEFAULT_TRADES_LIMIT, |n| {
-            u16::try_from(n.get()).unwrap_or(u16::MAX)
-        });
+        let limit = clamp_recent_trades_limit(request.limit);
         let start_nanos = datetime_to_unix_nanos(request.start);
         let end_nanos = datetime_to_unix_nanos(request.end);
         let params = request.params;
@@ -1697,19 +1580,6 @@ fn validate_l2_mbp_book_type(book_type: BookType, label: &str) -> anyhow::Result
     Ok(())
 }
 
-/// Clamps a `RequestBookSnapshot.depth` to a `limit` value the venue accepts.
-///
-/// Lighter's `GET /api/v1/orderBookOrders` rejects `limit` above
-/// [`LIGHTER_BOOK_ORDERS_MAX_LIMIT`] with venue error 20001. `None` defaults
-/// to the cap.
-fn clamp_book_snapshot_limit(depth: Option<std::num::NonZeroUsize>) -> u16 {
-    depth
-        .map_or(DEFAULT_BOOK_SNAPSHOT_LIMIT, |n| {
-            u16::try_from(n.get()).unwrap_or(u16::MAX)
-        })
-        .min(LIGHTER_BOOK_ORDERS_MAX_LIMIT)
-}
-
 #[cfg(test)]
 mod tests {
     use std::{num::NonZeroUsize, time::Duration};
@@ -1737,18 +1607,34 @@ mod tests {
     use rstest::rstest;
     use rust_decimal::Decimal;
 
-    use super::*;
+    use super::{
+        limits::{LIGHTER_BOOK_ORDERS_MAX_LIMIT, LIGHTER_RECENT_TRADES_MAX_LIMIT},
+        market_stats::{MarketStatsFlags, MarketStatsSubscription},
+        *,
+    };
     use crate::{
         common::enums::{LighterFundingResolution, LighterProductType},
         http::query::{LighterFundingsQuery, LighterRecentTradesQuery},
     };
 
-    const HTTP_ORDER_BOOK_DETAILS: &str = include_str!("../test_data/http_order_book_details.json");
-    const HTTP_FUNDINGS: &str = include_str!("../test_data/http_fundings.json");
-    const HTTP_RECENT_TRADES: &str = include_str!("../test_data/http_recent_trades.json");
-    const HTTP_RECENT_TRADES_NULL: &str = include_str!("../test_data/http_recent_trades_null.json");
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    const HTTP_ORDER_BOOK_DETAILS: &str =
+        include_str!("../../test_data/http_order_book_details.json");
+    const HTTP_FUNDINGS: &str = include_str!("../../test_data/http_fundings.json");
+    const HTTP_RECENT_TRADES: &str = include_str!("../../test_data/http_recent_trades.json");
+    const HTTP_RECENT_TRADES_NULL: &str =
+        include_str!("../../test_data/http_recent_trades_null.json");
     const HTTP_RECENT_TRADES_UNORDERED: &str =
-        include_str!("../test_data/http_recent_trades_unordered.json");
+        include_str!("../../test_data/http_recent_trades_unordered.json");
     const PRIVATE_KEY_HEX: &str =
         "0b8e0f63c24d8baacd9d29ad4e9a4b73c4a8d2bb8b16dc4fa9d7c2e1d3a8b1f0e8d3a4c5b6e7f001";
 
@@ -1764,6 +1650,20 @@ mod tests {
     fn test_clamp_book_snapshot_limit(#[case] depth: Option<usize>, #[case] expected: u16) {
         let depth = depth.map(|n| NonZeroUsize::new(n).expect("non-zero"));
         assert_eq!(clamp_book_snapshot_limit(depth), expected);
+    }
+
+    #[rstest]
+    #[case::none_defaults_to_cap(None, LIGHTER_RECENT_TRADES_MAX_LIMIT)]
+    #[case::below_cap_passes_through(Some(10), 10)]
+    #[case::at_cap_passes_through(
+        Some(LIGHTER_RECENT_TRADES_MAX_LIMIT as usize),
+        LIGHTER_RECENT_TRADES_MAX_LIMIT
+    )]
+    #[case::above_cap_clamps(Some(500), LIGHTER_RECENT_TRADES_MAX_LIMIT)]
+    #[case::usize_max_clamps(Some(usize::MAX), LIGHTER_RECENT_TRADES_MAX_LIMIT)]
+    fn test_clamp_recent_trades_limit(#[case] limit: Option<usize>, #[case] expected: u16) {
+        let limit = limit.map(|n| NonZeroUsize::new(n).expect("non-zero"));
+        assert_eq!(clamp_recent_trades_limit(limit), expected);
     }
 
     #[rstest]
@@ -2440,6 +2340,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_request_trades_clamps_limit_to_venue_cap() {
+        let base_url = spawn_trades_server_with_response_and_limit(
+            HTTP_RECENT_TRADES,
+            LIGHTER_RECENT_TRADES_MAX_LIMIT,
+        )
+        .await;
+        let config = LighterDataClientConfig {
+            base_url_http: Some(base_url),
+            ..Default::default()
+        };
+        let (client, mut receiver) = create_data_client_with_receiver_and_config_for_test(config);
+        let instrument_id = cache_test_instrument(&client, 0, "ETH", LighterProductType::Perp);
+        let request = RequestTrades::new(
+            instrument_id,
+            None,
+            None,
+            NonZeroUsize::new(usize::from(LIGHTER_RECENT_TRADES_MAX_LIMIT) + 1),
+            Some(ClientId::new("LIGHTER")),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        );
+
+        DataClient::request_trades(&client, request).unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("trades response")
+            .expect("trades event");
+
+        assert!(
+            matches!(event, DataEvent::Response(DataResponse::Trades(_))),
+            "expected trades response, was {event:?}",
+        );
+    }
+
+    #[tokio::test]
     async fn test_request_trades_emits_empty_response_for_null_recent_trades() {
         let base_url = spawn_trades_server_with_response(HTTP_RECENT_TRADES_NULL).await;
         let config = LighterDataClientConfig {
@@ -2632,6 +2569,32 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_reset_aborts_registered_tasks_before_rotating_token() {
+        let (mut client, _receiver) = create_data_client_with_receiver_for_test();
+        let old_token = client.cancellation_token.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+
+        let handle = get_runtime().spawn(async move {
+            let _drop_signal = DropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        client.tasks.push(handle);
+        started_rx.await.expect("registered task started");
+
+        client.reset().expect("reset");
+
+        assert!(old_token.is_cancelled());
+        assert!(client.tasks.is_empty());
+        assert!(!client.cancellation_token.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), dropped_rx)
+            .await
+            .expect("registered task was not aborted")
+            .expect("drop signal sender dropped");
+    }
+
     // Tests that observe `has_credentials()` semantics under controlled env
     // state. Pinned to the workspace `serial_tests` group (see
     // `.config/nextest.toml`) so env-var mutation runs single-threaded.
@@ -2787,11 +2750,18 @@ mod tests {
     }
 
     async fn spawn_trades_server_with_response(response_body: &'static str) -> String {
+        spawn_trades_server_with_response_and_limit(response_body, 50).await
+    }
+
+    async fn spawn_trades_server_with_response_and_limit(
+        response_body: &'static str,
+        expected_limit: u16,
+    ) -> String {
         let app = Router::new().route(
             "/api/v1/recentTrades",
             get(
                 move |Query(query): Query<LighterRecentTradesQuery>| async move {
-                    recent_trades_response(&query, response_body)
+                    recent_trades_response(&query, response_body, expected_limit)
                 },
             ),
         );
@@ -2820,9 +2790,10 @@ mod tests {
     fn recent_trades_response(
         query: &LighterRecentTradesQuery,
         response_body: &'static str,
+        expected_limit: u16,
     ) -> Response {
         assert_eq!(query.market_id, 0);
-        assert_eq!(query.limit, 50);
+        assert_eq!(query.limit, expected_limit);
         (StatusCode::OK, response_body).into_response()
     }
 
@@ -2872,6 +2843,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             UnixNanos::default(),
             UnixNanos::default(),
         ))
@@ -2887,6 +2859,7 @@ mod tests {
             4,
             Price::from("0.01"),
             Quantity::from("0.0001"),
+            None,
             None,
             None,
             None,

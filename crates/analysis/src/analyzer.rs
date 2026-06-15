@@ -16,7 +16,7 @@
 use std::{collections::BTreeMap, fmt::Debug, sync::Arc};
 
 use ahash::AHashMap;
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use nautilus_core::{UnixNanos, datetime::NANOSECONDS_IN_DAY};
 use nautilus_model::{
     accounts::Account,
@@ -62,6 +62,7 @@ pub struct PortfolioAnalyzer {
     pub account_balances: IndexMap<Currency, Money>,
     pub positions: Vec<Position>,
     pub realized_pnls: AHashMap<Currency, Vec<(PositionId, f64)>>,
+    pub recorded_realized_pnls: AHashMap<Currency, IndexMap<PositionId, f64>>,
     pub position_returns: Returns,
     pub portfolio_returns: Returns,
     /// Alias for the primary returns source.
@@ -108,6 +109,7 @@ impl PortfolioAnalyzer {
             account_balances: IndexMap::new(),
             positions: Vec::new(),
             realized_pnls: AHashMap::new(),
+            recorded_realized_pnls: AHashMap::new(),
             position_returns: BTreeMap::new(),
             portfolio_returns: BTreeMap::new(),
             returns: BTreeMap::new(),
@@ -135,6 +137,7 @@ impl PortfolioAnalyzer {
         self.account_balances.clear();
         self.positions.clear();
         self.realized_pnls.clear();
+        self.recorded_realized_pnls.clear();
         self.position_returns.clear();
         self.portfolio_returns.clear();
         self.returns.clear();
@@ -175,8 +178,8 @@ impl PortfolioAnalyzer {
 
     /// Calculates statistics based on account and position data.
     ///
-    /// This clears all previous state before calculating, so can be called
-    /// multiple times without accumulating stale data.
+    /// This clears calculated state before calculating, while preserving
+    /// close-time PnLs recorded during portfolio processing.
     pub fn calculate_statistics(&mut self, account: &dyn Account, positions: &[Position]) {
         self.account_balances_starting = account.starting_balances().into_iter().collect();
         self.account_balances = account.balances_total().into_iter().collect();
@@ -216,6 +219,13 @@ impl PortfolioAnalyzer {
         let currency = pnl.currency;
         let entry = self.realized_pnls.entry(currency).or_default();
         entry.push((*position_id, pnl.as_f64()));
+    }
+
+    /// Records a trade's PnL observed during portfolio processing.
+    pub fn record_trade(&mut self, position_id: &PositionId, pnl: &Money) {
+        let currency = pnl.currency;
+        let entry = self.recorded_realized_pnls.entry(currency).or_default();
+        entry.insert(*position_id, pnl.as_f64());
     }
 
     /// Records a position return at a specific timestamp.
@@ -329,18 +339,48 @@ impl PortfolioAnalyzer {
     /// without an explicit currency specified.
     #[must_use]
     pub fn realized_pnls(&self, currency: Option<&Currency>) -> Option<Vec<(PositionId, f64)>> {
-        if self.realized_pnls.is_empty() {
+        if self.realized_pnls.is_empty() && self.recorded_realized_pnls.is_empty() {
             return None;
         }
 
         // Require explicit currency for multi-currency portfolios to avoid nondeterminism
         let currency = match currency {
-            Some(c) => c,
-            None if self.account_balances.len() == 1 => self.account_balances.keys().next()?,
-            None => return None,
+            Some(c) => *c,
+            None if self.account_balances.len() == 1 => *self.account_balances.keys().next()?,
+            None => {
+                let mut currencies: IndexSet<Currency> =
+                    self.realized_pnls.keys().copied().collect();
+                currencies.extend(self.recorded_realized_pnls.keys().copied());
+                if currencies.len() != 1 {
+                    return None;
+                }
+
+                *currencies.first()?
+            }
         };
 
-        self.realized_pnls.get(currency).cloned()
+        let realized_pnls = self.realized_pnls.get(&currency);
+        let recorded_realized_pnls = self.recorded_realized_pnls.get(&currency);
+
+        match (realized_pnls, recorded_realized_pnls) {
+            (None, None) => None,
+            (Some(realized_pnls), None) => Some(realized_pnls.clone()),
+            (None, Some(recorded_realized_pnls)) => Some(
+                recorded_realized_pnls
+                    .iter()
+                    .map(|(position_id, pnl)| (*position_id, *pnl))
+                    .collect(),
+            ),
+            (Some(realized_pnls), Some(recorded_realized_pnls)) => {
+                let mut output: IndexMap<PositionId, f64> = realized_pnls.iter().copied().collect();
+
+                for (position_id, pnl) in recorded_realized_pnls {
+                    output.insert(*position_id, *pnl);
+                }
+
+                Some(output.into_iter().collect())
+            }
+        }
     }
 
     /// Calculates total PnL including unrealized PnL if provided.
@@ -381,7 +421,7 @@ impl PortfolioAnalyzer {
             .get(currency)
             .ok_or("Specified currency not found in account balances")?;
 
-        let default_money = &Money::new(0.0, *currency);
+        let default_money = &Money::zero(*currency);
         let account_balance_starting = self
             .account_balances_starting
             .get(currency)
@@ -429,7 +469,7 @@ impl PortfolioAnalyzer {
             .get(currency)
             .ok_or("Specified currency not found in account balances")?;
 
-        let default_money = &Money::new(0.0, *currency);
+        let default_money = &Money::zero(*currency);
         let account_balance_starting = self
             .account_balances_starting
             .get(currency)
@@ -504,6 +544,30 @@ impl PortfolioAnalyzer {
     #[must_use]
     pub fn get_performance_stats_portfolio_returns(&self) -> AHashMap<String, f64> {
         self.calculate_returns_stats(self.portfolio_returns())
+    }
+
+    /// Gets all benchmark-relative return statistics for the primary returns.
+    ///
+    /// This is stateless: the `benchmark` series is supplied by the caller rather
+    /// than stored on the analyzer. Only statistics that override
+    /// [`PortfolioStatistic::calculate_from_returns_with_benchmark`] (the benchmark-relative
+    /// statistics) contribute values; all others return `None` and are skipped.
+    #[must_use]
+    pub fn get_performance_stats_returns_vs_benchmark(
+        &self,
+        benchmark: &Returns,
+    ) -> AHashMap<String, f64> {
+        let mut output = AHashMap::new();
+
+        for (name, stat) in &self.statistics {
+            if let Some(value) =
+                stat.calculate_from_returns_with_benchmark(self.returns(), benchmark)
+            {
+                output.insert(name.clone(), value);
+            }
+        }
+
+        output
     }
 
     /// Gets general portfolio statistics.
@@ -650,6 +714,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::statistics::beta_ratio::BetaRatio;
 
     /// Mock implementation of `PortfolioStatistic` for testing.
     #[derive(Debug)]
@@ -1039,6 +1104,46 @@ mod tests {
     }
 
     #[rstest]
+    fn test_calculate_statistics_preserves_recorded_realized_pnls() {
+        let mut analyzer = PortfolioAnalyzer::new();
+        let account_currency = Currency::EUR();
+        let native_currency = Currency::USD();
+        let stat: Arc<dyn PortfolioStatistic<Item = f64> + Send + Sync> =
+            Arc::new(MockStatistic::new("test_stat"));
+        analyzer.register_statistic(Arc::clone(&stat));
+        analyzer.record_trade(
+            &PositionId::new("pos1"),
+            &Money::new(90.0, account_currency),
+        );
+
+        let positions = vec![create_mock_position("pos1", 100.0, 0.1, native_currency)];
+
+        let mut starting_balances = AHashMap::new();
+        starting_balances.insert(account_currency, Money::new(1000.0, account_currency));
+
+        let mut current_balances = AHashMap::new();
+        current_balances.insert(account_currency, Money::new(1100.0, account_currency));
+
+        let account = MockAccount {
+            starting_balances,
+            current_balances,
+            events: vec![],
+        };
+
+        analyzer.calculate_statistics(&account, &positions);
+
+        let native_pnls = analyzer.realized_pnls(Some(&native_currency)).unwrap();
+        let recorded_pnls = analyzer.realized_pnls(Some(&account_currency)).unwrap();
+        let pnl_stats = analyzer
+            .get_performance_stats_pnls(Some(&account_currency), None)
+            .unwrap();
+
+        assert_eq!(native_pnls[0].1, 100.0);
+        assert_eq!(recorded_pnls[0].1, 90.0);
+        assert_eq!(*pnl_stats.get("test_stat").unwrap(), 90.0);
+    }
+
+    #[rstest]
     fn test_formatted_output() {
         let mut analyzer = PortfolioAnalyzer::new();
         let currency = Currency::USD();
@@ -1106,6 +1211,7 @@ mod tests {
         assert!(analyzer.account_balances.is_empty());
         assert!(analyzer.positions.is_empty());
         assert!(analyzer.realized_pnls.is_empty());
+        assert!(analyzer.recorded_realized_pnls.is_empty());
         assert!(analyzer.position_returns.is_empty());
         assert!(analyzer.portfolio_returns.is_empty());
         assert!(analyzer.returns.is_empty());
@@ -1340,5 +1446,39 @@ mod tests {
             epsilon = 1e-9
         ));
         assert_eq!(returns_stats, portfolio_stats);
+    }
+
+    #[rstest]
+    fn test_get_performance_stats_returns_vs_benchmark() {
+        let mut analyzer = PortfolioAnalyzer::new();
+        analyzer.register_statistic(Arc::new(BetaRatio::new()));
+        analyzer.register_statistic(Arc::new(SharpeRatio::new(None)));
+
+        let one_day = 86_400_000_000_000_u64;
+        let start = 1_600_000_000_000_000_000_u64;
+        for (i, value) in [0.03, -0.01, 0.02, 0.04].iter().enumerate() {
+            analyzer.add_return(UnixNanos::from(start + i as u64 * one_day), *value);
+        }
+
+        let mut benchmark: Returns = BTreeMap::new();
+        for (i, value) in [0.01, 0.005, 0.005, 0.01].iter().enumerate() {
+            benchmark.insert(UnixNanos::from(start + i as u64 * one_day), *value);
+        }
+
+        let stats = analyzer.get_performance_stats_returns_vs_benchmark(&benchmark);
+
+        // r = [0.03, -0.01, 0.02, 0.04], b = [0.01, 0.005, 0.005, 0.01]:
+        //   mean_r = 0.02, mean_b = 0.0075
+        //   Cov = 1.5e-4 / 3 = 5e-5, Var(b) = 2.5e-5 / 3 -> beta = 6.0
+        // Only the benchmark-relative statistic contributes; SharpeRatio
+        // returns None from the default and is skipped.
+        assert_eq!(stats.len(), 1);
+        assert!(approx_eq!(
+            f64,
+            *stats.get("Beta").unwrap(),
+            6.0,
+            epsilon = 1e-9
+        ));
+        assert!(!stats.contains_key("Sharpe Ratio (252 days)"));
     }
 }

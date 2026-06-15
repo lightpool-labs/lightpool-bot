@@ -216,7 +216,7 @@ impl MarginAccount {
                 instrument_id,
                 MarginBalance::new(
                     margin_init,
-                    Money::new(0.0, margin_init.currency),
+                    Money::zero(margin_init.currency),
                     Some(instrument_id),
                 ),
             );
@@ -272,7 +272,7 @@ impl MarginAccount {
             self.margins.insert(
                 instrument_id,
                 MarginBalance::new(
-                    Money::new(0.0, margin_maintenance.currency),
+                    Money::zero(margin_maintenance.currency),
                     margin_maintenance,
                     Some(instrument_id),
                 ),
@@ -556,7 +556,7 @@ impl Account for MarginAccount {
     }
 
     fn calculated_account_state(&self) -> bool {
-        false // TODO (implement this logic)
+        self.calculate_account_state
     }
 
     fn balance_total(&self, currency: Option<Currency>) -> Option<Money> {
@@ -764,6 +764,12 @@ mod tests {
     }
 
     #[rstest]
+    fn test_calculated_account_state_returns_field_value(margin_account_state: AccountState) {
+        assert!(MarginAccount::new(margin_account_state.clone(), true).calculated_account_state());
+        assert!(!MarginAccount::new(margin_account_state, false).calculated_account_state());
+    }
+
+    #[rstest]
     fn test_base_account_properties(
         margin_account: MarginAccount,
         margin_account_state: AccountState,
@@ -890,6 +896,14 @@ mod tests {
                 .initial,
             margin
         );
+        assert_eq!(
+            margin_account
+                .margins
+                .get(&instrument_id_aud_usd_sim)
+                .expect("AUD/USD margin should exist")
+                .maintenance,
+            Money::zero(margin.currency)
+        );
     }
 
     #[rstest]
@@ -911,6 +925,14 @@ mod tests {
                 .expect("AUD/USD margin should exist")
                 .maintenance,
             margin
+        );
+        assert_eq!(
+            margin_account
+                .margins
+                .get(&instrument_id_aud_usd_sim)
+                .expect("AUD/USD margin should exist")
+                .initial,
+            Money::zero(margin.currency)
         );
     }
 

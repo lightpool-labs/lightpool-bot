@@ -52,10 +52,10 @@ use crate::{
         },
         models::{
             LighterAccountDetail, LighterAccountsResponse, LighterCandle, LighterCandles,
-            LighterFundings, LighterNextNonce, LighterOrderBookDetails, LighterOrderBookOrders,
-            LighterOrderBooks, LighterOrders, LighterResultCode, LighterSendTxBatchRequest,
-            LighterSendTxBatchResponse, LighterSendTxRequest, LighterSendTxResponse, LighterTrade,
-            LighterTrades,
+            LighterFundings, LighterMakerOnlyApiKeys, LighterNextNonce, LighterOrderBookDetails,
+            LighterOrderBookOrders, LighterOrderBooks, LighterOrders, LighterResultCode,
+            LighterSendTxBatchRequest, LighterSendTxBatchResponse, LighterSendTxRequest,
+            LighterSendTxResponse, LighterTrade, LighterTrades,
         },
         parse::{
             parse_candle_bar, parse_funding_rate_update,
@@ -66,8 +66,9 @@ use crate::{
         query::{
             LighterAccountActiveOrdersQuery, LighterAccountInactiveOrdersQuery,
             LighterAccountLookup, LighterAccountQuery, LighterCandlesQuery, LighterFundingsQuery,
-            LighterNextNonceQuery, LighterOrderBookDetailsQuery, LighterOrderBookOrdersQuery,
-            LighterOrderBooksQuery, LighterRecentTradesQuery, LighterTradesQuery,
+            LighterMakerOnlyApiKeysQuery, LighterNextNonceQuery, LighterOrderBookDetailsQuery,
+            LighterOrderBookOrdersQuery, LighterOrderBooksQuery, LighterRecentTradesQuery,
+            LighterTradesQuery,
         },
     },
 };
@@ -78,6 +79,7 @@ const ENDPOINT_ACCOUNT_ACTIVE_ORDERS: &str = "/api/v1/accountActiveOrders";
 const ENDPOINT_ACCOUNT_INACTIVE_ORDERS: &str = "/api/v1/accountInactiveOrders";
 const ENDPOINT_CANDLES: &str = "/api/v1/candles";
 const ENDPOINT_FUNDINGS: &str = "/api/v1/fundings";
+const ENDPOINT_MAKER_ONLY_API_KEYS: &str = "/api/v1/getMakerOnlyApiKeys";
 const ENDPOINT_NEXT_NONCE: &str = "/api/v1/nextNonce";
 const ENDPOINT_ORDER_BOOK_DETAILS: &str = "/api/v1/orderBookDetails";
 const ENDPOINT_ORDER_BOOK_ORDERS: &str = "/api/v1/orderBookOrders";
@@ -86,6 +88,7 @@ const ENDPOINT_RECENT_TRADES: &str = "/api/v1/recentTrades";
 const ENDPOINT_SEND_TX: &str = "/api/v1/sendTx";
 const ENDPOINT_SEND_TX_BATCH: &str = "/api/v1/sendTxBatch";
 const ENDPOINT_TRADES: &str = "/api/v1/trades";
+const HEADER_AUTHORIZATION: &str = "authorization";
 const MULTIPART_BOUNDARY: &str = "nautilus-lighter-form-boundary";
 
 /// Maximum page size accepted by Lighter REST list endpoints (`/api/v1/trades`,
@@ -124,6 +127,7 @@ impl_lighter_response_check!(
     LighterAccountsResponse,
     LighterCandles,
     LighterFundings,
+    LighterMakerOnlyApiKeys,
     LighterNextNonce,
     LighterOrderBookDetails,
     LighterOrderBookOrders,
@@ -378,6 +382,27 @@ impl LighterRawHttpClient {
             .await
     }
 
+    /// Calls `GET /api/v1/getMakerOnlyApiKeys`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response is invalid.
+    pub async fn get_maker_only_api_keys(
+        &self,
+        query: &LighterMakerOnlyApiKeysQuery,
+    ) -> LighterHttpResult<LighterMakerOnlyApiKeys> {
+        let params = LighterMakerOnlyApiKeysParams {
+            account_index: query.account_index,
+        };
+        let headers = query
+            .authorization
+            .as_ref()
+            .or(query.auth.as_ref())
+            .map(|auth| HashMap::from([(HEADER_AUTHORIZATION.to_string(), auth.clone())]));
+        self.send_get_request_with_headers(ENDPOINT_MAKER_ONLY_API_KEYS, Some(&params), headers)
+            .await
+    }
+
     /// Calls `POST /api/v1/sendTx`.
     ///
     /// # Errors
@@ -413,6 +438,20 @@ impl LighterRawHttpClient {
         T: DeserializeOwned + LighterResponseCheck,
         P: Serialize,
     {
+        self.send_get_request_with_headers(endpoint, params, None)
+            .await
+    }
+
+    async fn send_get_request_with_headers<T, P>(
+        &self,
+        endpoint: &str,
+        params: Option<&P>,
+        headers: Option<HashMap<String, String>>,
+    ) -> LighterHttpResult<T>
+    where
+        T: DeserializeOwned + LighterResponseCheck,
+        P: Serialize,
+    {
         let url = self.url(endpoint);
         let rate_limit_keys = Self::rate_limit_keys(endpoint);
         self.retry_manager
@@ -421,6 +460,8 @@ impl LighterRawHttpClient {
                 || {
                     let url = url.clone();
                     let rate_limit_keys = rate_limit_keys.clone();
+                    let headers = headers.clone();
+
                     async move {
                         let response = self
                             .client
@@ -428,7 +469,7 @@ impl LighterRawHttpClient {
                                 Method::GET,
                                 url,
                                 params,
-                                None,
+                                headers,
                                 None,
                                 None,
                                 Some(rate_limit_keys),
@@ -555,6 +596,11 @@ impl LighterRawHttpClient {
     fn default_headers() -> HashMap<String, String> {
         HashMap::from([(USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string())])
     }
+}
+
+#[derive(Serialize)]
+struct LighterMakerOnlyApiKeysParams {
+    account_index: i64,
 }
 
 fn multipart_headers() -> HashMap<String, String> {
@@ -816,6 +862,27 @@ impl LighterHttpClient {
             api_key_index,
         };
         self.inner.get_next_nonce(&query).await
+    }
+
+    /// Calls `GET /api/v1/getMakerOnlyApiKeys` for `account_index`.
+    ///
+    /// `auth_token` is the canonical Lighter auth string minted from the
+    /// caller's credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response is invalid.
+    pub async fn get_maker_only_api_keys(
+        &self,
+        account_index: i64,
+        auth_token: impl Into<String>,
+    ) -> LighterHttpResult<LighterMakerOnlyApiKeys> {
+        let query = LighterMakerOnlyApiKeysQuery {
+            authorization: Some(auth_token.into()),
+            auth: None,
+            account_index,
+        };
+        self.inner.get_maker_only_api_keys(&query).await
     }
 
     /// Calls `POST /api/v1/sendTx`.

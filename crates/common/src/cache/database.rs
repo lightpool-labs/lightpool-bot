@@ -37,7 +37,7 @@ use nautilus_model::{
     orderbook::OrderBook,
     orders::OrderAny,
     position::Position,
-    types::Currency,
+    types::{Currency, Money},
 };
 use ustr::Ustr;
 
@@ -150,7 +150,7 @@ pub trait CacheDatabaseAdapter {
     /// # Errors
     ///
     /// Returns an error if loading the index order-position mapping fails.
-    fn load_index_order_position(&self) -> anyhow::Result<AHashMap<ClientOrderId, Position>>;
+    fn load_index_order_position(&self) -> anyhow::Result<AHashMap<ClientOrderId, PositionId>>;
 
     /// Loads mapping from order IDs to client IDs.
     ///
@@ -479,14 +479,22 @@ pub trait CacheDatabaseAdapter {
     /// # Errors
     ///
     /// Returns an error if updating actor state fails.
-    fn update_actor(&self) -> anyhow::Result<()>;
+    fn update_actor(
+        &self,
+        component_id: &ComponentId,
+        state: &AHashMap<String, Bytes>,
+    ) -> anyhow::Result<()>;
 
     /// Updates strategy state in the cache.
     ///
     /// # Errors
     ///
     /// Returns an error if updating strategy state fails.
-    fn update_strategy(&self) -> anyhow::Result<()>;
+    fn update_strategy(
+        &self,
+        strategy_id: &StrategyId,
+        state: &AHashMap<String, Bytes>,
+    ) -> anyhow::Result<()>;
 
     /// Updates an account in the cache.
     ///
@@ -521,7 +529,12 @@ pub trait CacheDatabaseAdapter {
     /// # Errors
     ///
     /// Returns an error if snapshotting position state fails.
-    fn snapshot_position_state(&self, position: &Position) -> anyhow::Result<()>;
+    fn snapshot_position_state(
+        &self,
+        position: &Position,
+        ts_snapshot: UnixNanos,
+        unrealized_pnl: Option<Money>,
+    ) -> anyhow::Result<()>;
 
     /// Records a heartbeat timestamp.
     ///

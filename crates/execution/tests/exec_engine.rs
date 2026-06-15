@@ -43,12 +43,17 @@ use nautilus_common::{
     },
     timer::{TimeEvent, TimeEventCallback},
 };
-use nautilus_core::{UUID4, UnixNanos, datetime::NANOSECONDS_IN_MINUTE};
+use nautilus_core::{
+    UUID4, UnixNanos,
+    datetime::{NANOSECONDS_IN_MINUTE, NANOSECONDS_IN_SECOND},
+};
 use nautilus_execution::engine::{
-    ExecutionEngine, config::ExecutionEngineConfig, stubs::StubExecutionClient,
+    ExecutionEngine, PositionStateSnapshot, config::ExecutionEngineConfig,
+    stubs::StubExecutionClient,
 };
 use nautilus_model::{
     accounts::{AccountAny, CashAccount},
+    data::QuoteTick,
     enums::{
         AccountType, AssetClass, ContingencyType, LiquiditySide, OmsType, OrderSide, OrderStatus,
         OrderType, PositionSide, PositionSideSpecified, TimeInForce, TriggerType,
@@ -129,6 +134,7 @@ fn futures_contract_xcme() -> FuturesContract {
         Price::from("0.25"),
         Quantity::from(50),
         Quantity::from(1),
+        None,
         None,
         None,
         None,
@@ -697,6 +703,20 @@ fn test_submit_order_denied_with_custom_position_id_under_netting(
         .expect("Order should be cached");
 
     assert_eq!(cached_order.status(), OrderStatus::Denied);
+    if let OrderEventAny::Denied(denied) = cached_order.last_event() {
+        assert!(
+            denied.reason.as_str().starts_with("INVALID_POSITION_ID:"),
+            "Expected INVALID_POSITION_ID, was {}",
+            denied.reason,
+        );
+        assert!(
+            denied.reason.as_str().contains("not valid for NETTING OMS"),
+            "Expected NETTING OMS detail, was {}",
+            denied.reason,
+        );
+    } else {
+        panic!("Expected OrderDenied event");
+    }
 }
 
 #[rstest]
@@ -805,6 +825,20 @@ fn test_submit_order_list_denied_with_custom_position_id_under_netting(
             .order(&order.client_order_id())
             .expect("Order should be cached");
         assert_eq!(cached.status(), OrderStatus::Denied);
+        if let OrderEventAny::Denied(denied) = cached.last_event() {
+            assert!(
+                denied.reason.as_str().starts_with("INVALID_POSITION_ID:"),
+                "Expected INVALID_POSITION_ID, was {}",
+                denied.reason,
+            );
+            assert!(
+                denied.reason.as_str().contains("not valid for NETTING OMS"),
+                "Expected NETTING OMS detail, was {}",
+                denied.reason,
+            );
+        } else {
+            panic!("Expected OrderDenied event");
+        }
     }
 }
 
@@ -908,6 +942,24 @@ fn test_submit_order_list_denies_mixed_instruments_with_position_id_regardless_o
             "expected {} denied under OMS {oms_type:?}",
             order.client_order_id(),
         );
+
+        if let OrderEventAny::Denied(denied) = cached.last_event() {
+            assert!(
+                denied.reason.as_str().starts_with("INVALID_POSITION_ID:"),
+                "Expected INVALID_POSITION_ID, was {}",
+                denied.reason,
+            );
+            assert!(
+                denied
+                    .reason
+                    .as_str()
+                    .contains("mixed-instrument order list"),
+                "Expected mixed-instrument detail, was {}",
+                denied.reason,
+            );
+        } else {
+            panic!("Expected OrderDenied event");
+        }
     }
 }
 
@@ -2596,10 +2648,112 @@ fn test_submit_order_denies_when_client_does_not_handle_instrument_venue(
     if let OrderEventAny::Denied(denied) = cached_order.last_event() {
         assert_eq!(
             denied.reason.as_str(),
-            "Client IB does not handle order venue XCME (client venue IB)",
+            "CLIENT_VENUE_MISMATCH: client_id=IB, order_venue=XCME, client_venue=IB",
         );
     } else {
         panic!("Expected OrderDenied event");
+    }
+    assert!(submitted_order_ids.borrow().is_empty());
+}
+
+#[rstest]
+fn test_submit_order_list_denies_when_client_does_not_handle_instrument_venue(
+    mut execution_engine: ExecutionEngine,
+) {
+    let trader_id = TraderId::test_default();
+    let strategy_id = StrategyId::test_default();
+    let instrument = futures_contract_xcme();
+    let client_id = ClientId::from("IB");
+
+    let stub_client = StubExecutionClient::new(
+        client_id,
+        AccountId::from("IB-001"),
+        Venue::from("IB"),
+        OmsType::Netting,
+        None,
+    );
+    let submitted_order_ids = stub_client.submitted_order_ids();
+
+    execution_engine
+        .register_client(Box::new(stub_client))
+        .unwrap();
+
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_instrument(instrument.clone().into())
+        .unwrap();
+
+    let entry = OrderTestBuilder::new(OrderType::Market)
+        .trader_id(trader_id)
+        .strategy_id(strategy_id)
+        .instrument_id(instrument.id)
+        .client_order_id(ClientOrderId::from("O-VENUE-MISMATCH-001"))
+        .quantity(Quantity::from(1))
+        .build();
+
+    let stop_loss = OrderTestBuilder::new(OrderType::StopMarket)
+        .trader_id(trader_id)
+        .strategy_id(strategy_id)
+        .instrument_id(instrument.id)
+        .client_order_id(ClientOrderId::from("O-VENUE-MISMATCH-002"))
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from(1))
+        .trigger_price(Price::from("4000.00"))
+        .build();
+
+    let orders = [entry, stop_loss];
+    for order in &orders {
+        execution_engine
+            .cache()
+            .borrow_mut()
+            .add_order(order.clone(), None, Some(client_id), true)
+            .unwrap();
+    }
+
+    let order_list = OrderList::new(
+        OrderListId::from("L-VENUE-MISMATCH"),
+        instrument.id,
+        strategy_id,
+        orders.iter().map(|order| order.client_order_id()).collect(),
+        UnixNanos::default(),
+    );
+
+    let submit_order_list = SubmitOrderList {
+        trader_id,
+        client_id: Some(client_id),
+        strategy_id,
+        instrument_id: instrument.id,
+        order_list,
+        order_inits: orders
+            .iter()
+            .map(|order| order.init_event().clone())
+            .collect(),
+        exec_algorithm_id: None,
+        position_id: None,
+        params: None,
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        correlation_id: None,
+        causation_id: None,
+    };
+
+    execution_engine.execute(TradingCommand::SubmitOrderList(submit_order_list));
+
+    let cache = execution_engine.cache().borrow();
+    for order in &orders {
+        let cached_order = cache
+            .order(&order.client_order_id())
+            .expect("Order should be retrievable from cache");
+        assert_eq!(cached_order.status(), OrderStatus::Denied);
+        if let OrderEventAny::Denied(denied) = cached_order.last_event() {
+            assert_eq!(
+                denied.reason.as_str(),
+                "CLIENT_VENUE_MISMATCH: client_id=IB, order_venue=XCME, client_venue=IB",
+            );
+        } else {
+            panic!("Expected OrderDenied event");
+        }
     }
     assert!(submitted_order_ids.borrow().is_empty());
 }
@@ -2676,6 +2830,79 @@ fn test_submit_order_allows_routing_broker_for_exchange_mic_venue(
         submitted_order_ids.borrow().as_slice(),
         &[order.client_order_id()],
     );
+}
+
+#[rstest]
+fn test_submit_order_denies_when_client_submit_fails(mut execution_engine: ExecutionEngine) {
+    let trader_id = TraderId::test_default();
+    let strategy_id = StrategyId::test_default();
+    let instrument = audusd_sim();
+    let client_id = ClientId::from("SIM_CLIENT");
+
+    let stub_client = StubExecutionClient::new(
+        client_id,
+        AccountId::from("SIM-001"),
+        instrument.id.venue,
+        OmsType::Netting,
+        None,
+    )
+    .with_submit_order_error("transport closed");
+    let submitted_order_ids = stub_client.submitted_order_ids();
+
+    execution_engine
+        .register_client(Box::new(stub_client))
+        .unwrap();
+
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_instrument(instrument.clone().into())
+        .unwrap();
+
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .trader_id(trader_id)
+        .strategy_id(strategy_id)
+        .instrument_id(instrument.id)
+        .client_order_id(ClientOrderId::from("O-SUBMIT-FAIL-001"))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100_000))
+        .build();
+
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(client_id), true)
+        .unwrap();
+
+    let submit_order = SubmitOrder {
+        trader_id,
+        strategy_id,
+        position_id: None,
+        params: None,
+        client_order_id: order.client_order_id(),
+        order_init: order.init_event().clone(),
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        client_id: Some(client_id),
+        instrument_id: instrument.id,
+        exec_algorithm_id: None,
+        correlation_id: None,
+        causation_id: None,
+    };
+
+    execution_engine.execute(TradingCommand::SubmitOrder(submit_order));
+
+    let cache = execution_engine.cache().borrow();
+    let cached_order = cache
+        .order(&order.client_order_id())
+        .expect("Order should be retrievable from cache");
+    assert_eq!(cached_order.status(), OrderStatus::Denied);
+    if let OrderEventAny::Denied(denied) = cached_order.last_event() {
+        assert_eq!(denied.reason.as_str(), "SUBMIT_FAILED: transport closed");
+    } else {
+        panic!("Expected OrderDenied event");
+    }
+    assert!(submitted_order_ids.borrow().is_empty());
 }
 
 #[rstest]
@@ -5440,7 +5667,7 @@ fn test_flip_position_on_opposite_filled_same_position_sell(mut execution_engine
         None,
         None,
         None,
-        None,
+        Some(Money::from("3 USD")),
         None,
         Some(AccountId::test_default()),
     );
@@ -5479,14 +5706,18 @@ fn test_flip_position_on_opposite_filled_same_position_sell(mut execution_engine
             original_position.is_closed(),
             "Original position should be closed after flip"
         );
+        let close_split = original_position
+            .events
+            .last()
+            .expect("closed position should include the closing split fill");
         assert_eq!(
-            original_position
-                .events
-                .last()
-                .expect("closed position should include the closing split fill")
-                .event_id,
-            flip_fill_event_id,
+            close_split.event_id, flip_fill_event_id,
             "close-side split fill should retain the original fill event ID",
+        );
+        assert_eq!(
+            close_split.commission,
+            Some(Money::from("2 USD")),
+            "close-side split fill should receive two thirds of the commission",
         );
     }
 
@@ -5525,6 +5756,15 @@ fn test_flip_position_on_opposite_filled_same_position_sell(mut execution_engine
             flipped_position.quantity,
             Quantity::from(50_000), // 150,000 - 100,000 = 50,000
             "Flipped position quantity should be 50,000 (150,000 - 100,000)"
+        );
+        assert_eq!(
+            flipped_position
+                .events
+                .first()
+                .expect("flipped position should include the opening split fill")
+                .commission,
+            Some(Money::from("1 USD")),
+            "open-side split fill should receive the residual commission",
         );
 
         assert_eq!(
@@ -12132,6 +12372,101 @@ fn test_submit_order_list_adds_missing_orders_to_cache_from_inits(
 }
 
 #[rstest]
+fn test_submit_order_list_denies_when_client_submit_fails(mut execution_engine: ExecutionEngine) {
+    let trader_id = TraderId::test_default();
+    let strategy_id = StrategyId::test_default();
+    let instrument = audusd_sim();
+    let client_id = ClientId::from("SIM_CLIENT");
+    let client = StubExecutionClient::new(
+        client_id,
+        AccountId::from("SIM-ACCOUNT"),
+        instrument.id.venue,
+        OmsType::Netting,
+        None,
+    )
+    .with_submit_order_list_error("transport closed");
+    let submitted_order_ids = client.submitted_order_ids();
+    execution_engine.register_client(Box::new(client)).unwrap();
+
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_instrument(instrument.clone().into())
+        .unwrap();
+
+    let entry = OrderTestBuilder::new(OrderType::Market)
+        .trader_id(trader_id)
+        .strategy_id(strategy_id)
+        .instrument_id(instrument.id)
+        .client_order_id(ClientOrderId::from("O-SUBMIT-LIST-FAIL-001"))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100_000))
+        .build();
+
+    let stop_loss = OrderTestBuilder::new(OrderType::StopMarket)
+        .trader_id(trader_id)
+        .strategy_id(strategy_id)
+        .instrument_id(instrument.id)
+        .client_order_id(ClientOrderId::from("O-SUBMIT-LIST-FAIL-002"))
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from(100_000))
+        .trigger_price(Price::from_str("0.50000").unwrap())
+        .build();
+
+    let orders = [entry, stop_loss];
+    for order in &orders {
+        execution_engine
+            .cache()
+            .borrow_mut()
+            .add_order(order.clone(), None, Some(client_id), true)
+            .unwrap();
+    }
+
+    let order_list = OrderList::new(
+        OrderListId::from("L-SUBMIT-FAIL"),
+        instrument.id,
+        strategy_id,
+        orders.iter().map(|order| order.client_order_id()).collect(),
+        UnixNanos::default(),
+    );
+
+    let submit_order_list = SubmitOrderList {
+        trader_id,
+        client_id: Some(client_id),
+        strategy_id,
+        instrument_id: instrument.id,
+        order_list,
+        order_inits: orders
+            .iter()
+            .map(|order| order.init_event().clone())
+            .collect(),
+        exec_algorithm_id: None,
+        position_id: None,
+        params: None,
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        correlation_id: None,
+        causation_id: None,
+    };
+
+    execution_engine.execute(TradingCommand::SubmitOrderList(submit_order_list));
+
+    let cache = execution_engine.cache().borrow();
+    for order in &orders {
+        let cached_order = cache
+            .order(&order.client_order_id())
+            .expect("Order should be retrievable from cache");
+        assert_eq!(cached_order.status(), OrderStatus::Denied);
+        if let OrderEventAny::Denied(denied) = cached_order.last_event() {
+            assert_eq!(denied.reason.as_str(), "SUBMIT_FAILED: transport closed");
+        } else {
+            panic!("Expected OrderDenied event");
+        }
+    }
+    assert!(submitted_order_ids.borrow().is_empty());
+}
+
+#[rstest]
 fn test_submit_order_list_denies_cached_orders_when_missing_order_has_no_init(
     mut execution_engine: ExecutionEngine,
 ) {
@@ -12213,11 +12548,9 @@ fn test_submit_order_list_denies_cached_orders_when_missing_order_has_no_init(
 
     assert_eq!(cached_entry.status(), OrderStatus::Denied);
     if let OrderEventAny::Denied(denied) = cached_entry.last_event() {
-        assert!(
-            denied
-                .reason
-                .as_str()
-                .contains("Incomplete order list: missing orders in cache"),
+        assert_eq!(
+            denied.reason.as_str(),
+            "ORDER_LIST_INCOMPLETE: order_list_id=1",
         );
     } else {
         panic!("Expected OrderDenied event");
@@ -12354,6 +12687,14 @@ fn test_submit_order_with_no_client_denies_order(execution_engine: ExecutionEngi
     let cache = execution_engine.cache().borrow();
     let cached_order = cache.order(&order.client_order_id()).unwrap();
     assert_eq!(cached_order.status(), OrderStatus::Denied);
+    if let OrderEventAny::Denied(denied) = cached_order.last_event() {
+        assert_eq!(
+            denied.reason.as_str(),
+            "NO_EXECUTION_CLIENT: client_id=None, routing_context=venue=SIM",
+        );
+    } else {
+        panic!("Expected OrderDenied event");
+    }
 }
 
 #[rstest]
@@ -12460,6 +12801,16 @@ fn test_submit_order_list_with_no_client_denies_all_orders(execution_engine: Exe
     let cached_stop = cache.order(&stop_loss.client_order_id()).unwrap();
     assert_eq!(cached_entry.status(), OrderStatus::Denied);
     assert_eq!(cached_stop.status(), OrderStatus::Denied);
+    for cached in [cached_entry, cached_stop] {
+        if let OrderEventAny::Denied(denied) = cached.last_event() {
+            assert_eq!(
+                denied.reason.as_str(),
+                "NO_EXECUTION_CLIENT: client_id=None, routing_context=venue=SIM",
+            );
+        } else {
+            panic!("Expected OrderDenied event");
+        }
+    }
 }
 
 #[rstest]
@@ -12614,6 +12965,205 @@ fn test_purge_closed_orders_timer_fires_callback() {
             .len(),
         0
     );
+}
+
+#[rstest]
+fn test_start_snapshot_timer_registers_when_configured() {
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let config = ExecutionEngineConfig {
+        snapshot_positions_interval_secs: Some(1.0),
+        ..Default::default()
+    };
+
+    let mut engine = ExecutionEngine::new(clock.clone(), cache, Some(config));
+    engine.start();
+
+    assert!(
+        clock
+            .borrow()
+            .timer_names()
+            .contains(&"ExecEngine_SNAPSHOT_POSITIONS")
+    );
+    assert_eq!(clock.borrow().timer_count(), 1);
+}
+
+#[rstest]
+fn test_start_snapshot_timer_zero_interval_skipped() {
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let config = ExecutionEngineConfig {
+        snapshot_positions_interval_secs: Some(0.0),
+        ..Default::default()
+    };
+
+    let mut engine = ExecutionEngine::new(clock.clone(), cache, Some(config));
+    engine.start();
+
+    assert_eq!(clock.borrow().timer_count(), 0);
+}
+
+#[rstest]
+#[case::stop("stop")]
+#[case::reset("reset")]
+#[case::dispose("dispose")]
+fn test_snapshot_timer_canceled_on_lifecycle_transition(#[case] action: &str) {
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let config = ExecutionEngineConfig {
+        snapshot_positions_interval_secs: Some(1.0),
+        ..Default::default()
+    };
+
+    let mut engine = ExecutionEngine::new(clock.clone(), cache, Some(config));
+    engine.start();
+    assert_eq!(clock.borrow().timer_count(), 1);
+
+    match action {
+        "stop" => engine.stop(),
+        "reset" => engine.reset(),
+        "dispose" => engine.dispose(),
+        _ => unreachable!(),
+    }
+
+    assert_eq!(clock.borrow().timer_count(), 0);
+}
+
+#[rstest]
+fn test_snapshot_open_position_states_publishes_position_state_snapshot() {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+
+    let position = stub_position_long(audusd_sim());
+    cache
+        .borrow_mut()
+        .add_position(&position, OmsType::Netting)
+        .unwrap();
+
+    // Wide spread so a long marking to ask instead of bid changes the rounded PnL
+    let quote = QuoteTick {
+        instrument_id: position.instrument_id,
+        bid_price: Price::from("2.00020"),
+        ask_price: Price::from("3.00020"),
+        bid_size: Quantity::from(1_000_000),
+        ask_size: Quantity::from(1_000_000),
+        ts_event: UnixNanos::default(),
+        ts_init: UnixNanos::default(),
+    };
+    cache.borrow_mut().add_quote(quote).unwrap();
+
+    let ts_snapshot = UnixNanos::from(123_456_789);
+    clock.borrow_mut().advance_time(ts_snapshot, true);
+
+    let engine = ExecutionEngine::new(clock, cache, None);
+
+    let topic = format!("snapshots.positions.{}", position.id);
+    let pattern: msgbus::MStr<msgbus::Pattern> = topic.as_str().into();
+    let (handler, saver) = get_any_saving_handler::<PositionStateSnapshot>(None);
+    msgbus::subscribe_any(pattern, handler.clone(), None);
+
+    engine.snapshot_open_position_states();
+
+    msgbus::unsubscribe_any(pattern, &handler);
+
+    let snapshots = saver.get_messages();
+    assert_eq!(snapshots.len(), 1);
+    let snapshot = &snapshots[0];
+    let unrealized_pnl = snapshot
+        .unrealized_pnl
+        .expect("unrealized PnL should be present when a quote is cached");
+
+    assert_eq!(snapshot.position.id, position.id);
+    assert_eq!(snapshot.ts_snapshot, ts_snapshot);
+    assert_eq!(unrealized_pnl.currency, Currency::USD());
+    assert_eq!(unrealized_pnl.as_decimal(), dec!(1.00));
+}
+
+#[rstest]
+fn test_snapshot_open_position_states_publishes_snapshot_without_quote() {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+
+    let position = stub_position_long(audusd_sim());
+    cache
+        .borrow_mut()
+        .add_position(&position, OmsType::Netting)
+        .unwrap();
+
+    let ts_snapshot = UnixNanos::from(987_654_321);
+    clock.borrow_mut().advance_time(ts_snapshot, true);
+
+    let engine = ExecutionEngine::new(clock, cache, None);
+
+    let topic = format!("snapshots.positions.{}", position.id);
+    let pattern: msgbus::MStr<msgbus::Pattern> = topic.as_str().into();
+    let (handler, saver) = get_any_saving_handler::<PositionStateSnapshot>(None);
+    msgbus::subscribe_any(pattern, handler.clone(), None);
+
+    engine.snapshot_open_position_states();
+
+    msgbus::unsubscribe_any(pattern, &handler);
+
+    let snapshots = saver.get_messages();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].position.id, position.id);
+    assert_eq!(snapshots[0].ts_snapshot, ts_snapshot);
+    assert!(snapshots[0].unrealized_pnl.is_none());
+}
+
+#[rstest]
+fn test_snapshot_timer_fires_callback_publishes_position_state_snapshot() {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+
+    let position = stub_position_long(audusd_sim());
+    cache
+        .borrow_mut()
+        .add_position(&position, OmsType::Netting)
+        .unwrap();
+
+    let quote = QuoteTick {
+        instrument_id: position.instrument_id,
+        bid_price: Price::from("2.00020"),
+        ask_price: Price::from("2.00030"),
+        bid_size: Quantity::from(1_000_000),
+        ask_size: Quantity::from(1_000_000),
+        ts_event: UnixNanos::default(),
+        ts_init: UnixNanos::default(),
+    };
+    cache.borrow_mut().add_quote(quote).unwrap();
+
+    let config = ExecutionEngineConfig {
+        snapshot_positions_interval_secs: Some(1.0),
+        ..Default::default()
+    };
+    let mut engine = ExecutionEngine::new(clock.clone(), cache, Some(config));
+    engine.start();
+
+    let topic = format!("snapshots.positions.{}", position.id);
+    let pattern: msgbus::MStr<msgbus::Pattern> = topic.as_str().into();
+    let (handler, saver) = get_any_saving_handler::<PositionStateSnapshot>(None);
+    msgbus::subscribe_any(pattern, handler.clone(), None);
+
+    let events = clock
+        .borrow_mut()
+        .advance_time(UnixNanos::from(NANOSECONDS_IN_SECOND + 1), true);
+    let handlers = clock.borrow().match_handlers(events);
+    for handler in handlers {
+        handler.callback.call(handler.event);
+    }
+
+    msgbus::unsubscribe_any(pattern, &handler);
+
+    let snapshots = saver.get_messages();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].position.id, position.id);
 }
 
 #[rstest]

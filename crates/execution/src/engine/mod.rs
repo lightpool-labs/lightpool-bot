@@ -57,7 +57,7 @@ use nautilus_common::{
 };
 use nautilus_core::{
     UUID4, UnixNanos, WeakCell,
-    datetime::{mins_to_nanos, mins_to_secs},
+    datetime::{mins_to_nanos, mins_to_secs, secs_to_nanos},
 };
 use nautilus_model::{
     accounts::Account,
@@ -66,9 +66,9 @@ use nautilus_model::{
         TrailingOffsetType,
     },
     events::{
-        OrderAccepted, OrderCanceled, OrderDenied, OrderEvent, OrderEventAny, OrderExpired,
-        OrderFilled, OrderInitialized, PositionChanged, PositionClosed, PositionEvent,
-        PositionOpened,
+        OrderAccepted, OrderCanceled, OrderDenied, OrderDeniedReason, OrderEvent, OrderEventAny,
+        OrderExpired, OrderFilled, OrderInitialized, PositionChanged, PositionClosed,
+        PositionEvent, PositionOpened,
     },
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId, Venue,
@@ -92,9 +92,21 @@ use crate::{
     },
 };
 
+const TIMER_SNAPSHOT_POSITIONS: &str = "ExecEngine_SNAPSHOT_POSITIONS";
 const TIMER_PURGE_CLOSED_ORDERS: &str = "ExecEngine_PURGE_CLOSED_ORDERS";
 const TIMER_PURGE_CLOSED_POSITIONS: &str = "ExecEngine_PURGE_CLOSED_POSITIONS";
 const TIMER_PURGE_ACCOUNT_EVENTS: &str = "ExecEngine_PURGE_ACCOUNT_EVENTS";
+
+/// Position state snapshot published to the `snapshots.positions.{position_id}` topic.
+#[derive(Debug, Clone)]
+pub struct PositionStateSnapshot {
+    /// The position state at the time of the snapshot.
+    pub position: Position,
+    /// The unrealized PnL for the position, when a current quote is available.
+    pub unrealized_pnl: Option<Money>,
+    /// UNIX timestamp (nanoseconds) when the snapshot was taken.
+    pub ts_snapshot: UnixNanos,
+}
 
 /// Callback that anchors cache snapshot metadata in an external store.
 pub type SnapshotAnchorer = Rc<dyn Fn(CacheSnapshotRef) -> anyhow::Result<()>>;
@@ -681,18 +693,66 @@ impl ExecutionEngine {
     }
 
     /// Starts the position snapshot timer if configured.
-    ///
-    /// Timer functionality requires a live execution context with an active clock.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "timer registration is not expected to fail"
+    )]
     pub fn start_snapshot_timer(&mut self) {
-        if let Some(interval_secs) = self.config.snapshot_positions_interval_secs {
+        if let Some(interval_secs) = self
+            .config
+            .snapshot_positions_interval_secs
+            .filter(|&secs| secs > 0.0)
+            && !self
+                .clock
+                .borrow()
+                .timer_names()
+                .contains(&TIMER_SNAPSHOT_POSITIONS)
+        {
+            let interval_ns = match secs_to_nanos(interval_secs) {
+                Ok(ns) => ns,
+                Err(e) => {
+                    log::error!("Cannot start position snapshots timer: {e}");
+                    return;
+                }
+            };
+            let clock = self.clock.clone();
+            let cache = self.cache.clone();
+            let debug = self.config.debug;
+
+            let callback_fn: Rc<dyn Fn(TimeEvent)> = Rc::new(move |_event| {
+                Self::snapshot_open_positions(&clock, &cache, debug);
+            });
+            let callback = TimeEventCallback::from(callback_fn);
+
             log::info!("Starting position snapshots timer at {interval_secs} second intervals");
+            self.clock
+                .borrow_mut()
+                .set_timer_ns(
+                    TIMER_SNAPSHOT_POSITIONS,
+                    interval_ns,
+                    None,
+                    None,
+                    Some(callback),
+                    None,
+                    None,
+                )
+                .expect("Failed to set position snapshots timer");
         }
     }
 
     /// Stops the position snapshot timer if running.
     pub fn stop_snapshot_timer(&mut self) {
-        if self.config.snapshot_positions_interval_secs.is_some() {
+        let timer_registered = self
+            .clock
+            .borrow()
+            .timer_names()
+            .contains(&TIMER_SNAPSHOT_POSITIONS);
+
+        if timer_registered {
             log::info!("Canceling position snapshots timer");
+            self.clock
+                .borrow_mut()
+                .cancel_timer(TIMER_SNAPSHOT_POSITIONS);
         }
     }
 
@@ -855,8 +915,15 @@ impl ExecutionEngine {
 
     /// Creates snapshots of all open positions.
     pub fn snapshot_open_position_states(&self) {
-        let positions: Vec<Position> = self
-            .cache
+        Self::snapshot_open_positions(&self.clock, &self.cache, self.config.debug);
+    }
+
+    fn snapshot_open_positions(
+        clock: &Rc<RefCell<dyn Clock>>,
+        cache: &Rc<RefCell<Cache>>,
+        debug: bool,
+    ) {
+        let positions: Vec<Position> = cache
             .borrow()
             .positions_open(None, None, None, None, None)
             .into_iter()
@@ -864,7 +931,7 @@ impl ExecutionEngine {
             .collect();
 
         for position in positions {
-            self.create_position_state_snapshot(&position);
+            Self::publish_position_state_snapshot(clock, cache, debug, &position, true);
         }
     }
 
@@ -1885,10 +1952,11 @@ impl ExecutionEngine {
                 command.client_id(),
             );
 
-            let reason = format!(
-                "No execution client found for client_id={:?}, {routing_context}",
-                command.client_id(),
-            );
+            let reason = OrderDeniedReason::NoExecutionClient {
+                client_id: command.client_id(),
+                routing_context,
+            }
+            .to_string();
 
             match command {
                 TradingCommand::SubmitOrder(cmd) => {
@@ -2040,12 +2108,13 @@ impl ExecutionEngine {
         let client_venue = client.venue();
         if !client.handles_order_venue(order_venue) {
             let client_id = client.client_id();
-            self.deny_order(
-                &order,
-                &format!(
-                    "Client {client_id} does not handle order venue {order_venue} (client venue {client_venue})"
-                ),
-            );
+            let reason = OrderDeniedReason::ClientVenueMismatch {
+                client_id,
+                order_venue,
+                client_venue,
+            }
+            .to_string();
+            self.deny_order(&order, &reason);
             return;
         }
 
@@ -2055,7 +2124,7 @@ impl ExecutionEngine {
             cmd.position_id,
             client,
         ) {
-            self.deny_order(&order, &reason);
+            self.deny_order(&order, &reason.to_string());
             return;
         }
 
@@ -2081,7 +2150,13 @@ impl ExecutionEngine {
         }
 
         if let Err(e) = client.submit_order(cmd) {
-            self.deny_order(&order, &format!("failed-to-submit-order-to-client: {e}"));
+            self.deny_order(
+                &order,
+                &OrderDeniedReason::SubmitFailed {
+                    detail: e.to_string(),
+                }
+                .to_string(),
+            );
         }
     }
 
@@ -2127,11 +2202,13 @@ impl ExecutionEngine {
         }
 
         if orders.len() != cmd.order_list.client_order_ids.len() {
+            let reason = OrderDeniedReason::OrderListIncomplete {
+                order_list_id: cmd.order_list.id,
+            }
+            .to_string();
+
             for order in &orders {
-                self.deny_order(
-                    order,
-                    &format!("Incomplete order list: missing orders in cache for {cmd}"),
-                );
+                self.deny_order(order, &reason);
             }
             return;
         }
@@ -2140,14 +2217,15 @@ impl ExecutionEngine {
         let client_venue = client.venue();
         if !client.handles_order_venue(order_list_venue) {
             let client_id = client.client_id();
+            let reason = OrderDeniedReason::ClientVenueMismatch {
+                client_id,
+                order_venue: order_list_venue,
+                client_venue,
+            }
+            .to_string();
 
             for order in &orders {
-                self.deny_order(
-                    order,
-                    &format!(
-                        "Client {client_id} does not handle order list venue {order_list_venue} (client venue {client_venue})"
-                    ),
-                );
+                self.deny_order(order, &reason);
             }
             return;
         }
@@ -2159,10 +2237,12 @@ impl ExecutionEngine {
         if let Some(position_id) = cmd.position_id
             && !is_uniform_instrument
         {
-            let reason = format!(
-                "`position_id` {position_id} is not valid for a mixed-instrument order list; \
-                 a position belongs to a single instrument",
-            );
+            let reason = OrderDeniedReason::InvalidPositionId {
+                position_id,
+                detail: "not valid for a mixed-instrument order list; a position belongs to a single instrument"
+                    .to_string(),
+            }
+            .to_string();
 
             for order in &orders {
                 self.deny_order(order, &reason);
@@ -2176,6 +2256,7 @@ impl ExecutionEngine {
             cmd.position_id,
             client,
         ) {
+            let reason = reason.to_string();
             for order in &orders {
                 self.deny_order(order, &reason);
             }
@@ -2212,11 +2293,13 @@ impl ExecutionEngine {
 
         if let Err(e) = client.submit_order_list(cmd) {
             log::error!("Error submitting order list to client: {e}");
+            let reason = OrderDeniedReason::SubmitFailed {
+                detail: e.to_string(),
+            }
+            .to_string();
+
             for order in &orders {
-                self.deny_order(
-                    order,
-                    &format!("failed-to-submit-order-list-to-client: {e}"),
-                );
+                self.deny_order(order, &reason);
             }
         }
     }
@@ -2303,15 +2386,50 @@ impl ExecutionEngine {
         }
     }
 
-    fn create_position_state_snapshot(&self, position: &Position) {
-        if self.config.debug {
+    fn create_position_state_snapshot(&self, position: &Position, open_only: bool) {
+        Self::publish_position_state_snapshot(
+            &self.clock,
+            &self.cache,
+            self.config.debug,
+            position,
+            open_only,
+        );
+    }
+
+    fn publish_position_state_snapshot(
+        clock: &Rc<RefCell<dyn Clock>>,
+        cache: &Rc<RefCell<Cache>>,
+        debug: bool,
+        position: &Position,
+        open_only: bool,
+    ) {
+        if debug {
             log::debug!("Creating position state snapshot for {position}");
         }
 
-        // let mut position: Position = position.clone();
-        // if let Some(pnl) = self.cache.borrow().calculate_unrealized_pnl(&position) {
-        //     position.unrealized_pnl(last)
-        // }
+        let ts_snapshot = clock.borrow().timestamp_ns();
+        let unrealized_pnl = cache.borrow().calculate_unrealized_pnl(position);
+
+        let snapshot = PositionStateSnapshot {
+            position: position.clone(),
+            unrealized_pnl,
+            ts_snapshot,
+        };
+
+        let topic = format!("snapshots.positions.{}", position.id);
+        msgbus::publish_any(topic.into(), &snapshot);
+
+        let has_backing = cache.borrow().has_backing();
+        if has_backing
+            && let Err(e) = cache.borrow_mut().snapshot_position_state(
+                position,
+                ts_snapshot,
+                unrealized_pnl,
+                Some(open_only),
+            )
+        {
+            log::error!("Failed to snapshot position state: {e}");
+        }
     }
 
     fn handle_event(&mut self, event: &OrderEventAny) {
@@ -2576,7 +2694,7 @@ impl ExecutionEngine {
         strategy_id: StrategyId,
         position_id: Option<PositionId>,
         client: &dyn ExecutionClient,
-    ) -> Option<String> {
+    ) -> Option<OrderDeniedReason> {
         let position_id = position_id?;
 
         if self.resolve_oms_type_for_client(strategy_id, client) != OmsType::Netting {
@@ -2588,10 +2706,12 @@ impl ExecutionEngine {
             return None;
         }
 
-        Some(format!(
-            "`position_id` {position_id} is not valid for NETTING OMS; \
-             expected '{expected}' (use HEDGING for custom position IDs)"
-        ))
+        Some(OrderDeniedReason::InvalidPositionId {
+            position_id,
+            detail: format!(
+                "not valid for NETTING OMS; expected '{expected}' (use HEDGING for custom position IDs)"
+            ),
+        })
     }
 
     fn determine_position_id(
@@ -3154,7 +3274,7 @@ impl ExecutionEngine {
         self.cache.borrow_mut().add_position(&position, oms_type)?;
 
         if self.config.snapshot_positions {
-            self.create_position_state_snapshot(&position);
+            self.create_position_state_snapshot(&position, true);
         }
 
         let ts_init = self.clock.borrow().timestamp_ns();
@@ -3223,7 +3343,7 @@ impl ExecutionEngine {
 
         // Create position state snapshot if enabled
         if self.config.snapshot_positions {
-            self.create_position_state_snapshot(position);
+            self.create_position_state_snapshot(position, false);
         }
 
         let ts_init = self.clock.borrow().timestamp_ns();
@@ -3285,14 +3405,18 @@ impl ExecutionEngine {
         };
 
         // Split commission between two positions
-        let fill_percent = position.quantity.as_f64() / fill.last_qty.as_f64();
+        let fill_percent = position.quantity.as_decimal() / fill.last_qty.as_decimal();
         let (commission1, commission2) = if let Some(commission) = fill.commission {
             let commission_currency = commission.currency;
-            let commission1 = Money::new(commission * fill_percent, commission_currency);
+            let commission1 =
+                Money::from_decimal(commission.as_decimal() * fill_percent, commission_currency)
+                    .expect("Invalid split commission");
             let commission2 = commission - commission1;
             (Some(commission1), Some(commission2))
         } else {
-            log::error!("Commission is not available");
+            log::warn!(
+                "Commission is not available for position flip, splitting with no commission"
+            );
             (None, None)
         };
 

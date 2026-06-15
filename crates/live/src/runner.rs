@@ -177,7 +177,7 @@ pub struct AsyncRunner {
     data_evt_tx: tokio::sync::mpsc::UnboundedSender<DataEvent>,
 }
 
-/// Handle for stopping the AsyncRunner from another context.
+/// Handle for stopping the `AsyncRunner` from another context.
 #[derive(Clone, Debug)]
 pub struct AsyncRunnerHandle {
     signal_tx: tokio::sync::mpsc::UnboundedSender<()>,
@@ -367,13 +367,13 @@ impl AsyncRunner {
         handler.run();
     }
 
-    /// Handles a data command by sending to the DataEngine.
+    /// Handles a data command by sending to the `DataEngine`.
     #[inline]
     pub fn handle_data_command(cmd: DataCommand) {
         msgbus::send_data_command(MessagingSwitchboard::data_engine_execute(), cmd);
     }
 
-    /// Handles a data event by sending to the appropriate DataEngine endpoint.
+    /// Handles a data event by sending to the appropriate `DataEngine` endpoint.
     #[inline]
     pub fn handle_data_event(event: DataEvent) {
         match event {
@@ -402,7 +402,7 @@ impl AsyncRunner {
         }
     }
 
-    /// Handles an execution command by sending to the ExecEngine.
+    /// Handles an execution command by sending to the `ExecEngine`.
     #[inline]
     pub fn handle_exec_command(cmd: TradingCommand) {
         msgbus::send_trading_command(MessagingSwitchboard::exec_engine_execute(), cmd);
@@ -512,7 +512,7 @@ mod tests {
         }
     }
 
-    // Test helper to create AsyncRunner with manual channels.
+    // Test fixture to create AsyncRunner with manual channels.
     // Sender halves are dummies (not connected to the test receivers) since
     // these tests exercise the event loop, not TLS binding.
     fn create_test_runner(
@@ -1257,14 +1257,14 @@ mod tests {
         // Get handle before moving runner
         let handle = runner.handle();
 
-        let runner_task = tokio::spawn(async move {
+        let runner_handle = tokio::spawn(async move {
             runner.run().await;
         });
 
         // Use handle to stop
         handle.stop();
 
-        let result = tokio::time::timeout(Duration::from_millis(100), runner_task).await;
+        let result = tokio::time::timeout(Duration::from_millis(100), runner_handle).await;
         assert!(result.is_ok(), "Runner should stop via handle");
     }
 
@@ -1309,7 +1309,7 @@ mod tests {
                 .unwrap();
         }
 
-        let runner_task = tokio::spawn(async move {
+        let runner_handle = tokio::spawn(async move {
             runner.run().await;
         });
 
@@ -1317,7 +1317,7 @@ mod tests {
         tokio::task::yield_now().await;
         handle.stop();
 
-        let result = tokio::time::timeout(Duration::from_millis(200), runner_task).await;
+        let result = tokio::time::timeout(Duration::from_millis(200), runner_handle).await;
         assert!(result.is_ok(), "Runner should process events and stop");
     }
 

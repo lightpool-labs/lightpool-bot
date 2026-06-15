@@ -9,6 +9,7 @@ from nautilus_trader import model
 from nautilus_trader import portfolio
 
 __all__ = [
+    "ExecutionAlgorithmConfig",
     "ForexSession",
     "ImportableExecAlgorithmConfig",
     "ImportableStrategyConfig",
@@ -20,6 +21,21 @@ __all__ = [
     "fx_prev_end",
     "fx_prev_start",
 ]
+
+@typing.final
+class ExecutionAlgorithmConfig:
+    def __init__(
+        self,
+        exec_algorithm_id: model.ExecAlgorithmId | None = None,
+        log_events: bool = True,
+        log_commands: bool = True,
+    ) -> None: ...
+    @property
+    def exec_algorithm_id(self) -> model.ExecAlgorithmId | None: ...
+    @property
+    def log_events(self) -> bool: ...
+    @property
+    def log_commands(self) -> bool: ...
 
 @typing.final
 class ImportableExecAlgorithmConfig:
@@ -55,6 +71,8 @@ class Strategy:
     @property
     def portfolio(self) -> portfolio.Portfolio: ...
     @property
+    def order_factory(self) -> common.OrderFactory: ...
+    @property
     def log(self) -> common.Logger: ...
     def state(self) -> common.ComponentState: ...
     def is_ready(self) -> bool: ...
@@ -65,14 +83,37 @@ class Strategy:
     def is_faulted(self) -> bool: ...
     def start(self) -> None: ...
     def stop(self) -> None: ...
+    def market_exit(self) -> None: ...
+    def is_exiting(self) -> bool: ...
+    def save(self) -> dict: ...
+    def load(self, state: dict) -> None: ...
     def resume(self) -> None: ...
     def reset(self) -> None: ...
     def dispose(self) -> None: ...
     def degrade(self) -> None: ...
     def fault(self) -> None: ...
+    @property
+    def registered_indicators(self) -> list: ...
+    def indicators_initialized(self) -> bool: ...
+    def register_indicator_for_quote_ticks(
+        self, instrument_id: model.InstrumentId, indicator: typing.Any
+    ) -> None: ...
+    def register_indicator_for_trade_ticks(
+        self, instrument_id: model.InstrumentId, indicator: typing.Any
+    ) -> None: ...
+    def register_indicator_for_bars(
+        self, bar_type: model.BarType, indicator: typing.Any
+    ) -> None: ...
     def submit_order(
         self,
         order: typing.Any,
+        position_id: model.PositionId | None = None,
+        client_id: model.ClientId | None = None,
+        params: dict | None = None,
+    ) -> None: ...
+    def submit_order_list(
+        self,
+        order_list: typing.Any,
         position_id: model.PositionId | None = None,
         client_id: model.ClientId | None = None,
         params: dict | None = None,
@@ -92,6 +133,7 @@ class Strategy:
         client_id: model.ClientId | None = None,
         params: dict | None = None,
     ) -> None: ...
+    def cancel_gtd_expiry(self, order: typing.Any) -> None: ...
     def cancel_orders(
         self,
         client_order_ids: typing.Sequence[model.ClientOrderId],
@@ -140,6 +182,8 @@ class Strategy:
     def on_dispose(self) -> None: ...
     def on_degrade(self) -> None: ...
     def on_fault(self) -> None: ...
+    def on_save(self) -> dict: ...
+    def on_load(self, state: dict) -> None: ...
     def on_time_event(self, event: common.TimeEvent) -> None: ...
     def on_data(self, data: typing.Any) -> None: ...
     def on_signal(self, signal: common.Signal) -> None: ...
@@ -156,7 +200,10 @@ class Strategy:
     def on_instrument_close(self, close: model.InstrumentClose) -> None: ...
     def on_option_greeks(self, greeks: model.OptionGreeks) -> None: ...
     def on_option_chain(self, slice: model.OptionChainSlice) -> None: ...
+    def on_market_exit(self) -> None: ...
+    def post_market_exit(self) -> None: ...
     def on_order_initialized(self, event: model.OrderInitialized) -> None: ...
+    def on_order_event(self, event: typing.Any) -> None: ...
     def on_order_denied(self, event: model.OrderDenied) -> None: ...
     def on_order_emulated(self, event: model.OrderEmulated) -> None: ...
     def on_order_released(self, event: model.OrderReleased) -> None: ...
@@ -173,6 +220,7 @@ class Strategy:
     def on_order_canceled(self, event: model.OrderCanceled) -> None: ...
     def on_order_filled(self, event: model.OrderFilled) -> None: ...
     def on_position_opened(self, event: model.PositionOpened) -> None: ...
+    def on_position_event(self, event: typing.Any) -> None: ...
     def on_position_changed(self, event: model.PositionChanged) -> None: ...
     def on_position_closed(self, event: model.PositionClosed) -> None: ...
     def on_historical_data(self, data: typing.Any) -> None: ...
@@ -382,24 +430,24 @@ class Strategy:
         self,
         data_type: model.DataType,
         client_id: model.ClientId,
-        start: int | None = None,
-        end: int | None = None,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
         limit: int | None = None,
         params: dict | None = None,
     ) -> str: ...
     def request_instrument(
         self,
         instrument_id: model.InstrumentId,
-        start: int | None = None,
-        end: int | None = None,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
         client_id: model.ClientId | None = None,
         params: dict | None = None,
     ) -> str: ...
     def request_instruments(
         self,
         venue: model.Venue | None = None,
-        start: int | None = None,
-        end: int | None = None,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
         client_id: model.ClientId | None = None,
         params: dict | None = None,
     ) -> str: ...
@@ -410,11 +458,30 @@ class Strategy:
         client_id: model.ClientId | None = None,
         params: dict | None = None,
     ) -> str: ...
+    def request_book_deltas(
+        self,
+        instrument_id: model.InstrumentId,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
+        limit: int | None = None,
+        client_id: model.ClientId | None = None,
+        params: dict | None = None,
+    ) -> str: ...
+    def request_book_depth(
+        self,
+        instrument_id: model.InstrumentId,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
+        limit: int | None = None,
+        depth: int | None = None,
+        client_id: model.ClientId | None = None,
+        params: dict | None = None,
+    ) -> str: ...
     def request_quotes(
         self,
         instrument_id: model.InstrumentId,
-        start: int | None = None,
-        end: int | None = None,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
         limit: int | None = None,
         client_id: model.ClientId | None = None,
         params: dict | None = None,
@@ -422,8 +489,8 @@ class Strategy:
     def request_trades(
         self,
         instrument_id: model.InstrumentId,
-        start: int | None = None,
-        end: int | None = None,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
         limit: int | None = None,
         client_id: model.ClientId | None = None,
         params: dict | None = None,
@@ -431,8 +498,8 @@ class Strategy:
     def request_funding_rates(
         self,
         instrument_id: model.InstrumentId,
-        start: int | None = None,
-        end: int | None = None,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
         limit: int | None = None,
         client_id: model.ClientId | None = None,
         params: dict | None = None,
@@ -440,8 +507,8 @@ class Strategy:
     def request_bars(
         self,
         bar_type: model.BarType,
-        start: int | None = None,
-        end: int | None = None,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
         limit: int | None = None,
         client_id: model.ClientId | None = None,
         params: dict | None = None,

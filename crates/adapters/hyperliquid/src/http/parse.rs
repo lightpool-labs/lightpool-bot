@@ -16,11 +16,12 @@
 use anyhow::Context;
 use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_model::{
+    data::TradeTick,
     enums::{
-        AssetClass, CurrencyType, LiquiditySide, OrderSide, OrderStatus, OrderType,
+        AggressorSide, AssetClass, CurrencyType, LiquiditySide, OrderSide, OrderStatus, OrderType,
         PositionSideSpecified, TimeInForce, TriggerType,
     },
-    identifiers::{AccountId, ClientOrderId, InstrumentId, Symbol, VenueOrderId},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, Symbol, TradeId, VenueOrderId},
     instruments::{BinaryOption, CryptoPerpetual, CurrencyPair, Instrument, InstrumentAny},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{Currency, Money, Price, Quantity},
@@ -31,8 +32,8 @@ use serde_json::{Value, json};
 use ustr::Ustr;
 
 use super::models::{
-    AssetPosition, HyperliquidFill, OutcomeMarket, OutcomeMeta, OutcomeQuestion, PerpMeta,
-    SpotBalance, SpotMeta,
+    AssetPosition, HyperliquidFill, HyperliquidRecentTrade, OutcomeMarket, OutcomeMeta,
+    OutcomeQuestion, PerpMeta, SpotBalance, SpotMeta,
 };
 use crate::{
     common::{
@@ -43,7 +44,7 @@ use crate::{
         },
         parse::{
             format_outcome_nautilus_symbol, is_conditional_order_data, make_fill_trade_id,
-            parse_trigger_order_type,
+            millis_to_nanos, parse_trigger_order_type,
         },
         types::HyperliquidAssetId,
     },
@@ -108,6 +109,9 @@ pub struct HyperliquidInstrumentDef {
     pub base: Ustr,
     /// Quote currency (e.g., "USD" for perps, "USDC" for spot).
     pub quote: Ustr,
+    /// Settlement currency for perps. `None` for spot and outcome instruments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement: Option<Ustr>,
     /// Market type (perpetual, spot, or outcome).
     pub market_type: HyperliquidMarketType,
     /// Asset index used for order submission.
@@ -175,6 +179,18 @@ pub fn parse_perp_instruments(
     meta: &PerpMeta,
     asset_index_base: u32,
 ) -> Result<Vec<HyperliquidInstrumentDef>, String> {
+    Ok(parse_perp_instruments_with_settlement(
+        meta,
+        asset_index_base,
+        DEFAULT_PERP_SETTLEMENT_CURRENCY,
+    ))
+}
+
+pub(crate) fn parse_perp_instruments_with_settlement(
+    meta: &PerpMeta,
+    asset_index_base: u32,
+    settlement_currency: &str,
+) -> Vec<HyperliquidInstrumentDef> {
     const PERP_MAX_DECIMALS: i32 = 6;
 
     let mut defs = Vec::new();
@@ -195,6 +211,7 @@ pub fn parse_perp_instruments(
             raw_symbol,
             base: asset.name.clone().into(),
             quote: "USD".into(),
+            settlement: Some(settlement_currency.into()),
             market_type: HyperliquidMarketType::Perp,
             asset_index: asset_index_base + index as u32,
             price_decimals,
@@ -212,7 +229,36 @@ pub fn parse_perp_instruments(
         defs.push(def);
     }
 
-    Ok(defs)
+    defs
+}
+
+const DEFAULT_PERP_COLLATERAL_TOKEN: u32 = 0;
+const DEFAULT_PERP_SETTLEMENT_CURRENCY: &str = "USDC";
+
+pub(crate) fn resolve_perp_settlement_currency(
+    meta: &PerpMeta,
+    spot_meta: Option<&SpotMeta>,
+) -> Result<Ustr, String> {
+    let Some(collateral_token) = meta.collateral_token else {
+        return Ok(DEFAULT_PERP_SETTLEMENT_CURRENCY.into());
+    };
+
+    if collateral_token == DEFAULT_PERP_COLLATERAL_TOKEN {
+        return Ok(DEFAULT_PERP_SETTLEMENT_CURRENCY.into());
+    }
+
+    let spot_meta = spot_meta.ok_or_else(|| {
+        format!("Spot metadata required to resolve perp collateral token {collateral_token}")
+    })?;
+    let token = spot_meta
+        .tokens
+        .iter()
+        .find(|token| token.index == collateral_token)
+        .ok_or_else(|| {
+            format!("Perp collateral token index {collateral_token} not found in spot metadata")
+        })?;
+
+    Ok(token.name.as_str().into())
 }
 
 /// Parse spot instrument definitions from Hyperliquid `spotMeta` response.
@@ -269,6 +315,7 @@ pub fn parse_spot_instruments(meta: &SpotMeta) -> Result<Vec<HyperliquidInstrume
             raw_symbol,
             base: base_token.name.clone().into(),
             quote: quote_token.name.clone().into(),
+            settlement: None,
             market_type: HyperliquidMarketType::Spot,
             asset_index: SPOT_INDEX_OFFSET + pair.index,
             price_decimals,
@@ -391,6 +438,7 @@ fn build_outcome_def(
         raw_symbol: Ustr::from(coin.as_str()),
         base: Ustr::from(token.as_str()),
         quote: "USDH".into(),
+        settlement: None,
         market_type: HyperliquidMarketType::Outcome,
         asset_index: asset_id.to_raw(),
         price_decimals: OUTCOME_PRICE_DECIMALS,
@@ -708,6 +756,11 @@ fn is_outcome_side_token(symbol: &str) -> bool {
     !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
 }
 
+// Hyperliquid documents a venue-wide minimum order notional: $10 for perps,
+// and 10 quote_token for spot.
+// https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses
+const HYPERLIQUID_MIN_ORDER_NOTIONAL: Decimal = Decimal::TEN;
+
 /// Converts a single Hyperliquid instrument definition into a Nautilus `InstrumentAny`.
 ///
 /// Returns `None` if the conversion fails (e.g., unsupported market type).
@@ -732,6 +785,7 @@ pub fn create_instrument_from_def(
         HyperliquidMarketType::Spot => {
             let base_currency = get_currency(&def.base);
             let quote_currency = get_currency(&def.quote);
+            let min_notional = Some(min_order_notional(quote_currency)?);
 
             Some(InstrumentAny::CurrencyPair(CurrencyPair::new(
                 instrument_id,
@@ -747,6 +801,7 @@ pub fn create_instrument_from_def(
                 None,
                 None,
                 None,
+                min_notional,
                 None,
                 None,
                 None,
@@ -762,7 +817,16 @@ pub fn create_instrument_from_def(
         HyperliquidMarketType::Perp => {
             let base_currency = get_currency(&def.base);
             let quote_currency = get_currency(&def.quote);
-            let settlement_currency = get_currency("USDC");
+            let settlement_code = def
+                .settlement
+                .as_ref()
+                .map_or(DEFAULT_PERP_SETTLEMENT_CURRENCY, Ustr::as_str);
+            let settlement_currency = if settlement_code == "USDH" {
+                get_usdh_currency()
+            } else {
+                get_currency(settlement_code)
+            };
+            let min_notional = Some(min_order_notional(quote_currency)?);
 
             Some(InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
                 instrument_id,
@@ -780,6 +844,7 @@ pub fn create_instrument_from_def(
                 None,
                 None,
                 None,
+                min_notional,
                 None,
                 None,
                 None,
@@ -819,12 +884,17 @@ pub fn create_instrument_from_def(
                 None, // margin_maint
                 None, // maker_fee
                 None, // taker_fee
+                None, // tick_scheme
                 outcome.info.clone(),
                 ts_init,
                 ts_init,
             )))
         }
     }
+}
+
+fn min_order_notional(currency: Currency) -> Option<Money> {
+    Money::from_decimal(HYPERLIQUID_MIN_ORDER_NOTIONAL, currency).ok()
 }
 
 /// Convert a collection of Hyperliquid instrument definitions into Nautilus instruments,
@@ -991,6 +1061,53 @@ pub fn parse_order_status_report_from_basic(
     }
 
     Ok(report)
+}
+
+/// Parses a `recentTrades` info entry into a [`TradeTick`].
+///
+/// Mirrors the field mapping of the WebSocket trade parser
+/// [`parse_ws_trade_tick`](crate::websocket::parse::parse_ws_trade_tick): both the
+/// `trades` channel and the `recentTrades` endpoint carry the same
+/// `px`/`sz`/`side`/`time`/`tid` fields. For this historical snapshot `ts_init` is
+/// set to the trade's `ts_event` (venue time), matching the other request
+/// converters so the data engine's window trimming keeps bounded requests.
+///
+/// # Errors
+///
+/// Returns an error if the price, size, trade identifier, or timestamp is invalid.
+pub fn parse_recent_trade(
+    trade: &HyperliquidRecentTrade,
+    instrument: &InstrumentAny,
+) -> anyhow::Result<TradeTick> {
+    let price_decimal: Decimal = trade
+        .px
+        .parse()
+        .with_context(|| format!("Failed to parse price from '{}'", trade.px))?;
+    let price = Price::from_decimal_dp(price_decimal, instrument.price_precision())
+        .with_context(|| format!("Failed to create price from '{}'", trade.px))?;
+
+    let size_decimal: Decimal = trade
+        .sz
+        .parse()
+        .with_context(|| format!("Failed to parse size from '{}'", trade.sz))?;
+    let size = Quantity::from_decimal_dp(size_decimal.abs(), instrument.size_precision())
+        .with_context(|| format!("Failed to create size from '{}'", trade.sz))?;
+
+    let aggressor = AggressorSide::from(trade.side);
+    let trade_id = TradeId::new_checked(trade.tid.to_string())
+        .context("invalid trade identifier in Hyperliquid recent trade")?;
+    let ts_event = millis_to_nanos(trade.time)?;
+
+    TradeTick::new_checked(
+        instrument.id(),
+        price,
+        size,
+        aggressor,
+        trade_id,
+        ts_event,
+        ts_event,
+    )
+    .context("failed to construct TradeTick from Hyperliquid recent trade")
 }
 
 /// Parse Hyperliquid fill to FillReport.
@@ -1212,6 +1329,7 @@ mod tests {
                 },
             ],
             margin_tables: vec![],
+            collateral_token: None,
         };
 
         let defs = parse_perp_instruments(&meta, 0).unwrap();
@@ -1223,6 +1341,7 @@ mod tests {
         assert_eq!(btc.symbol, "BTC-USD-PERP");
         assert_eq!(btc.base, "BTC");
         assert_eq!(btc.quote, "USD");
+        assert_eq!(btc.settlement.as_ref().unwrap().as_str(), "USDC");
         assert_eq!(btc.market_type, HyperliquidMarketType::Perp);
         assert_eq!(btc.price_decimals, 1); // 6 - 5 = 1
         assert_eq!(btc.size_decimals, 5);
@@ -1254,6 +1373,7 @@ mod tests {
         assert_eq!(btc.symbol, "BTC-USD-PERP");
         assert_eq!(btc.base, "BTC");
         assert_eq!(btc.quote, "USD");
+        assert_eq!(btc.settlement.as_ref().unwrap().as_str(), "USDC");
         assert_eq!(btc.market_type, HyperliquidMarketType::Perp);
         assert_eq!(btc.size_decimals, 5);
         assert_eq!(btc.max_leverage, Some(40));
@@ -1272,6 +1392,190 @@ mod tests {
         assert_eq!(atom.base, "ATOM");
         assert_eq!(atom.size_decimals, 2);
         assert_eq!(atom.max_leverage, Some(5));
+    }
+
+    #[rstest]
+    fn test_parse_recent_trade() {
+        let meta: PerpMeta = load_test_data("http_meta_perp_sample.json");
+        let defs = parse_perp_instruments(&meta, 0).unwrap();
+        let instrument = create_instrument_from_def(&defs[0], UnixNanos::default()).unwrap();
+
+        let trade = HyperliquidRecentTrade {
+            coin: Ustr::from("BTC"),
+            side: HyperliquidSide::Sell,
+            px: "50000.0".to_string(),
+            sz: "0.5".to_string(),
+            time: 1_769_916_000_000,
+            tid: 987_654_321,
+        };
+
+        let tick = parse_recent_trade(&trade, &instrument).unwrap();
+
+        assert_eq!(tick.instrument_id, instrument.id());
+        assert_eq!(tick.price.as_decimal(), dec!(50000));
+        assert_eq!(tick.size.as_decimal(), dec!(0.5));
+        assert_eq!(tick.aggressor_side, AggressorSide::Seller);
+        assert_eq!(tick.trade_id.to_string(), "987654321");
+        assert_eq!(
+            tick.ts_event,
+            UnixNanos::from(1_769_916_000_000 * 1_000_000)
+        );
+        // Historical trades carry ts_init == ts_event so the engine's window
+        // trimming (by ts_init) keeps bounded requests.
+        assert_eq!(tick.ts_init, tick.ts_event);
+    }
+
+    #[rstest]
+    fn test_parse_recent_trade_rejects_invalid_price() {
+        let meta: PerpMeta = load_test_data("http_meta_perp_sample.json");
+        let defs = parse_perp_instruments(&meta, 0).unwrap();
+        let instrument = create_instrument_from_def(&defs[0], UnixNanos::default()).unwrap();
+
+        let trade = HyperliquidRecentTrade {
+            coin: Ustr::from("BTC"),
+            side: HyperliquidSide::Buy,
+            px: "not-a-number".to_string(),
+            sz: "0.5".to_string(),
+            time: 1_769_916_000_000,
+            tid: 1,
+        };
+
+        assert!(parse_recent_trade(&trade, &instrument).is_err());
+    }
+
+    #[rstest]
+    fn test_create_instrument_from_def_perp_sets_min_notional() {
+        let meta: PerpMeta = load_test_data("http_meta_perp_sample.json");
+        let defs = parse_perp_instruments(&meta, 0).unwrap();
+
+        let instrument = create_instrument_from_def(&defs[0], UnixNanos::default()).unwrap();
+
+        match instrument {
+            InstrumentAny::CryptoPerpetual(perp) => {
+                let min_notional = perp.min_notional.unwrap();
+                assert_eq!(min_notional.currency, Currency::USD());
+                assert_eq!(min_notional.as_decimal(), dec!(10));
+                assert_eq!(perp.settlement_currency.code.as_str(), "USDC");
+            }
+            other => panic!("Expected CryptoPerpetual, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_parse_perp_instruments_with_non_usdc_collateral() {
+        let all_metas: Vec<PerpMeta> =
+            load_test_data("http_all_perp_metas_non_usdc_collateral.json");
+        let spot_meta: SpotMeta = load_test_data("http_spot_meta_non_usdc_collateral.json");
+
+        assert_eq!(all_metas[1].collateral_token, Some(360));
+        assert_eq!(all_metas[2].collateral_token, Some(235));
+
+        let settlement_currency =
+            resolve_perp_settlement_currency(&all_metas[1], Some(&spot_meta)).unwrap();
+        let defs = parse_perp_instruments_with_settlement(
+            &all_metas[1],
+            110_000,
+            settlement_currency.as_str(),
+        );
+
+        assert_eq!(settlement_currency.as_str(), "USDH");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].symbol.as_str(), "km:US500-USD-PERP");
+        assert_eq!(defs[0].quote.as_str(), "USD");
+        assert_eq!(defs[0].settlement.as_ref().unwrap().as_str(), "USDH");
+
+        let instrument = create_instrument_from_def(&defs[0], UnixNanos::default()).unwrap();
+        match instrument {
+            InstrumentAny::CryptoPerpetual(perp) => {
+                assert_eq!(perp.quote_currency.code.as_str(), "USD");
+                assert_eq!(perp.settlement_currency.code.as_str(), "USDH");
+                assert_eq!(perp.settlement_currency.name.as_str(), "Hyperliquid USD");
+            }
+            other => panic!("Expected CryptoPerpetual, was {other:?}"),
+        }
+
+        let settlement_currency =
+            resolve_perp_settlement_currency(&all_metas[2], Some(&spot_meta)).unwrap();
+        let defs = parse_perp_instruments_with_settlement(
+            &all_metas[2],
+            140_000,
+            settlement_currency.as_str(),
+        );
+
+        assert_eq!(settlement_currency.as_str(), "USDE");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].symbol.as_str(), "hyna:BTC-USD-PERP");
+        assert_eq!(defs[0].quote.as_str(), "USD");
+        assert_eq!(defs[0].settlement.as_ref().unwrap().as_str(), "USDE");
+
+        let instrument = create_instrument_from_def(&defs[0], UnixNanos::default()).unwrap();
+        match instrument {
+            InstrumentAny::CryptoPerpetual(perp) => {
+                assert_eq!(perp.quote_currency.code.as_str(), "USD");
+                assert_eq!(perp.settlement_currency.code.as_str(), "USDE");
+            }
+            other => panic!("Expected CryptoPerpetual, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_create_instrument_from_def_perp_defaults_missing_settlement_to_usdc() {
+        let meta: PerpMeta = load_test_data("http_meta_perp_sample.json");
+        let mut defs = parse_perp_instruments(&meta, 0).unwrap();
+        defs[0].settlement = None;
+
+        let instrument = create_instrument_from_def(&defs[0], UnixNanos::default()).unwrap();
+
+        match instrument {
+            InstrumentAny::CryptoPerpetual(perp) => {
+                assert_eq!(perp.quote_currency.code.as_str(), "USD");
+                assert_eq!(perp.settlement_currency.code.as_str(), "USDC");
+            }
+            other => panic!("Expected CryptoPerpetual, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_resolve_perp_settlement_currency_defaults_to_usdc() {
+        let legacy_meta: PerpMeta = load_test_data("http_meta_perp_sample.json");
+        let all_metas: Vec<PerpMeta> =
+            load_test_data("http_all_perp_metas_non_usdc_collateral.json");
+
+        let legacy_settlement = resolve_perp_settlement_currency(&legacy_meta, None).unwrap();
+        let token_zero_settlement = resolve_perp_settlement_currency(&all_metas[0], None).unwrap();
+
+        assert_eq!(legacy_settlement.as_str(), "USDC");
+        assert_eq!(token_zero_settlement.as_str(), "USDC");
+    }
+
+    #[rstest]
+    fn test_resolve_perp_settlement_currency_requires_spot_meta_for_non_usdc() {
+        let all_metas: Vec<PerpMeta> =
+            load_test_data("http_all_perp_metas_non_usdc_collateral.json");
+
+        let err = resolve_perp_settlement_currency(&all_metas[1], None).unwrap_err();
+
+        assert_eq!(
+            err,
+            "Spot metadata required to resolve perp collateral token 360",
+        );
+    }
+
+    #[rstest]
+    fn test_resolve_perp_settlement_currency_errors_on_missing_token_index() {
+        let all_metas: Vec<PerpMeta> =
+            load_test_data("http_all_perp_metas_non_usdc_collateral.json");
+        let spot_meta = SpotMeta {
+            tokens: Vec::new(),
+            universe: Vec::new(),
+        };
+
+        let err = resolve_perp_settlement_currency(&all_metas[1], Some(&spot_meta)).unwrap_err();
+
+        assert_eq!(
+            err,
+            "Perp collateral token index 360 not found in spot metadata",
+        );
     }
 
     #[rstest]
@@ -1372,6 +1676,17 @@ mod tests {
         assert_eq!(alias.symbol, "PURR-USDC-SPOT");
         assert_eq!(alias.base, "PURR");
         assert!(!alias.active); // Non-canonical pairs are marked as inactive
+
+        let instrument = create_instrument_from_def(purr_usdc, UnixNanos::default()).unwrap();
+
+        match instrument {
+            InstrumentAny::CurrencyPair(pair) => {
+                let min_notional = pair.min_notional.unwrap();
+                assert_eq!(min_notional.currency, Currency::USDC());
+                assert_eq!(min_notional.as_decimal(), dec!(10));
+            }
+            other => panic!("Expected CurrencyPair, was {other:?}"),
+        }
     }
 
     #[rstest]
@@ -1442,6 +1757,7 @@ mod tests {
                 ..Default::default()
             }],
             margin_tables: vec![],
+            collateral_token: None,
         };
 
         let defs = parse_perp_instruments(&meta, 0).unwrap();
@@ -1474,6 +1790,7 @@ mod tests {
                 },
             ],
             margin_tables: vec![],
+            collateral_token: None,
         };
 
         let defs = parse_perp_instruments(&meta, 110_000).unwrap();
@@ -1563,6 +1880,7 @@ mod tests {
                 margin_mode: None,
             }],
             margin_tables: vec![],
+            collateral_token: None,
         };
 
         let defs = parse_perp_instruments(&meta, 110_000).unwrap();

@@ -639,6 +639,7 @@ async fn test_request_spot_position_status_reports_emits_for_cached_instrument()
         None,
         None,
         None,
+        None,
         ts,
         ts,
     );
@@ -696,6 +697,7 @@ async fn test_request_spot_position_status_reports_skips_usdc() {
         0,
         Price::from("0.00001"),
         Quantity::from("1"),
+        None,
         None,
         None,
         None,
@@ -770,6 +772,7 @@ async fn test_request_spot_position_status_reports_filters_by_instrument_id() {
         None,
         None,
         None,
+        None,
         ts,
         ts,
     );
@@ -786,6 +789,7 @@ async fn test_request_spot_position_status_reports_filters_by_instrument_id() {
         2,
         Price::from("0.00001"),
         Quantity::from("0.01"),
+        None,
         None,
         None,
         None,
@@ -881,6 +885,7 @@ async fn test_request_position_status_reports_skips_perp_fetch_for_spot_filter()
         None,
         None,
         None,
+        None,
         ts,
         ts,
     );
@@ -954,6 +959,7 @@ async fn test_request_spot_position_status_reports_resolves_outcome_side_token()
         None,
         None,
         None,
+        None,
         ts,
         ts,
     );
@@ -1006,6 +1012,7 @@ async fn test_request_position_status_reports_skips_perp_fetch_for_outcome_filte
         2,
         Price::from("0.0001"),
         Quantity::from("0.01"),
+        None,
         None,
         None,
         None,
@@ -1464,6 +1471,7 @@ fn cache_btc_instrument(client: &HyperliquidHttpClient) {
         None,
         None,
         None,
+        None,
         ts,
         ts,
     )
@@ -1687,44 +1695,6 @@ async fn test_request_order_status_report_by_client_order_id_matches_cloid() {
         "should return original client_order_id, not venue cloid"
     );
     assert_eq!(report.order_status, OrderStatus::Accepted);
-}
-
-#[rstest]
-#[tokio::test]
-async fn test_request_order_status_report_by_client_order_id_matches_legacy_cloid() {
-    let coid = ClientOrderId::new("O-20240101-000002");
-    let legacy_cloid = Cloid::from_legacy_client_order_id(coid);
-    let cloid_hex = legacy_cloid.to_hex();
-
-    let state = TestServerState::default();
-    *state.frontend_open_orders_response.lock().await = Some(json!([{
-        "coin": "BTC",
-        "side": "B",
-        "limitPx": "95000.0",
-        "sz": "0.1",
-        "oid": 77778,
-        "timestamp": 1700000000000u64,
-        "origSz": "0.1",
-        "cloid": cloid_hex
-    }]));
-
-    let addr = start_mock_server(state).await;
-    let client = create_domain_client(&addr);
-    cache_btc_instrument(&client);
-
-    let report = client
-        .request_order_status_report_by_client_order_id("0xuser", &coid)
-        .await
-        .unwrap()
-        .expect("should match by legacy cloid");
-
-    assert_eq!(report.client_order_id, Some(coid));
-    assert_eq!(report.order_status, OrderStatus::Accepted);
-    assert_eq!(
-        client.cached_client_order_id_cloid(&coid),
-        Some(legacy_cloid),
-        "legacy lookup should retain cancel-by-cloid recovery",
-    );
 }
 
 #[rstest]

@@ -25,7 +25,7 @@ use std::marker::PhantomData;
 
 use crate::{
     boundary::{BorrowedStr, OwnedBytes, PluginError, PluginErrorCode, PluginResult, Slice},
-    panic::{guard, guard_infallible},
+    panic::{guard, guard_drop, guard_infallible, guard_or_null},
 };
 
 /// Opaque handle to a single custom-data value owned by the plug-in.
@@ -191,9 +191,13 @@ pub struct MetadataEntry<'a> {
 /// [`nautilus_plugin!`](crate::nautilus_plugin) macro generates the
 /// `extern "C"` thunks that adapt this trait to a [`CustomDataVTable`].
 ///
-/// All trait methods run inside [`crate::panic::guard`] in the generated
-/// thunks, so a panic surfaces as a [`PluginError`] with code
+/// Fallible trait methods run inside [`crate::panic::guard`] in the
+/// generated thunks, so a panic surfaces as a [`PluginError`] with code
 /// [`PluginErrorCode::Panic`] instead of unwinding through the FFI.
+/// `clone_value` returns null on panic ([`crate::panic::guard_or_null`])
+/// and drops leak on panic ([`crate::panic::guard_drop`]); `ts_event`,
+/// `ts_init`, and `equals` run inside [`crate::panic::guard_infallible`],
+/// which aborts on panic because no sound sentinel value exists.
 pub trait PluginCustomData: 'static + Send + Sync + Sized {
     /// Canonical type name. Must be unique across a Nautilus deployment.
     const TYPE_NAME: &'static str;
@@ -205,18 +209,39 @@ pub trait PluginCustomData: 'static + Send + Sync + Sized {
     fn ts_init(&self) -> u64;
 
     /// Serializes this value to a JSON payload (no envelope, payload only).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the value cannot be encoded as JSON.
     fn to_json(&self) -> anyhow::Result<Vec<u8>>;
 
     /// Deserializes a value from a JSON payload (no envelope).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `payload` cannot be decoded into this type.
     fn from_json(payload: &[u8]) -> anyhow::Result<Self>;
 
     /// Returns the Arrow schema for this type as an Arrow IPC byte stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the schema cannot be encoded as Arrow IPC.
     fn schema_ipc() -> anyhow::Result<Vec<u8>>;
 
     /// Encodes a batch of values into an Arrow IPC byte stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the batch cannot be encoded as Arrow IPC.
     fn encode_batch(items: &[&Self]) -> anyhow::Result<Vec<u8>>;
 
     /// Decodes an Arrow IPC byte stream into a vector of values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `ipc_bytes` or `metadata` cannot be decoded into
+    /// this type.
     fn decode_batch(ipc_bytes: &[u8], metadata: &[(String, String)]) -> anyhow::Result<Vec<Self>>;
 
     /// Tests two values of this type for equality. Default implementation
@@ -371,6 +396,10 @@ unsafe extern "C" fn decode_batch_thunk<T: PluginCustomData>(
     })
 }
 
+#[expect(
+    clippy::cast_ptr_alignment,
+    reason = "pointer was produced from Vec<*mut CustomDataHandle> with pointer alignment"
+)]
 unsafe extern "C" fn drop_handle_array(ptr: *mut u8, len: usize, cap: usize) {
     if ptr.is_null() {
         return;
@@ -421,7 +450,7 @@ unsafe extern "C" fn to_json_thunk<T: PluginCustomData>(
 unsafe extern "C" fn clone_handle_thunk<T: PluginCustomData + Clone>(
     handle: *const CustomDataHandle,
 ) -> *mut CustomDataHandle {
-    guard_infallible("clone_handle", || {
+    guard_or_null("clone_handle", || {
         // SAFETY: see ts_event_thunk.
         let value = unsafe { &*handle.cast::<T>() };
         let cloned = value.clone_value();
@@ -433,7 +462,7 @@ unsafe extern "C" fn drop_handle_thunk<T: PluginCustomData>(handle: *mut CustomD
     if handle.is_null() {
         return;
     }
-    guard_infallible("drop_handle", || {
+    guard_drop("drop_handle", || {
         // SAFETY: handle was allocated via `Box::into_raw(Box::new(T))`.
         unsafe {
             drop(Box::from_raw(handle.cast::<T>()));

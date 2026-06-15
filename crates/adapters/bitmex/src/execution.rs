@@ -1250,7 +1250,7 @@ fn handle_submit_failure(failure: &SubmitFailure<'_>) {
             failure.post_only,
         );
     } else {
-        log::error!(
+        log::warn!(
             "Ambiguous BitMEX submit failure for {}, awaiting reconciliation: {:?}",
             failure.client_order_id,
             failure.err,
@@ -1280,7 +1280,7 @@ fn handle_modify_failure(failure: &ModifyFailure<'_>) {
             ts_event,
         );
     } else {
-        log::error!(
+        log::warn!(
             "Ambiguous BitMEX modify failure for {}, awaiting reconciliation: {:?}",
             failure.client_order_id,
             failure.err,
@@ -1477,6 +1477,7 @@ mod tests {
             0,
             Price::new(0.5, 1),
             Quantity::new(1.0, 0),
+            None,
             None,
             None,
             None,

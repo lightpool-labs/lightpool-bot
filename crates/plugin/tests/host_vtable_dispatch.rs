@@ -19,8 +19,8 @@
 //! strategies call back into. The vtable struct is defined in this crate
 //! but the function pointers come from the host (the live node) at load
 //! time. A wiring mistake at the host's vtable-init site (e.g. assigning
-//! the cancel handler to `submit_order`) compiles but routes commands to
-//! the wrong service, with no compiler help.
+//! the `unsubscribe_quotes` handler to `subscribe_quotes`) compiles but
+//! routes commands to the wrong service, with no compiler help.
 //!
 //! These tests build a fake host vtable whose every handler bumps a
 //! per-slot atomic counter and records the [`HostContext`] pointer the
@@ -31,8 +31,11 @@
 //! Covers every callable field of [`HostVTable`]: `clock_now_ns`, `log`,
 //! the six `cache_*` snapshots, every subscribe/unsubscribe pair, the
 //! message bus publish, the three clock alert/timer entries, and the
-//! three order command entries (`submit_order`, `cancel_order`,
-//! `modify_order`).
+//! ten order command entries (`submit_order`, `cancel_order`,
+//! `modify_order`, `submit_order_list`, `cancel_orders`,
+//! `cancel_all_orders`, `close_position`, `close_all_positions`,
+//! `query_account`, `query_order`), identity/state entries, and order
+//! factory id generation entries.
 
 #![allow(unsafe_code)]
 
@@ -64,7 +67,6 @@ use rstest::rstest;
 
 // One variant per callable [`HostVTable`] slot. Indexed into the per-hook
 // counter and last-context arrays.
-#[allow(clippy::enum_variant_names)]
 #[repr(usize)]
 #[derive(Clone, Copy, Debug)]
 enum HostHook {
@@ -100,9 +102,14 @@ enum HostHook {
     CloseAllPositions,
     QueryAccount,
     QueryOrder,
+    TraderId,
+    StrategyId,
+    ComponentState,
+    GenerateClientOrderId,
+    GenerateOrderListId,
 }
 
-const HOOK_COUNT: usize = HostHook::QueryOrder as usize + 1;
+const HOOK_COUNT: usize = HostHook::GenerateOrderListId as usize + 1;
 static HOOK_CALLS: [AtomicU64; HOOK_COUNT] = [const { AtomicU64::new(0) }; HOOK_COUNT];
 static LAST_CTX: [AtomicPtr<HostContext>; HOOK_COUNT] =
     [const { AtomicPtr::new(std::ptr::null_mut()) }; HOOK_COUNT];
@@ -126,7 +133,7 @@ fn dispatch_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn reset_all() {
@@ -171,7 +178,7 @@ fn assert_only_hook(expected: HostHook) {
 }
 
 fn assert_ctx(hook: HostHook, expected: *const HostContext) {
-    let last = LAST_CTX[hook as usize].load(Ordering::SeqCst) as *const HostContext;
+    let last = LAST_CTX[hook as usize].load(Ordering::SeqCst).cast_const();
     assert!(
         std::ptr::eq(last, expected),
         "host context not threaded through to {hook:?}: expected {expected:?}, was {last:?}",
@@ -182,7 +189,7 @@ unsafe extern "C" fn test_clock_now_ns() -> u64 {
     HOOK_CALLS[HostHook::ClockNowNs as usize].fetch_add(1, Ordering::SeqCst);
     // ClockNowNs has no ctx parameter; do not touch LAST_CTX so its
     // assertion is skipped for this slot.
-    0xC0FFEE_u64
+    0x00C0_FFEE_u64
 }
 
 unsafe extern "C" fn test_log(
@@ -218,6 +225,28 @@ bytes_handler!(
     test_cache_positions_for_strategy,
     HostHook::CachePositionsForStrategy
 );
+
+macro_rules! context_bytes_handler {
+    ($name:ident, $hook:expr) => {
+        unsafe extern "C" fn $name(ctx: *const HostContext) -> PluginResult<OwnedBytes> {
+            record(ctx, $hook);
+            PluginResult::Ok(OwnedBytes::empty())
+        }
+    };
+}
+
+context_bytes_handler!(test_trader_id, HostHook::TraderId);
+context_bytes_handler!(test_strategy_id, HostHook::StrategyId);
+context_bytes_handler!(
+    test_generate_client_order_id,
+    HostHook::GenerateClientOrderId
+);
+context_bytes_handler!(test_generate_order_list_id, HostHook::GenerateOrderListId);
+
+unsafe extern "C" fn test_component_state(ctx: *const HostContext) -> PluginResult<u8> {
+    record(ctx, HostHook::ComponentState);
+    PluginResult::Ok(3)
+}
 
 macro_rules! subscription_handler {
     ($name:ident, $hook:expr) => {
@@ -255,7 +284,10 @@ unsafe extern "C" fn test_subscribe_book_deltas(
 ) -> PluginResult<()> {
     record(ctx, HostHook::SubscribeBookDeltas);
     LAST_BOOK_TYPE.store(book_type, Ordering::SeqCst);
-    LAST_BOOK_DEPTH.store(depth as u64, Ordering::SeqCst);
+    LAST_BOOK_DEPTH.store(
+        u64::try_from(depth).expect("book depth fits in u64"),
+        Ordering::SeqCst,
+    );
     LAST_MANAGED.store(managed, Ordering::SeqCst);
     PluginResult::Ok(())
 }
@@ -271,8 +303,14 @@ unsafe extern "C" fn test_subscribe_book_at_interval(
 ) -> PluginResult<()> {
     record(ctx, HostHook::SubscribeBookAtInterval);
     LAST_BOOK_TYPE.store(book_type, Ordering::SeqCst);
-    LAST_BOOK_DEPTH.store(depth as u64, Ordering::SeqCst);
-    LAST_BOOK_INTERVAL_MS.store(interval_ms as u64, Ordering::SeqCst);
+    LAST_BOOK_DEPTH.store(
+        u64::try_from(depth).expect("book depth fits in u64"),
+        Ordering::SeqCst,
+    );
+    LAST_BOOK_INTERVAL_MS.store(
+        u64::try_from(interval_ms).expect("interval fits in u64"),
+        Ordering::SeqCst,
+    );
     PluginResult::Ok(())
 }
 
@@ -284,7 +322,10 @@ unsafe extern "C" fn test_unsubscribe_book_at_interval(
     _params_json: BorrowedStr<'_>,
 ) -> PluginResult<()> {
     record(ctx, HostHook::UnsubscribeBookAtInterval);
-    LAST_BOOK_INTERVAL_MS.store(interval_ms as u64, Ordering::SeqCst);
+    LAST_BOOK_INTERVAL_MS.store(
+        u64::try_from(interval_ms).expect("interval fits in u64"),
+        Ordering::SeqCst,
+    );
     PluginResult::Ok(())
 }
 
@@ -294,7 +335,10 @@ unsafe extern "C" fn test_msgbus_publish(
     payload: Slice<'_, u8>,
 ) -> PluginResult<()> {
     record(ctx, HostHook::MsgbusPublish);
-    LAST_PAYLOAD_LEN.store(payload.len as u64, Ordering::SeqCst);
+    LAST_PAYLOAD_LEN.store(
+        u64::try_from(payload.len).expect("payload length fits in u64"),
+        Ordering::SeqCst,
+    );
     PluginResult::Ok(())
 }
 
@@ -472,6 +516,11 @@ static TEST_HOST: HostVTable = HostVTable {
     close_all_positions: test_close_all_positions,
     query_account: test_query_account,
     query_order: test_query_order,
+    trader_id: test_trader_id,
+    strategy_id: test_strategy_id,
+    component_state: test_component_state,
+    generate_client_order_id: test_generate_client_order_id,
+    generate_order_list_id: test_generate_order_list_id,
 };
 
 // Sentinel non-null pointer used as the plug-in's host context in tests.
@@ -502,7 +551,7 @@ fn clock_now_ns_slot_invokes_bound_handler() {
     reset_all();
     // SAFETY: TEST_HOST is process-lifetime static.
     let ns = unsafe { (TEST_HOST.clock_now_ns)() };
-    assert_eq!(ns, 0xC0FFEE_u64);
+    assert_eq!(ns, 0x00C0_FFEE_u64);
     assert_only_hook(HostHook::ClockNowNs);
 }
 
@@ -597,6 +646,68 @@ fn cache_positions_for_strategy_slot_invokes_bound_handler() {
     r.into_result().expect("cache_positions_for_strategy");
     assert_only_hook(HostHook::CachePositionsForStrategy);
     assert_ctx(HostHook::CachePositionsForStrategy, ctx);
+}
+
+#[rstest]
+fn trader_id_slot_invokes_bound_handler() {
+    let _g = dispatch_lock();
+    reset_all();
+    let ctx = sentinel_ctx();
+    // SAFETY: TEST_HOST is process-lifetime static.
+    let r = unsafe { (TEST_HOST.trader_id)(ctx) };
+    r.into_result().expect("trader_id");
+    assert_only_hook(HostHook::TraderId);
+    assert_ctx(HostHook::TraderId, ctx);
+}
+
+#[rstest]
+fn strategy_id_slot_invokes_bound_handler() {
+    let _g = dispatch_lock();
+    reset_all();
+    let ctx = sentinel_ctx();
+    // SAFETY: TEST_HOST is process-lifetime static.
+    let r = unsafe { (TEST_HOST.strategy_id)(ctx) };
+    r.into_result().expect("strategy_id");
+    assert_only_hook(HostHook::StrategyId);
+    assert_ctx(HostHook::StrategyId, ctx);
+}
+
+#[rstest]
+fn component_state_slot_invokes_bound_handler() {
+    let _g = dispatch_lock();
+    reset_all();
+    let ctx = sentinel_ctx();
+    // SAFETY: TEST_HOST is process-lifetime static.
+    let state = unsafe { (TEST_HOST.component_state)(ctx) }
+        .into_result()
+        .expect("component_state");
+    assert_eq!(state, 3);
+    assert_only_hook(HostHook::ComponentState);
+    assert_ctx(HostHook::ComponentState, ctx);
+}
+
+#[rstest]
+fn generate_client_order_id_slot_invokes_bound_handler() {
+    let _g = dispatch_lock();
+    reset_all();
+    let ctx = sentinel_ctx();
+    // SAFETY: TEST_HOST is process-lifetime static.
+    let r = unsafe { (TEST_HOST.generate_client_order_id)(ctx) };
+    r.into_result().expect("generate_client_order_id");
+    assert_only_hook(HostHook::GenerateClientOrderId);
+    assert_ctx(HostHook::GenerateClientOrderId, ctx);
+}
+
+#[rstest]
+fn generate_order_list_id_slot_invokes_bound_handler() {
+    let _g = dispatch_lock();
+    reset_all();
+    let ctx = sentinel_ctx();
+    // SAFETY: TEST_HOST is process-lifetime static.
+    let r = unsafe { (TEST_HOST.generate_order_list_id)(ctx) };
+    r.into_result().expect("generate_order_list_id");
+    assert_only_hook(HostHook::GenerateOrderListId);
+    assert_ctx(HostHook::GenerateOrderListId, ctx);
 }
 
 #[rstest]
@@ -818,7 +929,7 @@ fn msgbus_publish_slot_invokes_bound_handler_with_payload_len() {
     assert_ctx(HostHook::MsgbusPublish, ctx);
     assert_eq!(
         LAST_PAYLOAD_LEN.load(Ordering::SeqCst),
-        payload.len() as u64
+        u64::try_from(payload.len()).expect("payload length fits in u64")
     );
 }
 

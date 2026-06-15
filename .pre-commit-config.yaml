@@ -1,3 +1,5 @@
+exclude: ^patches/pyo3-stub-gen/
+
 repos:
   ##############################################################################
   #  General checks
@@ -142,6 +144,21 @@ repos:
         files: ^(uv\.lock|python/uv\.lock|pyproject\.toml|python/pyproject\.toml)$
         pass_filenames: false
 
+      - id: check-docker-toolchain-pins
+        name: check Docker toolchain pins
+        description: Ensures Docker uv, Rust, and Python pins match project toolchain versions
+        entry: bash scripts/ci/check-docker-toolchain-pins.bash
+        language: system
+        files: >-
+          (?x)^(
+            \.docker/(DockerfileUbuntu|nautilus_trader\.dockerfile|jupyterlab\.dockerfile)|
+            pyproject\.toml|
+            rust-toolchain\.toml|
+            scripts/(uv-version|rust-toolchain)\.sh|
+            scripts/ci/check-docker-toolchain-pins\.bash
+          )$
+        pass_filenames: false
+
       - id: check-copyright-year
         name: check copyright year
         description: Ensures copyright headers have current year
@@ -188,7 +205,7 @@ repos:
 
       - id: check-logging-conventions
         name: check logging conventions
-        description: Enforces logging conventions
+        description: Enforces logging and process termination conventions
         entry: bash .pre-commit-hooks/check_logging_conventions.sh
         language: system
         files: "\\.rs$"
@@ -266,6 +283,14 @@ repos:
         files: "Cargo\\.toml$"
         pass_filenames: false
 
+      - id: check-cargo-crates-publish
+        name: check mocked cargo publish plan
+        description: Checks mocked Cargo publish-plan logic, not the real workspace crate graph
+        entry: bash scripts/ci/test-publish-cargo-crates-check.bash
+        language: system
+        files: "^scripts/ci/(publish-cargo-crates\\.sh|test-publish-cargo-crates-check\\.bash)$"
+        pass_filenames: false
+
       - id: fmt
         name: cargo fmt
         description: Format files with cargo fmt
@@ -282,6 +307,15 @@ repos:
         entry: bash scripts/clippy-changed.sh
         language: system
         files: "\\.(rs|toml)$"
+        types: [file]
+        pass_filenames: false
+
+      - id: cargo-clippy-network-turmoil-non-linux
+        name: cargo clippy network turmoil (non-Linux)
+        description: Run the network Turmoil Clippy check on non-Linux hosts
+        entry: bash .pre-commit-hooks/cargo_clippy_network_turmoil_non_linux.sh
+        language: system
+        files: "^(crates/network/|Cargo\\.toml$|clippy\\.toml$|rust-toolchain\\.toml$|\\.cargo/)"
         types: [file]
         pass_filenames: false
 
@@ -319,7 +353,7 @@ repos:
         types: [python]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.15
+    rev: v0.15.16
     hooks:
       - id: ruff
         name: ruff
@@ -366,7 +400,7 @@ repos:
         additional_dependencies: [msgspec, types-frozendict, types-pytz, types-redis, types-requests, types-toml]
 
   - repo: https://github.com/astral-sh/uv-pre-commit
-    rev: 0.11.18 # Must match [tool.uv] required-version in pyproject.toml
+    rev: 0.11.21 # Must match [tool.uv] required-version in pyproject.toml
     hooks:
       - id: uv-lock
         files: ^(uv\.lock|python/uv\.lock)$

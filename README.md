@@ -9,8 +9,6 @@ LightPool trading bot fork based on [NautilusTrader](https://nautilustrader.io).
 
 ## Build
 
-From this directory:
-
 ```bash
 cargo build -p lightpool-strategies --bin liquidity-maker
 ```

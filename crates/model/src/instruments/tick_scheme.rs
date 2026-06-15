@@ -17,7 +17,9 @@
 
 use std::{fmt::Display, str::FromStr, sync::LazyLock};
 
-use nautilus_core::correctness::check_predicate_true;
+use nautilus_core::correctness::{
+    CorrectnessResult, check_predicate_true, check_valid_string_ascii_optional,
+};
 
 #[cfg(not(feature = "high-precision"))]
 use crate::types::fixed::f64_to_fixed_i64;
@@ -25,8 +27,8 @@ use crate::types::fixed::f64_to_fixed_i64;
 use crate::types::fixed::f64_to_fixed_i128;
 use crate::types::{
     Price,
-    fixed::FIXED_SCALAR,
-    price::{PRICE_MAX, PRICE_MIN, PriceRaw},
+    fixed::{FIXED_PRECISION, FIXED_SCALAR},
+    price::{PRICE_MAX, PRICE_MIN, PRICE_RAW_MAX, PRICE_RAW_MIN, PriceRaw},
 };
 
 pub trait TickSchemeRule: Display {
@@ -35,6 +37,12 @@ pub trait TickSchemeRule: Display {
 }
 
 pub const BETFAIR_TICK_SCHEME_NAME: &str = "BETFAIR";
+pub const TOPIX100_TICK_SCHEME_NAME: &str = "TOPIX100";
+pub const CRYPTO_0_01_TICK_SCHEME_NAME: &str = "CRYPTO_0_01";
+pub const FOREX_3DECIMAL_TICK_SCHEME_NAME: &str = "FOREX_3DECIMAL";
+pub const FOREX_5DECIMAL_TICK_SCHEME_NAME: &str = "FOREX_5DECIMAL";
+pub const FIXED_TICK_SCHEME_NAME: &str = "FIXED";
+pub const FIXED_PRECISION_TICK_SCHEME_PREFIX: &str = "FIXED_PRECISION_";
 
 const BETFAIR_PRICE_TIERS: [(f64, f64, f64); 10] = [
     (1.01, 2.0, 0.01),
@@ -54,6 +62,42 @@ pub static BETFAIR_TICK_SCHEME: LazyLock<TieredTickScheme> = LazyLock::new(|| {
         .expect("BETFAIR tick scheme tiers are valid by construction")
 });
 
+pub static TOPIX100_TICK_SCHEME: LazyLock<TieredTickScheme> = LazyLock::new(|| {
+    TieredTickScheme::new(
+        &[
+            (0.1, 1_000.0, 0.1),
+            (1_000.0, 3_000.0, 0.5),
+            (3_000.0, 10_000.0, 1.0),
+            (10_000.0, 30_000.0, 5.0),
+            (30_000.0, 100_000.0, 10.0),
+            (100_000.0, 300_000.0, 50.0),
+            (300_000.0, 1_000_000.0, 100.0),
+            (1_000_000.0, 3_000_000.0, 500.0),
+            (3_000_000.0, 10_000_000.0, 1_000.0),
+            (10_000_000.0, 30_000_000.0, 5_000.0),
+            (30_000_000.0, f64::INFINITY, 10_000.0),
+        ],
+        4,
+        10_000,
+    )
+    .expect("TOPIX100 tick scheme tiers are valid by construction")
+});
+
+static FIXED_TICK_SCHEME: LazyLock<FixedTickScheme> =
+    LazyLock::new(|| FixedTickScheme::new(1.0).expect("fixed tick scheme is valid"));
+
+static CRYPTO_0_01_TICK_SCHEME: LazyLock<FixedTickScheme> =
+    LazyLock::new(|| FixedTickScheme::new(0.01).expect("crypto tick scheme is valid"));
+
+static FIXED_PRECISION_TICK_SCHEMES: LazyLock<Vec<FixedTickScheme>> = LazyLock::new(|| {
+    (0..=FIXED_PRECISION)
+        .map(|precision| {
+            let tick = 10_f64.powi(-i32::from(precision));
+            FixedTickScheme::new(tick).expect("fixed precision tick scheme is valid")
+        })
+        .collect()
+});
+
 #[derive(Clone, Copy, Debug)]
 pub struct FixedTickScheme {
     tick: f64,
@@ -67,8 +111,13 @@ impl PartialEq for FixedTickScheme {
 impl Eq for FixedTickScheme {}
 
 impl FixedTickScheme {
-    #[expect(clippy::missing_errors_doc)]
+    /// Creates a new [`FixedTickScheme`] with the given tick size.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `tick` is not finite or not positive.
     pub fn new(tick: f64) -> anyhow::Result<Self> {
+        check_predicate_true(tick.is_finite(), "tick must be finite")?;
         check_predicate_true(tick > 0.0, "tick must be positive")?;
         Ok(Self { tick })
     }
@@ -77,14 +126,12 @@ impl FixedTickScheme {
 impl TickSchemeRule for FixedTickScheme {
     #[inline(always)]
     fn next_bid_price(&self, value: f64, n: i32, precision: u8) -> Option<Price> {
-        let base = (value / self.tick).floor() * self.tick;
-        Some(Price::new(base - f64::from(n) * self.tick, precision))
+        fixed_next_bid_price(self.tick, value, n, precision)
     }
 
     #[inline(always)]
     fn next_ask_price(&self, value: f64, n: i32, precision: u8) -> Option<Price> {
-        let base = (value / self.tick).ceil() * self.tick;
-        Some(Price::new(base + f64::from(n) * self.tick, precision))
+        fixed_next_ask_price(self.tick, value, n, precision)
     }
 }
 
@@ -193,7 +240,7 @@ impl TieredTickScheme {
 
         for &(start, stop, step) in tiers {
             let effective_stop = if stop.is_infinite() {
-                start + ((max_ticks_per_tier + 1) as f64) * step
+                start + (max_ticks_per_tier.saturating_add(1) as f64) * step
             } else {
                 stop
             };
@@ -270,25 +317,7 @@ impl TieredTickScheme {
     /// Panics if the hardcoded TOPIX100 tiers fail validation (should not happen).
     #[must_use]
     pub fn topix100() -> Self {
-        Self::new(
-            &[
-                (0.1, 1_000.0, 0.1),
-                (1_000.0, 3_000.0, 0.5),
-                (3_000.0, 10_000.0, 1.0),
-                (10_000.0, 30_000.0, 5.0),
-                (30_000.0, 100_000.0, 10.0),
-                (100_000.0, 300_000.0, 50.0),
-                (300_000.0, 1_000_000.0, 100.0),
-                (1_000_000.0, 3_000_000.0, 500.0),
-                (3_000_000.0, 10_000_000.0, 1_000.0),
-                (10_000_000.0, 30_000_000.0, 5_000.0),
-                (30_000_000.0, f64::INFINITY, 10_000.0),
-            ],
-            4,
-            10_000,
-        )
-        // SAFETY: TOPIX100 tiers are valid by construction
-        .unwrap()
+        TOPIX100_TICK_SCHEME.clone()
     }
 
     /// Creates the BETFAIR tick scheme.
@@ -304,11 +333,14 @@ impl TieredTickScheme {
 
 impl TickSchemeRule for TieredTickScheme {
     fn next_bid_price(&self, value: f64, n: i32, _precision: u8) -> Option<Price> {
-        if n < 0 {
+        let n = usize::try_from(n).ok()?;
+
+        if value.is_nan() {
             return None;
         }
 
-        // Floor to get a raw value guaranteed <= true value
+        // Floor to get a raw value guaranteed <= true value, infinite values
+        // saturate at the integer bounds during the float-to-integer cast.
         let raw_floor = (value * FIXED_SCALAR).floor() as PriceRaw;
 
         if raw_floor < self.ticks[0] {
@@ -320,30 +352,24 @@ impl TickSchemeRule for TieredTickScheme {
 
         if idx < self.ticks.len() && self.ticks[idx] == raw_floor {
             // Value converts exactly to a tick
-            let target = idx as i32 - n;
-
-            if target < 0 {
-                return None;
-            }
-            return Some(self.price_at(target as usize));
+            let target = idx.checked_sub(n)?;
+            return Some(self.price_at(target));
         }
 
         // Value is beyond or between ticks; bid is the tick below
-        let effective_idx = idx.min(self.ticks.len());
-        let target = effective_idx as i32 - 1 - n;
-
-        if target < 0 {
-            return None;
-        }
-        Some(self.price_at(target as usize))
+        let target = idx.checked_sub(1)?.checked_sub(n)?;
+        Some(self.price_at(target))
     }
 
     fn next_ask_price(&self, value: f64, n: i32, _precision: u8) -> Option<Price> {
-        if n < 0 {
+        let n = usize::try_from(n).ok()?;
+
+        if value.is_nan() {
             return None;
         }
 
-        // Ceil to get a raw value guaranteed >= true value
+        // Ceil to get a raw value guaranteed >= true value, infinite values
+        // saturate at the integer bounds during the float-to-integer cast.
         let raw_ceil = (value * FIXED_SCALAR).ceil() as PriceRaw;
 
         if raw_ceil > *self.ticks.last()? {
@@ -352,12 +378,12 @@ impl TickSchemeRule for TieredTickScheme {
 
         // First index where tick >= raw_ceil
         let idx = self.ticks.partition_point(|&t| t < raw_ceil);
-        let target = idx as i32 + n;
+        let target = idx.checked_add(n)?;
 
-        if target < 0 || target >= self.ticks.len() as i32 {
+        if target >= self.ticks.len() {
             return None;
         }
-        Some(self.price_at(target as usize))
+        Some(self.price_at(target))
     }
 }
 
@@ -382,11 +408,7 @@ impl TickSchemeRule for TickScheme {
             Self::Fixed(scheme) => scheme.next_bid_price(value, n, precision),
             Self::Tiered(scheme) => scheme.next_bid_price(value, n, precision),
             Self::Betfair => BETFAIR_TICK_SCHEME.next_bid_price(value, n, precision),
-            Self::Crypto => {
-                let increment: f64 = 0.01;
-                let base = (value / increment).floor() * increment;
-                Some(Price::new(base - f64::from(n) * increment, precision))
-            }
+            Self::Crypto => CRYPTO_0_01_TICK_SCHEME.next_bid_price(value, n, precision),
         }
     }
 
@@ -396,11 +418,7 @@ impl TickSchemeRule for TickScheme {
             Self::Fixed(scheme) => scheme.next_ask_price(value, n, precision),
             Self::Tiered(scheme) => scheme.next_ask_price(value, n, precision),
             Self::Betfair => BETFAIR_TICK_SCHEME.next_ask_price(value, n, precision),
-            Self::Crypto => {
-                let increment: f64 = 0.01;
-                let base = (value / increment).ceil() * increment;
-                Some(Price::new(base + f64::from(n) * increment, precision))
-            }
+            Self::Crypto => CRYPTO_0_01_TICK_SCHEME.next_ask_price(value, n, precision),
         }
     }
 }
@@ -411,7 +429,7 @@ impl Display for TickScheme {
             Self::Fixed(_) => write!(f, "FIXED"),
             Self::Tiered(scheme) => write!(f, "{scheme}"),
             Self::Betfair => write!(f, "{BETFAIR_TICK_SCHEME_NAME}"),
-            Self::Crypto => write!(f, "CRYPTO_0_01"),
+            Self::Crypto => write!(f, "{CRYPTO_0_01_TICK_SCHEME_NAME}"),
         }
     }
 }
@@ -421,13 +439,64 @@ impl FromStr for TickScheme {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_uppercase().as_str() {
-            "FIXED" => Ok(Self::Fixed(FixedTickScheme::new(1.0)?)),
-            "TOPIX100" => Ok(Self::Tiered(TieredTickScheme::topix100())),
+            FIXED_TICK_SCHEME_NAME => Ok(Self::Fixed(FixedTickScheme::new(1.0)?)),
+            FOREX_3DECIMAL_TICK_SCHEME_NAME => Ok(Self::Fixed(FixedTickScheme::new(0.001)?)),
+            FOREX_5DECIMAL_TICK_SCHEME_NAME => Ok(Self::Fixed(FixedTickScheme::new(0.00001)?)),
+            TOPIX100_TICK_SCHEME_NAME => Ok(Self::Tiered(TieredTickScheme::topix100())),
             BETFAIR_TICK_SCHEME_NAME => Ok(Self::Betfair),
-            "CRYPTO_0_01" => Ok(Self::Crypto),
-            _ => anyhow::bail!("unknown tick scheme {s}"),
+            CRYPTO_0_01_TICK_SCHEME_NAME => Ok(Self::Crypto),
+            name => {
+                if let Some(precision) = parse_fixed_precision_name(name)
+                    && precision <= FIXED_PRECISION
+                {
+                    let tick = 10_f64.powi(-i32::from(precision));
+                    return Ok(Self::Fixed(FixedTickScheme::new(tick)?));
+                }
+                anyhow::bail!("unknown tick scheme {s}")
+            }
         }
     }
+}
+
+/// Returns a registered tick scheme rule by name.
+#[must_use]
+pub fn tick_scheme_rule_from_name(name: &str) -> Option<&'static dyn TickSchemeRule> {
+    let name = name.trim();
+    if name.eq_ignore_ascii_case(FIXED_TICK_SCHEME_NAME) {
+        Some(&*FIXED_TICK_SCHEME)
+    } else if name.eq_ignore_ascii_case(FOREX_3DECIMAL_TICK_SCHEME_NAME) {
+        Some(&FIXED_PRECISION_TICK_SCHEMES[3])
+    } else if name.eq_ignore_ascii_case(FOREX_5DECIMAL_TICK_SCHEME_NAME) {
+        Some(&FIXED_PRECISION_TICK_SCHEMES[5])
+    } else if name.eq_ignore_ascii_case(TOPIX100_TICK_SCHEME_NAME) {
+        Some(&*TOPIX100_TICK_SCHEME)
+    } else if name.eq_ignore_ascii_case(BETFAIR_TICK_SCHEME_NAME) {
+        Some(&*BETFAIR_TICK_SCHEME)
+    } else if name.eq_ignore_ascii_case(CRYPTO_0_01_TICK_SCHEME_NAME) {
+        Some(&*CRYPTO_0_01_TICK_SCHEME)
+    } else {
+        parse_fixed_precision_name_ignore_ascii_case(name).and_then(|precision| {
+            FIXED_PRECISION_TICK_SCHEMES
+                .get(usize::from(precision))
+                .map(|scheme| scheme as &dyn TickSchemeRule)
+        })
+    }
+}
+
+/// Validates an optional tick scheme name.
+///
+/// # Errors
+///
+/// Returns an error if the name is not valid ASCII or does not identify a registered scheme.
+pub fn check_tick_scheme<T: AsRef<str> + Copy>(tick_scheme: Option<T>) -> CorrectnessResult<()> {
+    check_valid_string_ascii_optional(tick_scheme, "tick_scheme")?;
+    if let Some(name) = tick_scheme {
+        check_predicate_true(
+            tick_scheme_rule_from_name(name.as_ref()).is_some(),
+            "tick_scheme not found in tick schemes",
+        )?;
+    }
+    Ok(())
 }
 
 /// Converts an f64 value to a `PriceRaw` fixed-point integer.
@@ -441,6 +510,76 @@ fn f64_to_raw(value: f64, precision: u8) -> PriceRaw {
     {
         f64_to_fixed_i64(value, precision)
     }
+}
+
+fn parse_fixed_precision_name(name: &str) -> Option<u8> {
+    name.strip_prefix(FIXED_PRECISION_TICK_SCHEME_PREFIX)
+        .and_then(|precision| precision.parse::<u8>().ok())
+}
+
+fn parse_fixed_precision_name_ignore_ascii_case(name: &str) -> Option<u8> {
+    let prefix_len = FIXED_PRECISION_TICK_SCHEME_PREFIX.len();
+    let prefix = name.get(..prefix_len)?;
+    if !prefix.eq_ignore_ascii_case(FIXED_PRECISION_TICK_SCHEME_PREFIX) {
+        return None;
+    }
+
+    name.get(prefix_len..)?.parse::<u8>().ok()
+}
+
+fn fixed_next_bid_price(tick: f64, value: f64, n: i32, precision: u8) -> Option<Price> {
+    let n = PriceRaw::from(n);
+    if n < 0 {
+        return None;
+    }
+    let tick_raw = fixed_tick_raw(tick, precision)?;
+    let value_raw = value_to_raw(value)?;
+    let base = value_raw
+        .checked_div_euclid(tick_raw)?
+        .checked_mul(tick_raw)?;
+    let offset = tick_raw.checked_mul(n)?;
+    price_from_raw_checked(base.checked_sub(offset)?, precision)
+}
+
+fn fixed_next_ask_price(tick: f64, value: f64, n: i32, precision: u8) -> Option<Price> {
+    let n = PriceRaw::from(n);
+    if n < 0 {
+        return None;
+    }
+    let tick_raw = fixed_tick_raw(tick, precision)?;
+    let value_raw = value_to_raw(value)?;
+    let base = value_raw
+        .checked_neg()?
+        .checked_div_euclid(tick_raw)?
+        .checked_neg()?
+        .checked_mul(tick_raw)?;
+    let offset = tick_raw.checked_mul(n)?;
+    price_from_raw_checked(base.checked_add(offset)?, precision)
+}
+
+fn fixed_tick_raw(tick: f64, precision: u8) -> Option<PriceRaw> {
+    Price::new_checked(0.0, precision).ok()?;
+
+    if !tick.is_finite() || tick <= 0.0 {
+        return None;
+    }
+
+    let raw = f64_to_raw(tick, precision);
+    (raw > 0).then_some(raw)
+}
+
+fn value_to_raw(value: f64) -> Option<PriceRaw> {
+    if !value.is_finite() || !(PRICE_MIN..=PRICE_MAX).contains(&value) {
+        return None;
+    }
+    Some(f64_to_raw(value, FIXED_PRECISION))
+}
+
+fn price_from_raw_checked(raw: PriceRaw, precision: u8) -> Option<Price> {
+    if !(PRICE_RAW_MIN..=PRICE_RAW_MAX).contains(&raw) {
+        return None;
+    }
+    Some(Price { raw, precision })
 }
 
 #[cfg(test)]
@@ -474,6 +613,17 @@ mod tests {
     }
 
     #[rstest]
+    fn fixed_tick_scheme_preserves_decimal_boundaries() {
+        let tenth = FixedTickScheme::new(0.1).unwrap();
+        let cent = FixedTickScheme::new(0.01).unwrap();
+
+        assert_eq!(tenth.next_bid_price(0.3, 0, 1), Some(Price::new(0.3, 1)));
+        assert_eq!(tenth.next_ask_price(0.3, 0, 1), Some(Price::new(0.3, 1)));
+        assert_eq!(cent.next_bid_price(0.07, 0, 2), Some(Price::new(0.07, 2)));
+        assert_eq!(cent.next_ask_price(0.07, 0, 2), Some(Price::new(0.07, 2)));
+    }
+
+    #[rstest]
     fn fixed_tick_multiple_steps() {
         let scheme = FixedTickScheme::new(1.0).unwrap();
         let bid = scheme.next_bid_price(10.0, 2, 1).unwrap();
@@ -489,6 +639,14 @@ mod tests {
     }
 
     #[rstest]
+    fn tick_scheme_rule_from_fixed_precision_name() {
+        let scheme = tick_scheme_rule_from_name("fixed_precision_1").unwrap();
+
+        assert_eq!(scheme.next_bid_price(0.3, 0, 1), Some(Price::new(0.3, 1)));
+        assert_eq!(scheme.next_ask_price(0.31, 0, 1), Some(Price::new(0.4, 1)));
+    }
+
+    #[rstest]
     fn tick_scheme_unknown() {
         assert!(TickScheme::from_str("UNKNOWN").is_err());
     }
@@ -496,6 +654,28 @@ mod tests {
     #[rstest]
     fn fixed_tick_zero() {
         assert!(FixedTickScheme::new(0.0).is_err());
+    }
+
+    #[rstest]
+    #[case(f64::INFINITY)]
+    #[case(f64::NAN)]
+    fn fixed_tick_non_finite_returns_error(#[case] tick: f64) {
+        let error = FixedTickScheme::new(tick).unwrap_err();
+        assert!(error.to_string().contains("tick must be finite"), "{error}");
+    }
+
+    #[rstest]
+    fn fixed_tick_scheme_nan_value_returns_none() {
+        let scheme = FixedTickScheme::new(1.0).unwrap();
+        assert!(scheme.next_bid_price(f64::NAN, 0, 2).is_none());
+        assert!(scheme.next_ask_price(f64::NAN, 0, 2).is_none());
+    }
+
+    #[rstest]
+    fn fixed_tick_scheme_out_of_range_returns_none() {
+        // Stepping one tick above PRICE_MAX must yield None rather than panicking
+        let scheme = FixedTickScheme::new(PRICE_MAX).unwrap();
+        assert!(scheme.next_ask_price(PRICE_MAX, 1, 2).is_none());
     }
 
     #[rstest]
@@ -634,6 +814,32 @@ mod tests {
         let scheme = TieredTickScheme::topix100();
         assert!(scheme.next_bid_price(500.0, -1, 4).is_none());
         assert!(scheme.next_ask_price(500.0, -1, 4).is_none());
+    }
+
+    #[rstest]
+    fn tiered_tick_scheme_nan_value_returns_none() {
+        let scheme = TieredTickScheme::topix100();
+        assert!(scheme.next_bid_price(f64::NAN, 0, 4).is_none());
+        assert!(scheme.next_ask_price(f64::NAN, 0, 4).is_none());
+    }
+
+    #[rstest]
+    fn tiered_tick_scheme_infinite_value_saturates() {
+        let scheme = TieredTickScheme::topix100();
+        assert_eq!(
+            scheme.next_bid_price(f64::INFINITY, 0, 4),
+            Some(scheme.max_price())
+        );
+        assert!(scheme.next_ask_price(f64::INFINITY, 0, 4).is_none());
+        assert!(scheme.next_bid_price(f64::NEG_INFINITY, 0, 4).is_none());
+    }
+
+    #[rstest]
+    fn crypto_tick_scheme_out_of_range_returns_none() {
+        // Values beyond the Price range must yield None rather than panicking
+        let scheme = TickScheme::Crypto;
+        assert!(scheme.next_ask_price(PRICE_MAX * 2.0, 0, 2).is_none());
+        assert!(scheme.next_bid_price(PRICE_MIN * 2.0, 0, 2).is_none());
     }
 
     #[rstest]

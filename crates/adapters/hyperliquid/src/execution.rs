@@ -53,7 +53,10 @@ use ustr::Ustr;
 use crate::{
     account::resolve_execution_account_address,
     common::{
-        consts::HYPERLIQUID_VENUE,
+        consts::{
+            HYPERLIQUID_BUILDER_APPROVAL_DOCS_URL, HYPERLIQUID_BUILDER_FEE_NOT_APPROVED,
+            HYPERLIQUID_VENUE,
+        },
         credential::Secrets,
         enums::HyperliquidProductType,
         parse::{
@@ -178,6 +181,7 @@ impl HyperliquidExecutionClient {
         http_client.set_account_address(account_address);
         http_client.set_normalize_prices(config.normalize_prices);
         http_client.set_market_order_slippage_bps(config.market_order_slippage_bps);
+        http_client.set_include_builder_attribution(config.include_builder_attribution);
 
         // Apply URL overrides from config (used for testing with mock servers)
         if let Some(url) = &config.base_url_http {
@@ -1763,7 +1767,7 @@ impl HyperliquidExecutionClient {
                         // (resubscribe_all) and never forwarded here
                         NautilusWsMessage::Reconnected => {}
                         NautilusWsMessage::Error(e) => {
-                            log::error!("WebSocket error: {e}");
+                            log::warn!("WebSocket error: {e}");
                         }
                         // Handled by data client
                         NautilusWsMessage::Trades(_)
@@ -2131,6 +2135,13 @@ impl PostRejectionRoute {
             return false;
         }
 
+        if reason.contains(HYPERLIQUID_BUILDER_FEE_NOT_APPROVED) {
+            log::warn!(
+                "Builder fee not approved: complete the one-time 0% builder approval \
+                 (signed by the master wallet). See: {HYPERLIQUID_BUILDER_APPROVAL_DOCS_URL}",
+            );
+        }
+
         self.emitter
             .emit_order_rejected(order, reason, ts_event, false);
         self.dispatch_state
@@ -2223,7 +2234,12 @@ fn handle_execution_report(
                 remove_cloid_mapping_for_client_order_id(ws_client, http_client, &id);
             }
 
-            None
+            // Hand a fill-path promotion's corrective reduce to the loop to post
+            client_order_id.and_then(|id| {
+                dispatch_state
+                    .take_corrective(&id)
+                    .map(|(oid, order)| (id, oid, order))
+            })
         }
     }
 }
@@ -2289,15 +2305,16 @@ fn remove_cloid_mapping_for_client_order_id(
     http_client: &HyperliquidHttpClient,
     client_order_id: &ClientOrderId,
 ) {
+    let generated_cloid = Cloid::from_client_order_id(*client_order_id);
+
     if let Some(cloid) = http_client.remove_client_order_id_cloid(client_order_id) {
         ws_client.remove_cloid_mapping(&Ustr::from(&cloid.to_hex()));
-    } else {
-        let cloid = Cloid::from_client_order_id(*client_order_id);
-        ws_client.remove_cloid_mapping(&Ustr::from(&cloid.to_hex()));
+        if cloid == generated_cloid {
+            return;
+        }
     }
 
-    let legacy_cloid = Cloid::from_legacy_client_order_id(*client_order_id);
-    ws_client.remove_cloid_mapping(&Ustr::from(&legacy_cloid.to_hex()));
+    ws_client.remove_cloid_mapping(&Ustr::from(&generated_cloid.to_hex()));
 }
 
 use crate::common::parse::determine_order_list_grouping;
@@ -3017,12 +3034,12 @@ mod tests {
         assert_eq!(ws_client.get_cloid_mapping(&cloid_for("O-HER-FILL")), None);
     }
 
-    /// GH-3972: when a status-only `FILLED` marker arrives before both the
-    /// buffered fill and the replacement `ACCEPTED(new_voi)`, the cloid
-    /// mapping must NOT be evicted on the buffered fill: otherwise the later
-    /// `ACCEPTED` cannot resolve the cloid and the buffered fill is stranded.
+    /// GH-4270: when a status-only `FILLED` marker arrives before the
+    /// replacement fill and the `ACCEPTED(new_voi)` is dropped, the fill itself
+    /// promotes the binding (OrderUpdated then OrderFilled) and, being terminal
+    /// and no longer buffered, completes the deferred cloid eviction.
     #[rstest]
-    fn test_handle_execution_report_buffered_fill_preserves_cloid_under_filled_marker() {
+    fn test_handle_execution_report_fill_under_filled_marker_promotes_and_evicts_cloid() {
         let ws_client = make_ws_client();
         let (emitter, mut rx) = test_emitter();
         let state = WsDispatchState::new();
@@ -3053,9 +3070,9 @@ mod tests {
             Some(cid)
         );
 
-        // Fill carrying the new venue_order_id arrives before ACCEPTED. It is
-        // buffered; the cloid mapping must be preserved so the eventual
-        // ACCEPTED can still resolve and drain the buffer.
+        // The replacement fill arrives with the new venue_order_id; the ACCEPTED
+        // was dropped. It promotes the binding, applies the fill, and -- being
+        // terminal and no longer buffered -- completes the deferred eviction.
         let fill = make_fill_report(Some("O-HER-BUF"), "new-voi", "trade-buf");
         handle_execution_report(
             ExecutionReport::Fill(fill),
@@ -3067,16 +3084,25 @@ mod tests {
             UnixNanos::default(),
         );
 
-        assert_eq!(state.buffered_fill_count(&cid), 1);
-        assert!(drain_events(&mut rx).is_empty());
+        let events = drain_events(&mut rx);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0],
+            ExecutionEvent::Order(OrderEventAny::Updated(_))
+        ));
+        assert!(matches!(
+            events[1],
+            ExecutionEvent::Order(OrderEventAny::Filled(_))
+        ));
+        assert_eq!(state.buffered_fill_count(&cid), 0);
         assert!(
-            pending_cloids.contains(&cid),
-            "deferred cleanup must remain armed until the buffered fill drains",
+            !pending_cloids.contains(&cid),
+            "deferred cleanup must complete once the promoting fill lands",
         );
         assert_eq!(
             ws_client.get_cloid_mapping(&cloid_for("O-HER-BUF")),
-            Some(cid),
-            "cloid mapping must survive a buffered fill so the later ACCEPTED resolves",
+            None,
+            "cloid mapping must be evicted after the terminal fill",
         );
     }
 
@@ -3270,6 +3296,70 @@ mod tests {
         // is suppressed and a further in-flight fill chains another reduce.
         assert_eq!(state.pending_modify(&cid), Some(VenueOrderId::new(new_voi)));
         assert_eq!(state.pending_modify_target_qty(&cid), Some(target_total));
+    }
+
+    /// GH-4270: when the replacement ACCEPTED is dropped, a fill on the new leg
+    /// promotes the binding and (parity with the ACCEPTED path) queues a corrective
+    /// reduce when an earlier old-leg fill left the replacement oversized.
+    #[rstest]
+    fn test_cancel_replace_fill_promotion_queues_corrective_reduce() {
+        let ws_client = make_ws_client();
+        let (emitter, mut rx) = test_emitter();
+        let state = WsDispatchState::new();
+        let mut pending_cloids: FifoCache<ClientOrderId, 10_000> = FifoCache::new();
+
+        let cid = ClientOrderId::from("O-HER-FILL-CORR");
+        let target_total = Quantity::from("1.000");
+        let old_voi = "445117664938";
+        let new_voi = "445117686214";
+
+        let mut identity = test_identity();
+        identity.quantity = target_total;
+        state.register_identity(cid, identity);
+        state.insert_accepted(cid);
+        state.record_venue_order_id(cid, VenueOrderId::new(old_voi));
+        // Modify dispatched while nothing had filled: request sized at the full target
+        state.mark_pending_modify(cid, VenueOrderId::new(old_voi), target_total);
+        state.stash_modify_request(cid, limit_request(Decimal::from(1)));
+        // An old-leg fill raced the modify; the replacement ACCEPTED was dropped
+        state.record_filled_qty(cid, Quantity::from("0.165"));
+
+        // A fill lands on the replacement leg: it must promote and queue the reduce
+        let fill = make_fill_report_with_qty(
+            Some("O-HER-FILL-CORR"),
+            new_voi,
+            "T-FILL-CORR",
+            Quantity::from("0.100"),
+        );
+        let corrective = handle_execution_report(
+            ExecutionReport::Fill(fill),
+            &state,
+            &emitter,
+            &ws_client,
+            &make_http_client(),
+            &mut pending_cloids,
+            UnixNanos::default(),
+        );
+
+        // The fill promoted: OrderUpdated then OrderFilled
+        let events = drain_events(&mut rx);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0],
+            ExecutionEvent::Order(OrderEventAny::Updated(_))
+        ));
+        assert!(matches!(
+            events[1],
+            ExecutionEvent::Order(OrderEventAny::Filled(_))
+        ));
+
+        // Corrective reduce queued to target - cumulative (1.000 - 0.265 = 0.735)
+        let (corr_cid, oid, request) =
+            corrective.expect("oversized replacement must queue a corrective reduce");
+        assert_eq!(corr_cid, cid);
+        assert_eq!(oid, 445_117_686_214);
+        assert_eq!(request.size, "0.735".parse::<Decimal>().unwrap());
+        assert_eq!(state.pending_modify(&cid), Some(VenueOrderId::new(new_voi)));
     }
 
     /// Without an in-flight fill the replacement is correctly sized, so the

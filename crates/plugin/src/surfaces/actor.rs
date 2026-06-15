@@ -74,7 +74,7 @@ use crate::{
     boundary::{BorrowedStr, PluginError, PluginErrorCode, PluginResult, Slice},
     host::{HostContext, HostVTable},
     normalize::BoundaryNormalize,
-    panic::{guard, guard_infallible},
+    panic::{guard, guard_drop, guard_or_null},
     surfaces::{
         book::{OrderBookDeltasHandle, OrderBookHandle},
         custom_data::PluginCustomDataRef,
@@ -99,9 +99,9 @@ pub struct PluginActorHandle {
 /// also powers [`custom_data_vtable`](crate::surfaces::custom_data::custom_data_vtable).
 ///
 /// Every callback that returns [`PluginResult<()>`] runs inside
-/// [`crate::panic::guard`]. The infallible `create`/`drop` callbacks run
-/// inside [`crate::panic::guard_infallible`], which aborts the host on
-/// panic since their signatures cannot carry an error.
+/// [`crate::panic::guard`]. A `create` panic returns null (the host treats
+/// it as a failed construction) and a `drop` panic leaks the instance; see
+/// [`crate::panic::guard_or_null`] and [`crate::panic::guard_drop`].
 ///
 /// Slots are nullable at the ABI type level so the host can reject malformed
 /// manifests with null callbacks before constructing an actor. Macro-generated
@@ -302,6 +302,15 @@ pub struct ActorVTable {
 /// Every callback has a no-op default; authors override the ones they care
 /// about. Callbacks receive borrowed references to host-owned values; the
 /// references are only valid for the duration of the call.
+///
+/// # Errors
+///
+/// Hook implementations may return an error to abort the current callback.
+/// Default hook implementations never error.
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "hook error behavior is documented once at the trait level"
+)]
 pub trait PluginActor: 'static + Send + Sized {
     /// Canonical type name. Must be unique across a Nautilus deployment.
     const TYPE_NAME: &'static str;
@@ -549,7 +558,7 @@ unsafe extern "C" fn create_thunk<T: PluginActor>(
     ctx: *const HostContext,
     config_json: BorrowedStr<'_>,
 ) -> *mut PluginActorHandle {
-    guard_infallible("actor::create", || {
+    guard_or_null("actor::create", || {
         // SAFETY: host promises `config_json` borrows storage that is live
         // for the duration of this call.
         let cfg = unsafe { config_json.as_str() };
@@ -561,7 +570,7 @@ unsafe extern "C" fn drop_handle_thunk<T: PluginActor>(handle: *mut PluginActorH
     if handle.is_null() {
         return;
     }
-    guard_infallible("actor::drop", || {
+    guard_drop("actor::drop", || {
         // SAFETY: handle was allocated via `Box::into_raw(Box::new(T))`.
         unsafe {
             drop(Box::from_raw(handle.cast::<T>()));

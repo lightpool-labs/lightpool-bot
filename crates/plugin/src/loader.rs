@@ -38,7 +38,7 @@ use crate::{
     host::{HostContext, HostLogLevel, HostVTable},
     manifest::{
         PluginBuildId, PluginInitFn, PluginManifest, PluginManifestValidationErrors,
-        ValidatedPluginManifest,
+        ValidatedCustomDataRegistration, ValidatedPluginManifest,
     },
     surfaces::commands::{
         CancelAllOrdersHandle, CancelOrderHandle, CancelOrdersHandle, CloseAllPositionsHandle,
@@ -91,6 +91,16 @@ pub enum LoadError {
         type_name: String,
         existing_path: PathBuf,
     },
+
+    #[error(
+        "plug-in '{path}' build mismatch: host {host}, plug-in {plugin}; rebuild the plug-in \
+         against the host toolchain or call `PluginLoader::set_allow_build_mismatch`"
+    )]
+    BuildMismatch {
+        path: PathBuf,
+        host: Box<PluginBuildIdDiagnostics>,
+        plugin: Box<PluginBuildIdDiagnostics>,
+    },
 }
 
 /// Owned manifest diagnostics captured before a rejected plug-in is unloaded.
@@ -113,6 +123,12 @@ impl PluginManifestDiagnostics {
         }
     }
 
+    // Reading manifest fields beyond `abi_version` here relies on the
+    // append-only manifest evolution contract (see `PluginManifest` docs):
+    // the header prefix (name, vendor, version, build_id) stays
+    // layout-stable across ABI revisions, so these reads are sound for
+    // conforming plug-ins. Non-conforming binaries are bounded by the
+    // length-capped diagnostic reads.
     fn from_abi_mismatch_manifest(manifest: &PluginManifest) -> Self {
         let build_id = if manifest.build_id.schema_version == PLUGIN_BUILD_ID_VERSION {
             PluginBuildIdDiagnostics::from_build_id(&manifest.build_id)
@@ -210,14 +226,23 @@ fn unknown_if_empty(value: &str) -> &str {
     if value.is_empty() { "<unknown>" } else { value }
 }
 
+/// Maximum bytes read when capturing a manifest string for diagnostics.
+///
+/// Diagnostics also run on the ABI-mismatch path, where the manifest layout
+/// is not trusted and a corrupt descriptor could carry an absurd length; the
+/// cap bounds the raw read. Genuine values (names, versions, targets) fit
+/// comfortably.
+const MAX_DIAGNOSTIC_STR_LEN: usize = 256;
+
 fn borrowed_str_diagnostic(value: BorrowedStr<'_>) -> String {
     if value.ptr.is_null() || value.len == 0 {
         return String::new();
     }
 
+    let len = value.len.min(MAX_DIAGNOSTIC_STR_LEN);
     // SAFETY: manifest strings live in static cdylib storage while the
-    // library is loaded.
-    let bytes = unsafe { slice::from_raw_parts(value.ptr, value.len) };
+    // library is loaded; the read is length-capped for untrusted descriptors.
+    let bytes = unsafe { slice::from_raw_parts(value.ptr, len) };
     String::from_utf8_lossy(bytes).into_owned()
 }
 
@@ -240,7 +265,7 @@ impl Debug for LoadedPlugin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(LoadedPlugin))
             .field("path", &self.path)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -279,6 +304,7 @@ impl LoadedPlugin {
 pub struct PluginLoader {
     loaded: Vec<LoadedPlugin>,
     host: Option<*const HostVTable>,
+    allow_build_mismatch: bool,
 }
 
 /// SAFETY: `*const HostVTable` is a process-lifetime static pointer; the host
@@ -298,6 +324,7 @@ impl PluginLoader {
         Self {
             loaded: Vec::new(),
             host: None,
+            allow_build_mismatch: false,
         }
     }
 
@@ -311,10 +338,28 @@ impl PluginLoader {
         Self {
             loaded: Vec::new(),
             host: Some(host),
+            allow_build_mismatch: false,
         }
     }
 
+    /// Allows loading plug-ins whose build identifier does not match the host.
+    ///
+    /// The loader rejects mismatched `rustc_version` or
+    /// `nautilus_plugin_version` by default: boundary payloads include
+    /// `repr(Rust)` interiors whose layout is only guaranteed when host and
+    /// plug-in share a toolchain and crate version. Allowing a mismatch
+    /// downgrades the rejection to a warning; the operator owns the layout
+    /// risk.
+    pub fn set_allow_build_mismatch(&mut self, allow: bool) {
+        self.allow_build_mismatch = allow;
+    }
+
     /// Loads every plug-in path in order. Stops on the first error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`LoadError`] raised while loading the provided
+    /// paths.
     pub fn load_all<P>(&mut self, paths: impl IntoIterator<Item = P>) -> Result<(), LoadError>
     where
         P: AsRef<OsStr>,
@@ -326,6 +371,12 @@ impl PluginLoader {
     }
 
     /// Loads a single plug-in cdylib.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`LoadError`] if the library cannot be opened, the init
+    /// symbol is missing, the manifest is invalid, or the manifest conflicts
+    /// with an already loaded plug-in.
     pub fn load(&mut self, path: impl AsRef<OsStr>) -> Result<&LoadedPlugin, LoadError> {
         let path_buf = PathBuf::from(path.as_ref());
 
@@ -336,6 +387,13 @@ impl PluginLoader {
             path: path_buf.clone(),
             source: e,
         })?;
+
+        // Leak the handle immediately: by this point the cdylib's static
+        // initializers have run (and `nautilus_plugin_init` runs below), so
+        // `dlclose` on a rejection path could unload code that registered
+        // atexit callbacks or spawned threads. v1 never unloads; rejected
+        // plug-ins leak the handle the same way accepted ones do.
+        let library = ManuallyDrop::new(library);
 
         let manifest_ptr = {
             // SAFETY: looking up a known symbol name in an opened library.
@@ -352,9 +410,13 @@ impl PluginLoader {
         };
 
         let manifest = validate_manifest_ptr(manifest_ptr, &path_buf)?;
+        validate_build_pinning(manifest, &path_buf, self.allow_build_mismatch)?;
 
         let collision = {
-            let new_types: Vec<&str> = manifest.custom_data().map(|e| e.type_name()).collect();
+            let new_types: Vec<&str> = manifest
+                .custom_data()
+                .map(ValidatedCustomDataRegistration::type_name)
+                .collect();
             let existing: Vec<(&str, &Path)> = self
                 .loaded
                 .iter()
@@ -393,12 +455,13 @@ impl PluginLoader {
             path_buf.display(),
         );
 
+        let loaded_index = self.loaded.len();
         self.loaded.push(LoadedPlugin {
             path: path_buf,
-            _library: ManuallyDrop::new(library),
+            _library: library,
             manifest,
         });
-        Ok(self.loaded.last().expect("just pushed"))
+        Ok(&self.loaded[loaded_index])
     }
 
     /// Returns every loaded plug-in in load order.
@@ -456,6 +519,79 @@ fn validate_manifest_ptr(
             errors,
         }),
     }
+}
+
+/// Verifies the manifest's build identifier is pinned to the host's.
+///
+/// Boundary payloads include `repr(Rust)` interiors (`Box<OrderBook>`,
+/// `Vec<OrderAny>`, `String` fields) whose layout is only guaranteed when
+/// host and plug-in share a toolchain and `nautilus-plugin` crate version,
+/// so the loader compares `rustc_version` and `nautilus_plugin_version` by
+/// default. A field that is empty on either side cannot be compared and
+/// logs a warning instead of failing.
+fn validate_build_pinning(
+    manifest: ValidatedPluginManifest<'_>,
+    path: &Path,
+    allow_mismatch: bool,
+) -> Result<(), LoadError> {
+    let host_build = PluginBuildId::current();
+    let plugin_build = &manifest.manifest().build_id;
+
+    let mut mismatch = false;
+
+    for (field, host_value, plugin_value) in [
+        (
+            "rustc_version",
+            host_build.rustc_version,
+            plugin_build.rustc_version,
+        ),
+        (
+            "nautilus_plugin_version",
+            host_build.nautilus_plugin_version,
+            plugin_build.nautilus_plugin_version,
+        ),
+    ] {
+        // SAFETY: host values live in compiled-in static storage; plug-in
+        // values passed manifest validation (UTF-8 checked) and live in
+        // static cdylib storage.
+        let host_value = unsafe { host_value.as_str() };
+        // SAFETY: see above.
+        let plugin_value = unsafe { plugin_value.as_str() };
+        if host_value.is_empty() || plugin_value.is_empty() {
+            log::warn!(
+                target: "nautilus_plugin",
+                "Cannot verify build_id.{field} for plug-in '{}': value unavailable",
+                path.display(),
+            );
+            continue;
+        }
+
+        if host_value != plugin_value {
+            mismatch = true;
+        }
+    }
+
+    if !mismatch {
+        return Ok(());
+    }
+
+    let host = Box::new(PluginBuildIdDiagnostics::from_build_id(&host_build));
+    let plugin = Box::new(PluginBuildIdDiagnostics::from_build_id(plugin_build));
+
+    if allow_mismatch {
+        log::warn!(
+            target: "nautilus_plugin",
+            "Plug-in '{}' build mismatch allowed by configuration: host {host}, plug-in {plugin}",
+            path.display(),
+        );
+        return Ok(());
+    }
+
+    Err(LoadError::BuildMismatch {
+        path: path.to_path_buf(),
+        host,
+        plugin,
+    })
 }
 
 /// Returns the first custom-data type name in `new_types` that a previously
@@ -522,6 +658,11 @@ fn host_vtable() -> *const HostVTable {
         close_all_positions: host_close_all_positions_unbound,
         query_account: host_query_account_unbound,
         query_order: host_query_order_unbound,
+        trader_id: host_trader_id_unbound,
+        strategy_id: host_strategy_id_unbound,
+        component_state: host_component_state_unbound,
+        generate_client_order_id: host_generate_client_order_id_unbound,
+        generate_order_list_id: host_generate_order_list_id_unbound,
     }))
 }
 
@@ -545,6 +686,15 @@ macro_rules! unbound_bytes_fn {
 macro_rules! unbound_unit_fn {
     ($name:ident, $message:literal, ($($arg:ident : $ty:ty),* $(,)?)) => {
         unsafe extern "C" fn $name($($arg: $ty),*) -> PluginResult<()> {
+            $(let _ = $arg;)*
+            PluginResult::Err(PluginError::new(PluginErrorCode::NotImplemented, $message))
+        }
+    };
+}
+
+macro_rules! unbound_u8_fn {
+    ($name:ident, $message:literal, ($($arg:ident : $ty:ty),* $(,)?)) => {
+        unsafe extern "C" fn $name($($arg: $ty),*) -> PluginResult<u8> {
             $(let _ = $arg;)*
             PluginResult::Err(PluginError::new(PluginErrorCode::NotImplemented, $message))
         }
@@ -580,6 +730,31 @@ unbound_bytes_fn!(
     host_cache_positions_for_strategy_unbound,
     "cache_positions_for_strategy is not wired into this host vtable",
     (ctx: *const HostContext, strategy_id: BorrowedStr<'_>)
+);
+unbound_bytes_fn!(
+    host_trader_id_unbound,
+    "trader_id is not wired into this host vtable",
+    (ctx: *const HostContext)
+);
+unbound_bytes_fn!(
+    host_strategy_id_unbound,
+    "strategy_id is not wired into this host vtable",
+    (ctx: *const HostContext)
+);
+unbound_u8_fn!(
+    host_component_state_unbound,
+    "component_state is not wired into this host vtable",
+    (ctx: *const HostContext)
+);
+unbound_bytes_fn!(
+    host_generate_client_order_id_unbound,
+    "generate_client_order_id is not wired into this host vtable",
+    (ctx: *const HostContext)
+);
+unbound_bytes_fn!(
+    host_generate_order_list_id_unbound,
+    "generate_order_list_id is not wired into this host vtable",
+    (ctx: *const HostContext)
 );
 
 unbound_unit_fn!(
@@ -832,17 +1007,21 @@ unsafe extern "C" fn host_log(
     target: BorrowedStr<'_>,
     message: BorrowedStr<'_>,
 ) {
-    // SAFETY: producer holds the storage live across the call.
-    let target = unsafe { target.as_str() };
-    // SAFETY: see above.
-    let message = unsafe { message.as_str() };
-    match level {
-        HostLogLevel::Error => log::error!(target: "nautilus_plugin", "[{target}] {message}"),
-        HostLogLevel::Warn => log::warn!(target: "nautilus_plugin", "[{target}] {message}"),
-        HostLogLevel::Info => log::info!(target: "nautilus_plugin", "[{target}] {message}"),
-        HostLogLevel::Debug => log::debug!(target: "nautilus_plugin", "[{target}] {message}"),
-        HostLogLevel::Trace => log::trace!(target: "nautilus_plugin", "[{target}] {message}"),
-    }
+    // No error channel here, so a panicking logger must be swallowed rather
+    // than unwind out of the `extern "C"` thunk and abort the process.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: producer holds the storage live across the call.
+        let target = unsafe { target.to_string_lossy() };
+        // SAFETY: see above.
+        let message = unsafe { message.to_string_lossy() };
+        match level {
+            HostLogLevel::Error => log::error!(target: "nautilus_plugin", "[{target}] {message}"),
+            HostLogLevel::Warn => log::warn!(target: "nautilus_plugin", "[{target}] {message}"),
+            HostLogLevel::Info => log::info!(target: "nautilus_plugin", "[{target}] {message}"),
+            HostLogLevel::Debug => log::debug!(target: "nautilus_plugin", "[{target}] {message}"),
+            HostLogLevel::Trace => log::trace!(target: "nautilus_plugin", "[{target}] {message}"),
+        }
+    }));
 }
 
 #[cfg(test)]
@@ -1009,6 +1188,98 @@ mod tests {
         // SAFETY: target and message outlive the call; the host_log fn
         // only forwards to the `log` crate macros.
         unsafe { (v.log)(HostLogLevel::Info, target, message) };
+    }
+
+    fn pinning_test_manifest(build_id: PluginBuildId) -> PluginManifest {
+        PluginManifest {
+            abi_version: NAUTILUS_PLUGIN_ABI_VERSION,
+            plugin_name: BorrowedStr::from_str("pinning-test"),
+            plugin_vendor: BorrowedStr::from_str(""),
+            plugin_version: BorrowedStr::from_str("0.0.0"),
+            build_id,
+            custom_data: Slice::empty(),
+            actors: Slice::empty(),
+            strategies: Slice::empty(),
+            controllers: Slice::empty(),
+        }
+    }
+
+    #[rstest]
+    fn validate_build_pinning_accepts_matching_build() {
+        let manifest = pinning_test_manifest(PluginBuildId::current());
+        let manifest = ValidatedPluginManifest::new(&manifest).expect("manifest validates");
+        let path = Path::new("/test/plugin.so");
+
+        assert!(validate_build_pinning(manifest, path, false).is_ok());
+    }
+
+    #[rstest]
+    fn validate_build_pinning_rejects_crate_version_mismatch() {
+        let build_id = PluginBuildId {
+            nautilus_plugin_version: BorrowedStr::from_str("0.0.0-test"),
+            ..PluginBuildId::current()
+        };
+        let manifest = pinning_test_manifest(build_id);
+        let manifest = ValidatedPluginManifest::new(&manifest).expect("manifest validates");
+        let path = Path::new("/test/plugin.so");
+
+        let err = validate_build_pinning(manifest, path, false).unwrap_err();
+        match &err {
+            LoadError::BuildMismatch {
+                path: p,
+                host,
+                plugin,
+            } => {
+                assert_eq!(p, path);
+                assert_eq!(
+                    host.nautilus_plugin_version.as_str(),
+                    env!("CARGO_PKG_VERSION")
+                );
+                assert_eq!(plugin.nautilus_plugin_version.as_str(), "0.0.0-test");
+            }
+            other => panic!("expected BuildMismatch, was {other:?}"),
+        }
+        let rendered = format!("{err}");
+        assert!(rendered.contains("build mismatch"));
+        assert!(rendered.contains("0.0.0-test"));
+        assert!(rendered.contains("set_allow_build_mismatch"));
+    }
+
+    #[rstest]
+    fn validate_build_pinning_allows_mismatch_when_configured() {
+        let build_id = PluginBuildId {
+            nautilus_plugin_version: BorrowedStr::from_str("0.0.0-test"),
+            ..PluginBuildId::current()
+        };
+        let manifest = pinning_test_manifest(build_id);
+        let manifest = ValidatedPluginManifest::new(&manifest).expect("manifest validates");
+        let path = Path::new("/test/plugin.so");
+
+        assert!(validate_build_pinning(manifest, path, true).is_ok());
+    }
+
+    #[rstest]
+    fn validate_build_pinning_skips_unavailable_fields() {
+        // An empty value cannot be compared, so it warns instead of failing.
+        let build_id = PluginBuildId {
+            rustc_version: BorrowedStr::empty(),
+            ..PluginBuildId::current()
+        };
+        let manifest = pinning_test_manifest(build_id);
+        let manifest = ValidatedPluginManifest::new(&manifest).expect("manifest validates");
+        let path = Path::new("/test/plugin.so");
+
+        assert!(validate_build_pinning(manifest, path, false).is_ok());
+    }
+
+    #[rstest]
+    fn borrowed_str_diagnostic_caps_read_length() {
+        let long = "x".repeat(MAX_DIAGNOSTIC_STR_LEN * 4);
+        let value = BorrowedStr::from_str(&long);
+
+        let captured = borrowed_str_diagnostic(value);
+
+        assert_eq!(captured.len(), MAX_DIAGNOSTIC_STR_LEN);
     }
 
     #[rstest]
@@ -1418,14 +1689,65 @@ mod tests {
             _ => unreachable!(),
         };
 
-        let err = match r.into_result() {
-            Ok(_) => panic!("{method} unexpectedly succeeded"),
-            Err(e) => e,
+        let Err(e) = r.into_result() else {
+            panic!("{method} unexpectedly succeeded");
         };
-        assert_eq!(err.code, PluginErrorCode::NotImplemented);
+        assert_eq!(e.code, PluginErrorCode::NotImplemented);
         assert_eq!(
-            err.message_string(),
+            e.message_string(),
             format!("{method} is not wired into this host vtable")
+        );
+    }
+
+    #[rstest]
+    #[case::trader_id("trader_id")]
+    #[case::strategy_id("strategy_id")]
+    #[case::generate_client_order_id("generate_client_order_id")]
+    #[case::generate_order_list_id("generate_order_list_id")]
+    fn host_context_bytes_stubs_return_not_implemented(#[case] method: &str) {
+        let p = host_vtable();
+        // SAFETY: pointer is to a static `OnceLock`-backed HostVTable.
+        let v = unsafe { &*p };
+        let ctx = std::ptr::null::<HostContext>();
+
+        let r = match method {
+            // SAFETY: stubs do not dereference ctx.
+            "trader_id" => unsafe { (v.trader_id)(ctx) },
+            // SAFETY: see above.
+            "strategy_id" => unsafe { (v.strategy_id)(ctx) },
+            // SAFETY: see above.
+            "generate_client_order_id" => unsafe { (v.generate_client_order_id)(ctx) },
+            // SAFETY: see above.
+            "generate_order_list_id" => unsafe { (v.generate_order_list_id)(ctx) },
+            _ => unreachable!(),
+        };
+
+        let Err(e) = r.into_result() else {
+            panic!("{method} unexpectedly succeeded");
+        };
+        assert_eq!(e.code, PluginErrorCode::NotImplemented);
+        assert_eq!(
+            e.message_string(),
+            format!("{method} is not wired into this host vtable")
+        );
+    }
+
+    #[rstest]
+    fn host_component_state_stub_returns_not_implemented() {
+        let p = host_vtable();
+        // SAFETY: pointer is to a static `OnceLock`-backed HostVTable.
+        let v = unsafe { &*p };
+        let ctx = std::ptr::null::<HostContext>();
+
+        // SAFETY: stub does not dereference ctx.
+        let r = unsafe { (v.component_state)(ctx) };
+        let Err(e) = r.into_result() else {
+            panic!("component_state unexpectedly succeeded");
+        };
+        assert_eq!(e.code, PluginErrorCode::NotImplemented);
+        assert_eq!(
+            e.message_string(),
+            "component_state is not wired into this host vtable"
         );
     }
 

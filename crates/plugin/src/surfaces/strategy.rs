@@ -104,7 +104,7 @@ use crate::{
     boundary::{BorrowedStr, PluginError, PluginErrorCode, PluginResult, Slice},
     host::{HostContext, HostVTable},
     normalize::BoundaryNormalize,
-    panic::{guard, guard_infallible},
+    panic::{guard, guard_drop, guard_or_null},
     surfaces::{
         book::{OrderBookDeltasHandle, OrderBookHandle},
         custom_data::PluginCustomDataRef,
@@ -449,6 +449,15 @@ pub struct StrategyVTable {
 /// they can use to issue order commands through the host.
 ///
 /// Every callback has a no-op default. Override only what you need.
+///
+/// # Errors
+///
+/// Hook implementations may return an error to abort the current callback.
+/// Default hook implementations never error.
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "hook error behavior is documented once at the trait level"
+)]
 pub trait PluginStrategy: 'static + Send + Sized {
     /// Canonical type name. Must be unique across a Nautilus deployment.
     const TYPE_NAME: &'static str;
@@ -807,7 +816,7 @@ unsafe extern "C" fn create_thunk<T: PluginStrategy>(
     ctx: *const HostContext,
     config_json: BorrowedStr<'_>,
 ) -> *mut PluginStrategyHandle {
-    guard_infallible("strategy::create", || {
+    guard_or_null("strategy::create", || {
         // SAFETY: host promises `config_json` borrows storage that is live
         // for the duration of this call.
         let cfg = unsafe { config_json.as_str() };
@@ -819,7 +828,7 @@ unsafe extern "C" fn drop_handle_thunk<T: PluginStrategy>(handle: *mut PluginStr
     if handle.is_null() {
         return;
     }
-    guard_infallible("strategy::drop", || {
+    guard_drop("strategy::drop", || {
         // SAFETY: handle was allocated via `Box::into_raw(Box::new(T))`.
         unsafe {
             drop(Box::from_raw(handle.cast::<T>()));

@@ -103,7 +103,7 @@ impl NautilusKernelBuilder {
             save_state: true,
             shutdown_on_error: false,
             logging: None,
-            timeout_connection: Duration::from_secs(60),
+            timeout_connection: Duration::from_mins(1),
             timeout_reconciliation: Duration::from_secs(30),
             timeout_portfolio: Duration::from_secs(10),
             timeout_disconnection: Duration::from_secs(10),
@@ -341,7 +341,7 @@ mod tests {
         orderbook::OrderBook,
         orders::OrderAny,
         position::Position,
-        types::Currency,
+        types::{Currency, Money},
     };
     use rstest::*;
     use ustr::Ustr;
@@ -492,14 +492,14 @@ mod tests {
         assert_eq!(builder.timeout_portfolio, Duration::from_secs(30));
         assert_eq!(builder.timeout_disconnection, Duration::from_secs(40));
         assert_eq!(builder.delay_post_stop, Duration::from_secs(50));
-        assert_eq!(builder.timeout_shutdown, Duration::from_secs(60));
+        assert_eq!(builder.timeout_shutdown, Duration::from_mins(1));
     }
 
     #[rstest]
     fn test_builder_default_timeouts() {
         let builder = NautilusKernelBuilder::default();
 
-        assert_eq!(builder.timeout_connection, Duration::from_secs(60));
+        assert_eq!(builder.timeout_connection, Duration::from_mins(1));
         assert_eq!(builder.timeout_reconciliation, Duration::from_secs(30));
         assert_eq!(builder.timeout_portfolio, Duration::from_secs(10));
         assert_eq!(builder.timeout_disconnection, Duration::from_secs(10));
@@ -553,7 +553,7 @@ mod tests {
             Ok(AHashMap::new())
         }
 
-        fn load_index_order_position(&self) -> anyhow::Result<AHashMap<ClientOrderId, Position>> {
+        fn load_index_order_position(&self) -> anyhow::Result<AHashMap<ClientOrderId, PositionId>> {
             Ok(AHashMap::new())
         }
 
@@ -767,11 +767,19 @@ mod tests {
             Ok(())
         }
 
-        fn update_actor(&self) -> anyhow::Result<()> {
+        fn update_actor(
+            &self,
+            _component_id: &ComponentId,
+            _state: &AHashMap<String, Bytes>,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
 
-        fn update_strategy(&self) -> anyhow::Result<()> {
+        fn update_strategy(
+            &self,
+            _strategy_id: &StrategyId,
+            _state: &AHashMap<String, Bytes>,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -791,7 +799,12 @@ mod tests {
             Ok(())
         }
 
-        fn snapshot_position_state(&self, _position: &Position) -> anyhow::Result<()> {
+        fn snapshot_position_state(
+            &self,
+            _position: &Position,
+            _ts_snapshot: UnixNanos,
+            _unrealized_pnl: Option<Money>,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
 

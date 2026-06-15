@@ -460,6 +460,23 @@ pub struct HostVTable {
         ctx: *const HostContext,
         command: *const QueryOrderHandle,
     ) -> PluginResult<()>,
+
+    /// Returns the calling actor or strategy trader ID as a JSON string.
+    pub trader_id: unsafe extern "C" fn(ctx: *const HostContext) -> PluginResult<OwnedBytes>,
+
+    /// Returns the calling strategy ID as a JSON string.
+    pub strategy_id: unsafe extern "C" fn(ctx: *const HostContext) -> PluginResult<OwnedBytes>,
+
+    /// Returns the calling actor or strategy component state discriminant.
+    pub component_state: unsafe extern "C" fn(ctx: *const HostContext) -> PluginResult<u8>,
+
+    /// Generates the next client order ID from the calling strategy's order factory.
+    pub generate_client_order_id:
+        unsafe extern "C" fn(ctx: *const HostContext) -> PluginResult<OwnedBytes>,
+
+    /// Generates the next order list ID from the calling strategy's order factory.
+    pub generate_order_list_id:
+        unsafe extern "C" fn(ctx: *const HostContext) -> PluginResult<OwnedBytes>,
 }
 
 impl HostVTable {
@@ -478,6 +495,7 @@ impl HostVTable {
     ///
     /// The vtable pointer must originate from the host's `nautilus_plugin_init`
     /// call and the host's library must still be live.
+    #[must_use]
     pub unsafe fn now_ns(&self) -> u64 {
         // SAFETY: caller upholds liveness of the host.
         unsafe { (self.clock_now_ns)() }
@@ -529,7 +547,7 @@ mod tests {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     unsafe extern "C" fn fixed_clock_now_ns() -> u64 {
@@ -704,6 +722,14 @@ mod tests {
         (ctx: *const HostContext, c: *const QueryOrderHandle)
     );
 
+    unsafe extern "C" fn stub_host_bytes(_ctx: *const HostContext) -> PluginResult<OwnedBytes> {
+        PluginResult::Ok(OwnedBytes::empty())
+    }
+
+    unsafe extern "C" fn stub_component_state(_ctx: *const HostContext) -> PluginResult<u8> {
+        PluginResult::Ok(0)
+    }
+
     fn build_test_host(abi: u32) -> HostVTable {
         HostVTable {
             abi_version: abi,
@@ -739,6 +765,11 @@ mod tests {
             close_all_positions: stub_close_all_positions,
             query_account: stub_query_account,
             query_order: stub_query_order,
+            trader_id: stub_host_bytes,
+            strategy_id: stub_host_bytes,
+            component_state: stub_component_state,
+            generate_client_order_id: stub_host_bytes,
+            generate_order_list_id: stub_host_bytes,
         }
     }
 

@@ -210,6 +210,7 @@ impl Trader {
     }
 
     /// Returns references to all component clocks for backtest time advancement.
+    #[must_use]
     pub fn get_component_clocks(&self) -> Vec<Rc<RefCell<dyn Clock>>> {
         self.clocks.values().cloned().collect()
     }
@@ -1027,20 +1028,20 @@ impl Trader {
         trader: &Rc<RefCell<Self>>,
         strategy_id: &StrategyId,
     ) -> anyhow::Result<()> {
-        let handler = trader.borrow().strategy_command_handler(strategy_id)?;
+        let handler = trader.borrow().strategy_command_handler(*strategy_id)?;
         handler.handle(&StrategyCommand::ExitMarket);
         Ok(())
     }
 
     fn strategy_command_handler(
         &self,
-        strategy_id: &StrategyId,
+        strategy_id: StrategyId,
     ) -> anyhow::Result<TypedHandler<StrategyCommand>> {
-        if !self.strategy_ids.contains(strategy_id) {
+        if !self.strategy_ids.contains(&strategy_id) {
             anyhow::bail!("Cannot market exit strategy, {strategy_id} not found");
         }
 
-        let endpoint = strategy_control_endpoint(*strategy_id);
+        let endpoint = strategy_control_endpoint(strategy_id);
         let handler = {
             let msgbus = get_message_bus();
             msgbus
@@ -1541,9 +1542,13 @@ mod tests {
         trader.add_strategy(strategy).unwrap();
 
         let mut registered = get_actor_unchecked::<TestStrategy>(&strategy_id.inner());
-        let order_factory = registered.core.order_factory();
-        let client_order_id = order_factory.generate_client_order_id();
-        let order_list_id = order_factory.generate_order_list_id();
+        let (client_order_id, order_list_id) = {
+            let mut order_factory = registered.core.order_factory();
+            (
+                order_factory.generate_client_order_id(),
+                order_factory.generate_order_list_id(),
+            )
+        };
 
         assert_eq!(trader.strategy_ids(), vec![strategy_id]);
         assert_eq!(registered.core().strategy_id(), Some(strategy_id));
@@ -1582,9 +1587,13 @@ mod tests {
         assert!(try_get_actor_unchecked::<TestStrategy>(&strategy_id.inner()).is_none());
 
         let mut registered = get_actor_unchecked::<TestStrategy>(&runtime_strategy_id.inner());
-        let order_factory = registered.core.order_factory();
-        let client_order_id = order_factory.generate_client_order_id();
-        let order_list_id = order_factory.generate_order_list_id();
+        let (client_order_id, order_list_id) = {
+            let mut order_factory = registered.core.order_factory();
+            (
+                order_factory.generate_client_order_id(),
+                order_factory.generate_order_list_id(),
+            )
+        };
 
         assert_eq!(trader.strategy_ids(), vec![runtime_strategy_id]);
         assert_eq!(registered.core().strategy_id(), Some(runtime_strategy_id));

@@ -32,7 +32,7 @@ VERBOSE ?= true
 # Set UV_SYNC_FLAGS= to make uv prune packages not in uv.lock
 UV_SYNC_FLAGS ?= --inexact
 
-PIP_AUDIT_IGNORE_FLAGS := --ignore-vuln GHSA-jg22-mg44-37j8 --ignore-vuln GHSA-hg6j-4rv6-33pg
+PIP_AUDIT_IGNORE_FLAGS :=
 
 # TARGET_DIR controls where cargo places build artifacts.
 # Can be overridden to use a separate directory: make build-debug TARGET_DIR=target-python
@@ -70,6 +70,47 @@ FAIL_FAST ?= false
 # CI should set NEXTEST_PROFILE=ci to limit parallelism on resource-constrained runners.
 NEXTEST_PROFILE ?= default
 
+# Local Rust concurrency defaults are capped by host CPU count so lower-spec
+# machines do not inherit settings meant for high-core workstations.
+# Override with CARGO_BUILD_JOBS or NEXTEST_TEST_THREADS when needed
+HOST_CPU_COUNT := $(shell \
+	n=`getconf _NPROCESSORS_ONLN 2>/dev/null` || n=; \
+	if [ -z "$$n" ]; then n=`sysctl -n hw.ncpu 2>/dev/null` || n=; fi; \
+	if [ -z "$$n" ]; then n="$${NUMBER_OF_PROCESSORS:-1}"; fi; \
+	n=`printf '%s' "$$n" | tr -cd '0-9'`; \
+	if [ -z "$$n" ]; then n=1; fi; \
+	printf '%s' "$$n")
+
+ifeq ($(CI),true)
+LOCAL_CARGO_BUILD_JOBS_DEFAULT :=
+LOCAL_NEXTEST_TEST_THREADS_DEFAULT :=
+else
+LOCAL_CARGO_BUILD_JOBS_DEFAULT := $(shell \
+	n='$(HOST_CPU_COUNT)'; \
+	[ "$$n" -gt 32 ] && n=32; \
+	printf '%s' "$$n")
+ifeq ($(NEXTEST_PROFILE),ci)
+LOCAL_NEXTEST_TEST_THREADS_DEFAULT :=
+else
+LOCAL_NEXTEST_TEST_THREADS_DEFAULT := $(shell \
+	n='$(HOST_CPU_COUNT)'; \
+	[ "$$n" -gt 64 ] && n=64; \
+	printf '%s' "$$n")
+endif
+endif
+
+ifeq ($(origin CARGO_BUILD_JOBS),undefined)
+CARGO_BUILD_JOBS_FOR_RUST := $(LOCAL_CARGO_BUILD_JOBS_DEFAULT)
+else
+CARGO_BUILD_JOBS_FOR_RUST := $(CARGO_BUILD_JOBS)
+endif
+
+ifeq ($(origin NEXTEST_TEST_THREADS),undefined)
+NEXTEST_TEST_THREADS_FOR_RUST := $(LOCAL_NEXTEST_TEST_THREADS_DEFAULT)
+else
+NEXTEST_TEST_THREADS_FOR_RUST := $(NEXTEST_TEST_THREADS)
+endif
+
 # CARGO_CI_PROFILE selects the Cargo compile profile used by nextest.
 CARGO_CI_PROFILE ?= nextest
 
@@ -106,6 +147,36 @@ ifneq ($(strip $(EXTRA_FEATURES)),)
 CARGO_FEATURES := $(BASE_FEATURES),$(EXTRA_FEATURES)
 else
 CARGO_FEATURES := $(BASE_FEATURES)
+endif
+
+CARGO_BUILD_JOB_TARGETS := install install-debug build build-debug \
+	build-debug-pyo3 build-wheel build-wheel-debug build-dry-run check-code \
+	check-all-targets clippy clippy-fix clippy-fix-nightly clippy-pedantic-crate-% \
+	docs docs-rust docsrs-check cargo-build cargo-check check-features cargo-test \
+	cargo-test-extras cargo-test-core-local cargo-test-core cargo-test-adapters \
+	cargo-test-sim cargo-test-plugin-cdylib-smoke cargo-test-core-debug \
+	cargo-test-core-local-debug cargo-test-lib cargo-test-standard-precision \
+	cargo-test-debug cargo-test-coverage cargo-test-crate-% \
+	cargo-test-coverage-crate-% cargo-test-coverage-html \
+	cargo-test-coverage-crate-html-% cargo-miri-core cargo-miri-model \
+	cargo-miri-plugin cargo-miri cargo-ci-benches build-debug-v2 py-stubs-v2 \
+	install-cli
+
+NEXTEST_ENV_TARGETS := cargo-test cargo-test-extras cargo-test-core-local \
+	cargo-test-core cargo-test-adapters cargo-test-sim \
+	cargo-test-plugin-cdylib-smoke cargo-test-core-debug \
+	cargo-test-core-local-debug cargo-test-lib cargo-test-standard-precision \
+	cargo-test-debug cargo-test-coverage cargo-test-crate-% \
+	cargo-test-coverage-crate-% cargo-test-coverage-html \
+	cargo-test-coverage-crate-html-% cargo-miri-core cargo-miri-model \
+	cargo-miri-plugin cargo-miri
+
+ifneq ($(strip $(CARGO_BUILD_JOBS_FOR_RUST)),)
+$(CARGO_BUILD_JOB_TARGETS): export CARGO_BUILD_JOBS=$(CARGO_BUILD_JOBS_FOR_RUST)
+endif
+
+ifneq ($(strip $(NEXTEST_TEST_THREADS_FOR_RUST)),)
+$(NEXTEST_ENV_TARGETS): export NEXTEST_TEST_THREADS=$(NEXTEST_TEST_THREADS_FOR_RUST)
 endif
 
 # Core crates (excludes adapters/*, nautilus-pyo3, nautilus-cli)
@@ -233,7 +304,7 @@ ib-stop:  #-- Stop local TWS/IBC processes and Docker IB Gateway containers
 
 .PHONY: clean-builds
 clean-builds:  #-- Clean distribution and target directories
-	$Q rm -rf dist target target-v2 2>/dev/null || true
+	$Q rm -rf dist target target-v2 crates/pyo3/target-v2 2>/dev/null || true
 
 .PHONY: clean-build-artifacts
 clean-build-artifacts:  #-- Clean compiled artifacts (.so, .dll, .pyc, .c files)
@@ -272,7 +343,7 @@ distclean: clean  #-- Nuclear clean - remove all untracked files (requires FORCE
 .PHONY: format
 format:  #-- Format Rust (with nightly) and Python code
 	cargo +nightly fmt
-	uv run --active --no-sync ruff format .
+	uv run --active --no-sync ruff format . --force-exclude
 
 .PHONY: pre-commit
 pre-commit:  #-- Run all pre-commit hooks on all files
@@ -284,7 +355,7 @@ pre-commit:  #-- Run all pre-commit hooks on all files
 check-code:  #-- Run clippy on lib/test targets and ruff --fix (use HYPERSYNC=true to include hypersync feature)
 	$(info $(M) Running code quality checks...)
 	@cargo clippy --workspace --lib --tests --features "$(CARGO_FEATURES)" --profile nextest -- -D warnings
-	@uv run --active --no-sync ruff check . --fix
+	@uv run --active --no-sync ruff check . --fix --force-exclude
 	@printf "$(GREEN)Checks passed$(RESET)\n"
 
 .PHONY: check-all-targets
@@ -329,7 +400,7 @@ pre-flight:  #-- Run pre-flight checks (format, check-code, cargo-test, build-de
 
 .PHONY: ruff
 ruff:  #-- Run ruff linter with automatic fixes
-	uv run --active --no-sync ruff check . --fix
+	uv run --active --no-sync ruff check . --fix --force-exclude
 
 .PHONY: clippy
 clippy:  #-- Run clippy linter (check only, workspace lints)
@@ -421,9 +492,7 @@ security-audit: check-audit-installed check-deny-installed check-vet-installed c
 	@$(call audit_step,cargo vet,cargo vet --locked)
 	@$(call audit_step,cargo vet lighter fuzz,cargo vet --locked --manifest-path crates/adapters/lighter/fuzz/Cargo.toml --store-path .supply-chain)
 	@$(call audit_step,cargo vet derive fuzz,cargo vet --locked --manifest-path crates/adapters/derive/fuzz/Cargo.toml --store-path .supply-chain)
-	@# aiohttp 3.14.0 fixes these advisories, but remains inside uv's 3-day
-	@# exclude-newer window while aiohttp source builds are disabled.
-	@$(call audit_step,pip-audit,uv export --no-hashes --frozen | uv run --no-project --with pip-audit -- pip-audit --disable-pip --no-deps -r /dev/stdin $(PIP_AUDIT_IGNORE_FLAGS))
+	@$(call audit_step,pip-audit,uv export --frozen | sed '/^-e /d' | uv run --no-project --with pip-audit -- pip-audit --disable-pip --require-hashes -r /dev/stdin $(PIP_AUDIT_IGNORE_FLAGS))
 	@$(call audit_step,osv-scanner,osv-scanner --config=osv-scanner.toml --lockfile=Cargo.lock --lockfile=crates/adapters/lighter/fuzz/Cargo.lock --lockfile=crates/adapters/derive/fuzz/Cargo.lock --lockfile=uv.lock --lockfile=python/uv.lock)
 
 .PHONY: cargo-deny
@@ -973,7 +1042,7 @@ docker-push:  #-- Push Docker image to registry
 
 .PHONY: docker-build-jupyter
 docker-build-jupyter:  #-- Build JupyterLab Docker image
-	docker build --build-arg GIT_TAG=$(GIT_TAG) -f .docker/jupyterlab.dockerfile --platform linux/x86_64 -t $(IMAGE):jupyter .
+	docker build -f .docker/jupyterlab.dockerfile --platform linux/x86_64 -t $(IMAGE):jupyter .
 
 .PHONY: docker-push-jupyter
 docker-push-jupyter:  #-- Push JupyterLab Docker image to registry

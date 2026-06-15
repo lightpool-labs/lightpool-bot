@@ -263,6 +263,19 @@ jobs:
       - name: Verify immutable CI inputs (post-checkout)
         run: bash scripts/ci/verify-ci-inputs.sh post-checkout
 
+      # Fork-PR runners keep the workspace on the small root fs; bind the target
+      # dir to the larger /mnt disk (path stays workspace-relative for rust-cache).
+      - name: Back Cargo target with /mnt ephemeral disk (fork PRs)
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork
+        run: |
+          target="${{ github.workspace }}/target/build-linux-x86"
+          backing="/mnt/cargo-target/build-linux-x86"
+          sudo mkdir -p "$backing"
+          sudo chown "$(id -u):$(id -g)" "$backing"
+          mkdir -p "$target"
+          sudo mount --bind "$backing" "$target"
+          df -h / /mnt
+
       - name: Common setup
         uses: ./.github/actions/common-setup
         with:
@@ -315,7 +328,7 @@ jobs:
         run: |
           rm -rf "${CARGO_TARGET_DIR}/nextest"
           rm -rf "${CARGO_TARGET_DIR}/${CARGO_CI_PROFILE:-nextest}"
-          df -h .
+          df -h . "${CARGO_TARGET_DIR}"
 
       # Temporary: fail fast on rare runner worktree corruption while we isolate the root cause
       - name: Verify immutable CI inputs (pre-wheel build)
@@ -653,13 +666,8 @@ jobs:
       PARALLEL_BUILD: false
       RUST_BACKTRACE: 1
     steps:
-      # https://github.com/step-security/harden-runner
-      - uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
-        with:
-          egress-policy: ${{ env.EGRESS_POLICY }}
-          allowed-endpoints: >-
-            ${{ vars.COMMON_ALLOWED_ENDPOINTS }}
-            ${{ vars.CI_ALLOWED_ENDPOINTS }}
+      # Harden-Runner skips its agent on Depot Windows,
+      # and its post step assumes C:\agent exists. Keep this job out until upstream fixes cleanup.
 
       - name: Checkout repository
         # https://github.com/actions/checkout
@@ -730,7 +738,6 @@ jobs:
           allowed-endpoints: >-
             ${{ vars.COMMON_ALLOWED_ENDPOINTS }}
             ${{ vars.CI_ALLOWED_ENDPOINTS }}
-            # Sigstore TUF trust root (for gh attestation verify)
             tuf-repo-cdn.sigstore.dev:443
             ${{ secrets.CLOUDFLARE_R2_ALLOWED_HOST }}:443
 
@@ -755,23 +762,16 @@ jobs:
 
       # https://github.com/actions/attest-build-provenance
       - name: Attest wheel provenance
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: ./.github/actions/attest-build-provenance-retry
         with:
           subject-path: "dist/nautilus_trader-*.whl"
 
       - name: Verify wheel attestations
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          IDENTITY: ${{ github.server_url }}/${{ github.workflow_ref }}
-          ISSUER: https://token.actions.githubusercontent.com
-        run: |
-          set -e
-          for whl in dist/nautilus_trader-*.whl; do
-            gh attestation verify "$whl" \
-              --repo "$GITHUB_REPOSITORY" \
-              --cert-identity "$IDENTITY" \
-              --cert-oidc-issuer "$ISSUER"
-          done
+          ATTESTATION_IDENTITY: ${{ github.server_url }}/${{ github.workflow_ref }}
+          ATTESTATION_ISSUER: https://token.actions.githubusercontent.com
+        run: bash ./scripts/ci/verify-gh-attestations.bash dist/nautilus_trader-*.whl
 
       - name: Publish wheels to Cloudflare R2
         uses: ./.github/actions/publish-wheels
@@ -879,7 +879,6 @@ jobs:
           allowed-endpoints: >-
             ${{ vars.COMMON_ALLOWED_ENDPOINTS }}
             ${{ vars.CI_ALLOWED_ENDPOINTS }}
-            # Sigstore TUF trust root (for gh attestation verify)
             tuf-repo-cdn.sigstore.dev:443
             ${{ secrets.CLOUDFLARE_R2_ALLOWED_HOST }}:443
 
@@ -898,23 +897,16 @@ jobs:
 
       # https://github.com/actions/attest-build-provenance
       - name: Attest wheel provenance
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: ./.github/actions/attest-build-provenance-retry
         with:
           subject-path: "dist/nautilus_trader-*.whl"
 
       - name: Verify wheel attestations
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          IDENTITY: ${{ github.server_url }}/${{ github.workflow_ref }}
-          ISSUER: https://token.actions.githubusercontent.com
-        run: |
-          set -e
-          for whl in dist/nautilus_trader-*.whl; do
-            gh attestation verify "$whl" \
-              --repo "$GITHUB_REPOSITORY" \
-              --cert-identity "$IDENTITY" \
-              --cert-oidc-issuer "$ISSUER"
-          done
+          ATTESTATION_IDENTITY: ${{ github.server_url }}/${{ github.workflow_ref }}
+          ATTESTATION_ISSUER: https://token.actions.githubusercontent.com
+        run: bash ./scripts/ci/verify-gh-attestations.bash dist/nautilus_trader-*.whl
 
       - name: Publish wheels to Cloudflare R2
         uses: ./.github/actions/publish-wheels
@@ -1062,7 +1054,6 @@ jobs:
           allowed-endpoints: >-
             ${{ vars.COMMON_ALLOWED_ENDPOINTS }}
             ${{ vars.CI_ALLOWED_ENDPOINTS }}
-            # Sigstore TUF trust root (for gh attestation verify)
             tuf-repo-cdn.sigstore.dev:443
             pypi.org:443
             files.pythonhosted.org:443
@@ -1094,30 +1085,21 @@ jobs:
           merge-multiple: true
 
       - name: Generate PyPI publish attestations
-        run: |
-          uv run --no-project --no-build --with "pypi-attestations==${PYPI_ATTESTATIONS_VERSION}" -- \
-            python -m pypi_attestations sign dist/nautilus_trader-*.whl
+        run: bash ./scripts/ci/sign-pypi-attestations.bash dist/nautilus_trader-*.whl
 
       # https://github.com/actions/attest-build-provenance
       - name: Attest wheel provenance
         id: attest-wheels
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: ./.github/actions/attest-build-provenance-retry
         with:
           subject-path: "dist/nautilus_trader-*.whl"
 
       - name: Verify wheel attestations
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          IDENTITY: ${{ github.server_url }}/${{ github.workflow_ref }}
-          ISSUER: https://token.actions.githubusercontent.com
-        run: |
-          set -e
-          for whl in dist/nautilus_trader-*.whl; do
-            gh attestation verify "$whl" \
-              --repo "$GITHUB_REPOSITORY" \
-              --cert-identity "$IDENTITY" \
-              --cert-oidc-issuer "$ISSUER"
-          done
+          ATTESTATION_IDENTITY: ${{ github.server_url }}/${{ github.workflow_ref }}
+          ATTESTATION_ISSUER: https://token.actions.githubusercontent.com
+        run: bash ./scripts/ci/verify-gh-attestations.bash dist/nautilus_trader-*.whl
 
       - name: Publish wheels to PyPI
         if: success()
@@ -1308,7 +1290,6 @@ jobs:
           allowed-endpoints: >-
             ${{ vars.COMMON_ALLOWED_ENDPOINTS }}
             ${{ vars.CI_ALLOWED_ENDPOINTS }}
-            # Sigstore TUF trust root (for gh attestation verify)
             tuf-repo-cdn.sigstore.dev:443
             pypi.org:443
             files.pythonhosted.org:443
@@ -1339,27 +1320,21 @@ jobs:
           path: dist
 
       - name: Generate PyPI publish attestation
-        run: |
-          uv run --no-project --no-build --with "pypi-attestations==${PYPI_ATTESTATIONS_VERSION}" -- \
-            python -m pypi_attestations sign dist/nautilus_trader-*.tar.gz
+        run: bash ./scripts/ci/sign-pypi-attestations.bash dist/nautilus_trader-*.tar.gz
 
       # https://github.com/actions/attest-build-provenance
       - name: Attest sdist provenance
         id: attest-sdist
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: ./.github/actions/attest-build-provenance-retry
         with:
           subject-path: "dist/nautilus_trader-*.tar.gz"
 
       - name: Verify sdist attestation
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          IDENTITY: ${{ github.server_url }}/${{ github.workflow_ref }}
-          ISSUER: https://token.actions.githubusercontent.com
-        run: |
-          gh attestation verify dist/nautilus_trader-*.tar.gz \
-            --repo "$GITHUB_REPOSITORY" \
-            --cert-identity "$IDENTITY" \
-            --cert-oidc-issuer "$ISSUER"
+          ATTESTATION_IDENTITY: ${{ github.server_url }}/${{ github.workflow_ref }}
+          ATTESTATION_ISSUER: https://token.actions.githubusercontent.com
+        run: bash ./scripts/ci/verify-gh-attestations.bash dist/nautilus_trader-*.tar.gz
 
       - name: Publish sdist to PyPI
         if: success()
@@ -1400,7 +1375,6 @@ jobs:
           allowed-endpoints: >-
             ${{ vars.COMMON_ALLOWED_ENDPOINTS }}
             ${{ vars.CI_ALLOWED_ENDPOINTS }}
-            # Sigstore TUF trust root (for pypi-attestations verify)
             tuf-repo-cdn.sigstore.dev:443
             pypi.org:443
             files.pythonhosted.org:443
@@ -1441,6 +1415,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PYPI_PUBLISHER_WORKFLOW: build.yml
           PYPI_PUBLISHER_ENVIRONMENT: release
+          CRATES_IO_MANUAL_PUBLISH_EXCEPTIONS: ${{ vars.CRATES_IO_MANUAL_PUBLISH_EXCEPTIONS }}
           CARGO_PUBLISH_USER_AGENT: >-
             nautilus-trader-release-verifier
             (${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
@@ -1502,6 +1477,9 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+
+      - name: Check Rekor readiness
+        run: bash ./scripts/ci/check-rekor-ready.bash
 
       - name: Publish GitHub release
         env:

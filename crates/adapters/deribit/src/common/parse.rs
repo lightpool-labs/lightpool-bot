@@ -25,12 +25,12 @@ use nautilus_core::{
 };
 use nautilus_model::{
     data::{Bar, BarType, BookOrder, TradeTick},
-    enums::{AccountType, AggressorSide, BookType, OptionKind, OrderSide},
+    enums::{AccountType, AggressorSide, BookType, InstrumentClass, OptionKind, OrderSide},
     events::AccountState,
     identifiers::{AccountId, InstrumentId, Symbol, TradeId},
     instruments::{
         CryptoFuture, CryptoFuturesSpread, CryptoOption, CryptoOptionSpread, CryptoPerpetual,
-        CurrencyPair, any::InstrumentAny,
+        CurrencyPair, Instrument, any::InstrumentAny,
     },
     orderbook::OrderBook,
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
@@ -234,6 +234,7 @@ fn parse_spot_instrument(
         Some(maker_fee),
         Some(taker_fee),
         None,
+        None,
         ts_event,
         ts_init,
     );
@@ -296,6 +297,7 @@ fn parse_perpetual_instrument(
         None, // margin_maint
         Some(maker_fee),
         Some(taker_fee),
+        None,
         None,
         ts_event,
         ts_init,
@@ -368,6 +370,7 @@ fn parse_future_instrument(
         None, // margin_maint
         Some(maker_fee),
         Some(taker_fee),
+        None,
         None,
         ts_event,
         ts_init,
@@ -454,6 +457,7 @@ fn parse_option_instrument(
         Some(maker_fee),
         Some(taker_fee),
         None,
+        None,
         ts_event,
         ts_init,
     );
@@ -495,6 +499,7 @@ fn parse_option_combo_instrument(
         Some(spread.maker_fee),
         Some(spread.taker_fee),
         None,
+        None,
         ts_event,
         ts_init,
     );
@@ -534,6 +539,7 @@ fn parse_future_combo_instrument(
         None,
         Some(spread.maker_fee),
         Some(spread.taker_fee),
+        None,
         None,
         ts_event,
         ts_init,
@@ -692,7 +698,7 @@ pub fn parse_account_state(
     // Ensure at least one balance exists (Nautilus requires non-empty balances)
     if balances.is_empty() {
         let zero_currency = Currency::USD();
-        let zero_money = Money::new(0.0, zero_currency);
+        let zero_money = Money::zero(zero_currency);
         let zero_balance = AccountBalance::new(zero_money, zero_money, zero_money);
         balances.push(zero_balance);
     }
@@ -860,10 +866,34 @@ pub fn parse_trade_tick(
     ))
 }
 
+/// Returns true when `Bar.volume` should be populated from the chart `cost` field (USD) instead
+/// of the `volume` field (base currency).
+///
+/// Deribit's `trades.{instrument}` channel reports each trade's `amount` in USD for inverse
+/// perpetuals and inverse futures, and in the underlying base currency for options and linear
+/// futures. To keep `Bar.volume` and `TradeTick.size` on a single unit per instrument, route
+/// inverse non-option products through `cost`. Options and option spreads stay on `volume` even
+/// when flagged `is_inverse`, because their trade `amount` is reported in base currency.
+///
+/// Reference: <https://docs.deribit.com/api-reference/market-data/public-get_last_trades_by_currency>
+#[must_use]
+pub fn use_cost_for_bar_volume(instrument: &InstrumentAny) -> bool {
+    if !instrument.is_inverse() {
+        return false;
+    }
+    !matches!(
+        instrument.instrument_class(),
+        InstrumentClass::Option | InstrumentClass::OptionSpread
+    )
+}
+
 /// Parses Deribit TradingView chart data into Nautilus [`Bar`]s.
 ///
 /// Converts OHLCV arrays from the `public/get_tradingview_chart_data` endpoint
 /// into a vector of [`Bar`] objects.
+///
+/// When `use_cost_for_volume` is true, `Bar.volume` is populated from `chart_data.cost` (USD)
+/// instead of `chart_data.volume` (base currency) — see [`use_cost_for_bar_volume`].
 ///
 /// # Errors
 ///
@@ -876,6 +906,7 @@ pub fn parse_bars(
     bar_type: BarType,
     price_precision: u8,
     size_precision: u8,
+    use_cost_for_volume: bool,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Vec<Bar>> {
     // Check status
@@ -894,7 +925,8 @@ pub fn parse_bars(
             && chart_data.high.len() == num_bars
             && chart_data.low.len() == num_bars
             && chart_data.close.len() == num_bars
-            && chart_data.volume.len() == num_bars,
+            && chart_data.volume.len() == num_bars
+            && chart_data.cost.len() == num_bars,
         "Inconsistent array lengths in chart data"
     );
 
@@ -913,7 +945,12 @@ pub fn parse_bars(
             .with_context(|| format!("Invalid low price at index {i}"))?;
         let close = Price::new_checked(chart_data.close[i], price_precision)
             .with_context(|| format!("Invalid close price at index {i}"))?;
-        let volume = Quantity::new_checked(chart_data.volume[i], size_precision)
+        let raw_volume = if use_cost_for_volume {
+            chart_data.cost[i]
+        } else {
+            chart_data.volume[i]
+        };
+        let volume = Quantity::new_checked(raw_volume, size_precision)
             .with_context(|| format!("Invalid volume at index {i}"))?;
 
         // Convert timestamp from milliseconds to nanoseconds
@@ -1402,7 +1439,56 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_bars() {
+    fn test_use_cost_for_bar_volume() {
+        // Inverse perpetual: BTC-PERPETUAL → cost (USD)
+        let perp_json = load_test_json("http_get_instrument.json");
+        let perp_response: DeribitJsonRpcResponse<DeribitInstrument> =
+            serde_json::from_str(&perp_json).unwrap();
+        let perp_inst = perp_response.result.expect("Test data must have result");
+        let perp =
+            parse_deribit_instrument_any(&perp_inst, UnixNanos::default(), UnixNanos::default())
+                .unwrap()
+                .expect("Should parse perpetual");
+        assert!(perp.is_inverse());
+        assert!(use_cost_for_bar_volume(&perp));
+
+        // BTC inverse option: is_inverse, but trade amount is in BTC, so stay on volume
+        let instruments_json = load_test_json("http_get_instruments.json");
+        let instruments_response: DeribitJsonRpcResponse<Vec<DeribitInstrument>> =
+            serde_json::from_str(&instruments_json).unwrap();
+        let instruments = instruments_response
+            .result
+            .expect("Test data must have result");
+
+        let option_inst = instruments
+            .iter()
+            .find(|i| i.instrument_name.as_str() == "BTC-27DEC24-100000-C")
+            .expect("Test data must contain BTC-27DEC24-100000-C");
+        let option =
+            parse_deribit_instrument_any(option_inst, UnixNanos::default(), UnixNanos::default())
+                .unwrap()
+                .expect("Should parse option");
+        assert!(option.is_inverse());
+        assert!(
+            !use_cost_for_bar_volume(&option),
+            "options report trade amount in base currency, must keep using volume",
+        );
+
+        // Inverse future: same convention as perp — cost (USD)
+        let future_inst = instruments
+            .iter()
+            .find(|i| i.instrument_name.as_str() == "BTC-27DEC24")
+            .expect("Test data must contain BTC-27DEC24");
+        let future =
+            parse_deribit_instrument_any(future_inst, UnixNanos::default(), UnixNanos::default())
+                .unwrap()
+                .expect("Should parse future");
+        assert!(future.is_inverse());
+        assert!(use_cost_for_bar_volume(&future));
+    }
+
+    #[rstest]
+    fn test_parse_bars_uses_volume_field() {
         let json_data = load_test_json("http_get_tradingview_chart_data.json");
         let response: DeribitJsonRpcResponse<DeribitTradingViewChartData> =
             serde_json::from_str(&json_data).unwrap();
@@ -1411,7 +1497,8 @@ mod tests {
         let bar_type = BarType::from("BTC-PERPETUAL.DERIBIT-1-MINUTE-LAST-EXTERNAL");
         let ts_init = UnixNanos::from(1766487086146245_u64 * NANOSECONDS_IN_MICROSECOND);
 
-        let bars = parse_bars(&chart_data, bar_type, 1, 8, ts_init).expect("Should parse bars");
+        let bars =
+            parse_bars(&chart_data, bar_type, 1, 8, false, ts_init).expect("Should parse bars");
 
         assert_eq!(bars.len(), 5, "Should parse 5 bars");
 
@@ -1440,6 +1527,24 @@ mod tests {
             last_bar.ts_event,
             UnixNanos::from(1766483700000_u64 * NANOSECONDS_IN_MILLISECOND)
         );
+    }
+
+    #[rstest]
+    fn test_parse_bars_cost_path() {
+        let json_data = load_test_json("http_get_tradingview_chart_data.json");
+        let response: DeribitJsonRpcResponse<DeribitTradingViewChartData> =
+            serde_json::from_str(&json_data).unwrap();
+        let chart_data = response.result.expect("Test data must have result");
+
+        let bar_type = BarType::from("BTC-PERPETUAL.DERIBIT-1-MINUTE-LAST-EXTERNAL");
+        let ts_init = UnixNanos::from(1766487086146245_u64 * NANOSECONDS_IN_MICROSECOND);
+
+        // Cost path picks `cost` (USD), matching trade `amount` on inverse perps/futures.
+        let bars =
+            parse_bars(&chart_data, bar_type, 1, 0, true, ts_init).expect("Should parse bars");
+        assert_eq!(bars.len(), 5);
+        assert_eq!(bars[0].volume, Quantity::from("257490"));
+        assert_eq!(bars[4].volume, Quantity::from("8910"));
     }
 
     #[rstest]

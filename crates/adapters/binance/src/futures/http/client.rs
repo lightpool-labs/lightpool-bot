@@ -24,7 +24,7 @@ use nautilus_core::{
     consts::NAUTILUS_USER_AGENT, datetime::SECONDS_IN_DAY, nanos::UnixNanos, time::AtomicTime,
 };
 use nautilus_model::{
-    data::{Bar, BarType, TradeTick},
+    data::{Bar, BarType, FundingRateUpdate, TradeTick},
     enums::{
         AggregationSource, AggressorSide, BarAggregation, MarketStatusAction, OrderSide, OrderType,
         TimeInForce,
@@ -39,6 +39,7 @@ use nautilus_network::{
     http::{HttpClient, HttpResponse, Method},
     ratelimiter::quota::Quota,
 };
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use ustr::Ustr;
 
@@ -66,25 +67,28 @@ use super::{
         BinanceTradesParams, BinanceUserTradesParams, ListenKeyParams,
     },
 };
-use crate::common::{
-    consts::{
-        BINANCE_API_KEY_HEADER, BINANCE_DAPI_PATH, BINANCE_DAPI_RATE_LIMITS, BINANCE_FAPI_PATH,
-        BINANCE_FAPI_RATE_LIMITS, BINANCE_NAUTILUS_FUTURES_BROKER_ID, BinanceRateLimitQuota,
+use crate::{
+    common::{
+        consts::{
+            BINANCE_API_KEY_HEADER, BINANCE_DAPI_PATH, BINANCE_DAPI_RATE_LIMITS, BINANCE_FAPI_PATH,
+            BINANCE_FAPI_RATE_LIMITS, BINANCE_NAUTILUS_FUTURES_BROKER_ID, BinanceRateLimitQuota,
+        },
+        credential::SigningCredential,
+        encoder::encode_broker_id,
+        enums::{
+            BinanceAlgoType, BinanceEnvironment, BinanceFuturesOrderType, BinancePositionSide,
+            BinancePriceMatch, BinanceProductType, BinanceRateLimitInterval, BinanceRateLimitType,
+            BinanceSide, BinanceTimeInForce, BinanceWorkingType,
+        },
+        models::BinanceErrorResponse,
+        parse::{
+            parse_coinm_instrument, parse_required_price_at_precision,
+            parse_required_quantity_at_precision, parse_usdm_instrument,
+        },
+        symbol::{format_binance_symbol, format_instrument_id},
+        urls::get_http_base_url,
     },
-    credential::SigningCredential,
-    encoder::encode_broker_id,
-    enums::{
-        BinanceAlgoType, BinanceEnvironment, BinanceFuturesOrderType, BinancePositionSide,
-        BinancePriceMatch, BinanceProductType, BinanceRateLimitInterval, BinanceRateLimitType,
-        BinanceSide, BinanceTimeInForce, BinanceWorkingType,
-    },
-    models::BinanceErrorResponse,
-    parse::{
-        parse_coinm_instrument, parse_required_price_at_precision,
-        parse_required_quantity_at_precision, parse_usdm_instrument,
-    },
-    symbol::{format_binance_symbol, format_instrument_id},
-    urls::get_http_base_url,
+    futures::conversions::reduce_only_param,
 };
 
 const BINANCE_GLOBAL_RATE_KEY: &str = "binance:global";
@@ -1748,7 +1752,7 @@ impl BinanceFuturesHttpClient {
             price: price_str,
             new_client_order_id: Some(client_id_str),
             stop_price: stop_price_str,
-            reduce_only: if reduce_only { Some(true) } else { None },
+            reduce_only: reduce_only_param(reduce_only, position_side),
             position_side,
             close_position: None,
             activation_price: None,
@@ -1833,11 +1837,7 @@ impl BinanceFuturesHttpClient {
         } else {
             trigger_price.map(|p| p.to_string())
         };
-        let reduce_only = if reduce_only && position_side.is_none() {
-            Some(true)
-        } else {
-            None
-        };
+        let reduce_only = reduce_only_param(reduce_only, position_side);
         let client_id_str = encode_broker_id(&client_order_id, BINANCE_NAUTILUS_FUTURES_BROKER_ID);
 
         // closePosition is mutually exclusive with quantity and reduceOnly
@@ -2476,6 +2476,40 @@ impl BinanceFuturesHttpClient {
 
         Ok(result)
     }
+
+    /// Requests historical funding rates for an instrument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or parsing fails.
+    pub async fn request_funding_rates(
+        &self,
+        instrument_id: InstrumentId,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: Option<u32>,
+    ) -> anyhow::Result<Vec<FundingRateUpdate>> {
+        let params = BinanceFundingRateParams {
+            symbol: Some(format_binance_symbol(&instrument_id)),
+            start_time: start.map(|dt| dt.timestamp_millis()),
+            end_time: end.map(|dt| dt.timestamp_millis()),
+            limit,
+        };
+
+        let rates = self.inner.funding_rate(&params).await?;
+        let ts_init = UnixNanos::default();
+
+        let mut result = Vec::with_capacity(rates.len());
+        for rate in rates {
+            result.push(parse_futures_funding_rate_update(
+                &rate,
+                instrument_id,
+                ts_init,
+            )?);
+        }
+
+        Ok(result)
+    }
 }
 
 fn parse_futures_trade_tick(
@@ -2530,6 +2564,26 @@ fn parse_futures_kline_bar(
 
     Ok(Bar::new(
         bar_type, open, high, low, close, volume, ts_event, ts_init,
+    ))
+}
+
+fn parse_futures_funding_rate_update(
+    rate: &BinanceFundingRate,
+    instrument_id: InstrumentId,
+    ts_init: UnixNanos,
+) -> anyhow::Result<FundingRateUpdate> {
+    let funding_rate = rate.funding_rate.parse::<Decimal>().map_err(|e| {
+        anyhow::anyhow!("invalid Futures funding rate at {}: {e}", rate.funding_time)
+    })?;
+    let ts_event = UnixNanos::from_millis(rate.funding_time as u64);
+
+    Ok(FundingRateUpdate::new(
+        instrument_id,
+        funding_rate,
+        None, // Funding interval is not provided by the history endpoint
+        None, // Next funding time is not provided by the history endpoint
+        ts_event,
+        ts_init,
     ))
 }
 

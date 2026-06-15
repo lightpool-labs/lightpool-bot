@@ -60,7 +60,7 @@ impl Debug for PluginControllerAdapter {
         f.debug_struct(stringify!(PluginControllerAdapter))
             .field("plugin_name", &self.plugin_name)
             .field("type_name", &self.type_name)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -110,7 +110,9 @@ impl PluginControllerAdapter {
         if handle.is_null() {
             // SAFETY: ctx came from leak_controller_host_context above.
             unsafe { drop_controller_host_context(ctx) };
-            anyhow::bail!("plug-in controller '{type_name}' returned a null handle from create");
+            anyhow::bail!(
+                "plug-in controller '{type_name}' returned a null handle from create (constructor failure or panic)"
+            );
         }
 
         Ok(Self {

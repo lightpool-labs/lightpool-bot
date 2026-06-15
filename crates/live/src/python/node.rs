@@ -15,7 +15,7 @@
 
 //! Python bindings for live node.
 
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc, str::FromStr};
 
 use nautilus_common::{
     actor::data_actor::ImportableActorConfig, cache::CacheConfig, enums::Environment,
@@ -27,7 +27,9 @@ use nautilus_core::{
     UUID4,
     python::{to_pyruntime_err, to_pyvalue_err},
 };
-use nautilus_model::identifiers::{ActorId, ComponentId, ExecAlgorithmId, StrategyId, TraderId};
+use nautilus_model::identifiers::{
+    ActorId, ComponentId, ExecAlgorithmId, InstrumentId, StrategyId, TraderId,
+};
 use nautilus_portfolio::config::PortfolioConfig;
 use nautilus_system::get_global_pyo3_registry;
 #[cfg(feature = "examples")]
@@ -47,7 +49,7 @@ use nautilus_trading::{
 };
 use pyo3::{
     prelude::*,
-    types::{PyDict, PyTuple},
+    types::{PyCFunction, PyDict, PyTuple},
 };
 use serde_json;
 
@@ -60,6 +62,12 @@ use crate::{
     node::LiveNode,
     python::config::coerce_json_config,
 };
+
+struct SendPtr<T>(*mut T);
+
+// SAFETY: `py_run` has exclusive access to `LiveNode` through `&mut self`.
+#[allow(unsafe_code)]
+unsafe impl<T> Send for SendPtr<T> {}
 
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 #[pymethods]
@@ -136,10 +144,8 @@ impl LiveNode {
 
         // Set up a custom signal handler that uses our handle
         let handle_for_signal = handle;
-        let signal_callback = pyo3::types::PyCFunction::new_closure(
+        let signal_callback = new_sync_py_callback(
             py,
-            None,
-            None,
             move |_args: &pyo3::Bound<'_, PyTuple>,
                   _kwargs: Option<&pyo3::Bound<'_, PyDict>>|
                   -> PyResult<()> {
@@ -153,8 +159,7 @@ impl LiveNode {
         signal_module.call_method1("signal", (2, signal_callback))?;
 
         // Run the node and restore signal handler afterward
-        let result =
-            { get_runtime().block_on(async { self.run().await.map_err(to_pyruntime_err) }) };
+        let result = run_live_node_detached(py, self);
 
         // Restore original signal handler
         signal_module.call_method1("signal", (2, original_handler))?;
@@ -404,6 +409,10 @@ impl LiveNode {
                     if let Some(val) = extract_bool_config_attr(config_obj, "log_commands") {
                         py_strategy_ref.set_log_commands(val);
                     }
+
+                    if let Some(claims) = extract_external_order_claims_config_attr(config_obj)? {
+                        py_strategy_ref.set_external_order_claims(Some(claims));
+                    }
                 }
 
                 py_strategy_ref.set_python_instance(python_strategy.clone().unbind());
@@ -472,22 +481,25 @@ impl LiveNode {
         })
         .map_err(to_pyruntime_err)?;
 
-        // TODO: Register external order claims with the execution manager
-        // once PyStrategy exposes external_order_claims publicly.
-        // Currently external_order_claims are only handled for Rust-native
-        // strategies via LiveNode::add_strategy<T>().
-        Python::attach(|py| {
+        let external_order_claims = Python::attach(|py| -> anyhow::Result<Option<Vec<_>>> {
             let py_strategy = python_strategy.bind(py);
-            if let Ok(claims) = py_strategy.getattr("external_order_claims")
-                && !claims.is_none()
-                && claims.len().unwrap_or(0) > 0
-            {
-                log::warn!(
-                    "Strategy '{strategy_id}' has external_order_claims configured, \
-                     but these are not yet supported for Python strategies on the Rust backend"
-                );
+            let py_strategy_ref = py_strategy
+                .extract::<PyRef<PyStrategy>>()
+                .map_err(Into::<PyErr>::into)
+                .map_err(|e| anyhow::anyhow!("Failed to extract PyStrategy: {e}"))?;
+
+            Ok(py_strategy_ref.external_order_claims())
+        })
+        .map_err(to_pyruntime_err)?;
+
+        if let Some(claims) = external_order_claims.filter(|claims| !claims.is_empty()) {
+            for instrument_id in &claims {
+                self.exec_manager_mut()
+                    .claim_external_orders(*instrument_id, strategy_id)
+                    .map_err(to_pyruntime_err)?;
             }
-        });
+            log::info!("Registered external order claims for {strategy_id}: {claims:?}");
+        }
 
         self.kernel_mut()
             .trader
@@ -720,6 +732,29 @@ impl LiveNode {
             self.is_running()
         )
     }
+}
+
+fn new_sync_py_callback<F>(py: Python<'_>, closure: F) -> PyResult<Bound<'_, PyCFunction>>
+where
+    F: Fn(&Bound<'_, PyTuple>, Option<&Bound<'_, PyDict>>) -> PyResult<()> + Send + Sync + 'static,
+{
+    PyCFunction::new_closure(py, None, None, closure)
+}
+
+#[allow(unsafe_code)]
+fn run_live_node_detached(py: Python<'_>, node: &mut LiveNode) -> PyResult<()> {
+    let node_ptr = SendPtr(std::ptr::from_mut::<LiveNode>(node));
+
+    // SAFETY: `py_run` holds the only mutable reference to `LiveNode` until
+    // `run()` returns, and the detached closure completes before `py_run` can
+    // access `node` again.
+    unsafe {
+        py.detach(move || {
+            let ptr = node_ptr;
+            get_runtime().block_on(async { (*ptr.0).run().await })
+        })
+    }
+    .map_err(to_pyruntime_err)
 }
 
 #[cfg(feature = "examples")]
@@ -1216,9 +1251,7 @@ fn create_config_instance<'py>(
     let py_dict = PyDict::new(py);
 
     for (key, value) in config {
-        let json_str = serde_json::to_string(value)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize config value: {e}"))?;
-        let py_value = PyModule::import(py, "json")?.call_method("loads", (json_str,), None)?;
+        let py_value = config_value_to_py(py, key, value)?;
         py_dict.set_item(key, py_value)?;
     }
 
@@ -1237,14 +1270,7 @@ fn create_config_instance<'py>(
                 Ok(instance) => {
                     log::debug!("Created default config instance, setting attributes");
                     for (key, value) in config {
-                        let json_str = serde_json::to_string(value).map_err(|e| {
-                            anyhow::anyhow!("Failed to serialize config value: {e}")
-                        })?;
-                        let py_value = PyModule::import(py, "json")?.call_method(
-                            "loads",
-                            (json_str,),
-                            None,
-                        )?;
+                        let py_value = config_value_to_py(py, key, value)?;
 
                         if let Err(setattr_err) = instance.setattr(key, py_value) {
                             log::warn!("Failed to set attribute {key}: {setattr_err}");
@@ -1274,6 +1300,26 @@ fn create_config_instance<'py>(
     Ok(Some(config_instance))
 }
 
+fn config_value_to_py<'py>(
+    py: Python<'py>,
+    key: &str,
+    value: &serde_json::Value,
+) -> anyhow::Result<Bound<'py, PyAny>> {
+    if key == "actor_id"
+        && let Some(actor_id) = value.as_str()
+    {
+        return Ok(ActorId::new_checked(actor_id)?
+            .into_pyobject(py)?
+            .into_any());
+    }
+
+    let json_str = serde_json::to_string(value)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize config value: {e}"))?;
+    Ok(PyModule::import(py, "json")?
+        .call_method("loads", (json_str,), None)?
+        .into_any())
+}
+
 /// Extracts an optional boolean attribute from a Python config object.
 ///
 /// Returns `None` if the attribute doesn't exist or isn't a bool,
@@ -1283,6 +1329,36 @@ fn extract_bool_config_attr(config_obj: &Bound<'_, PyAny>, attr: &str) -> Option
         .getattr(attr)
         .ok()
         .and_then(|val| val.extract::<bool>().ok())
+}
+
+fn extract_external_order_claims_config_attr(
+    config_obj: &Bound<'_, PyAny>,
+) -> anyhow::Result<Option<Vec<InstrumentId>>> {
+    let Ok(claims) = config_obj.getattr("external_order_claims") else {
+        return Ok(None);
+    };
+
+    if claims.is_none() {
+        return Ok(None);
+    }
+
+    if let Ok(claims) = claims.extract::<Vec<InstrumentId>>() {
+        return Ok(Some(claims));
+    }
+
+    let claim_strings = claims
+        .extract::<Vec<String>>()
+        .map_err(|e| anyhow::anyhow!("Invalid `external_order_claims` type: {e}"))?;
+    let claims = claim_strings
+        .into_iter()
+        .map(|claim| {
+            InstrumentId::from_str(&claim).map_err(|e| {
+                anyhow::anyhow!("Invalid `external_order_claims` instrument ID {claim}: {e}")
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    Ok(Some(claims))
 }
 
 #[cfg(all(test, feature = "python"))]
@@ -1297,8 +1373,10 @@ mod tests {
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc,
         },
-        time::Duration,
+        thread,
+        time::{Duration, Instant},
     };
 
     use async_trait::async_trait;
@@ -1318,7 +1396,7 @@ mod tests {
     use nautilus_core::UnixNanos;
     use nautilus_model::{
         data::{Bar, BarType},
-        identifiers::{ClientId, TraderId, Venue},
+        identifiers::{ClientId, InstrumentId, StrategyId, TraderId, Venue},
         types::{Price, Quantity},
     };
     use nautilus_trading::{ImportableStrategyConfig, python::strategy::PyStrategy};
@@ -1326,7 +1404,6 @@ mod tests {
         Python,
         types::{PyAnyMethods, PyDict, PyModule, PyModuleMethods},
     };
-    #[cfg(feature = "examples")]
     use rstest::rstest;
 
     use super::LiveNode;
@@ -1340,6 +1417,10 @@ mod tests {
     }
 
     #[derive(Debug)]
+    #[expect(
+        clippy::struct_field_names,
+        reason = "test counters intentionally share the count postfix"
+    )]
     struct TestHistoricalBarsDataClientFactory {
         request_count: Arc<AtomicUsize>,
         response_sent_count: Arc<AtomicUsize>,
@@ -1588,6 +1669,164 @@ class HistoricalBarsStrategy(Strategy):
         (on_start, on_historical_bars, historical_bar_count)
     }
 
+    fn install_timer_strategy_module(py: Python<'_>, module_name: &str) {
+        let module = PyModule::new(py, module_name).expect("test module should create");
+        module
+            .setattr("Strategy", py.get_type::<PyStrategy>())
+            .expect("Strategy type should bind");
+        module
+            .setattr("RESULTS", PyDict::new(py))
+            .expect("RESULTS should bind");
+
+        let code = CString::new(
+            r#"
+RESULTS["on_start"] = 0
+RESULTS["callback_timer_count"] = 0
+RESULTS["default_timer_count"] = 0
+RESULTS["callback_event_type"] = ""
+RESULTS["default_event_type"] = ""
+RESULTS["callback_event_name"] = ""
+RESULTS["default_event_name"] = ""
+
+class LiveTimerStrategy(Strategy):
+    def __init__(self):
+        super().__init__()
+
+    def on_start(self):
+        RESULTS["on_start"] += 1
+        self.clock.set_timer_ns(
+            "explicit_timer",
+            1_000_000,
+            callback=self._on_timer,
+            fire_immediately=True,
+        )
+        self.clock.set_timer_ns(
+            "default_timer",
+            1_000_000,
+            fire_immediately=True,
+        )
+
+    def on_stop(self):
+        pass
+
+    def _on_timer(self, event):
+        RESULTS["callback_timer_count"] += 1
+        RESULTS["callback_event_type"] = type(event).__name__
+        RESULTS["callback_event_name"] = event.name
+
+    def on_time_event(self, event):
+        RESULTS["default_timer_count"] += 1
+        RESULTS["default_event_type"] = type(event).__name__
+        RESULTS["default_event_name"] = event.name
+"#,
+        )
+        .expect("python test code should be valid CString");
+
+        py.run(code.as_c_str(), Some(&module.dict()), None)
+            .expect("test strategy code should execute");
+
+        let sys_modules = py
+            .import("sys")
+            .expect("sys should import")
+            .getattr("modules")
+            .expect("sys.modules should exist");
+        sys_modules
+            .set_item(module_name, module)
+            .expect("test strategy module should register");
+    }
+
+    fn install_claim_strategy_module(py: Python<'_>, module_name: &str) {
+        let module = PyModule::new(py, module_name).expect("test module should create");
+        module
+            .setattr("Strategy", py.get_type::<PyStrategy>())
+            .expect("Strategy type should bind");
+
+        let code = CString::new(
+            "
+class ClaimsConfig:
+    def __init__(self, strategy_id=None, external_order_claims=None):
+        self.strategy_id = strategy_id
+        self.external_order_claims = external_order_claims
+
+class ClaimsStrategy(Strategy):
+    def __init__(self, config):
+        super().__init__(config)
+",
+        )
+        .expect("python test code should be valid CString");
+
+        py.run(code.as_c_str(), Some(&module.dict()), None)
+            .expect("test strategy code should execute");
+
+        let sys_modules = py
+            .import("sys")
+            .expect("sys should import")
+            .getattr("modules")
+            .expect("sys.modules should exist");
+        sys_modules
+            .set_item(module_name, module)
+            .expect("test strategy module should register");
+    }
+
+    #[derive(Debug)]
+    struct TimerStrategyResults {
+        on_start: usize,
+        callback_timer_count: usize,
+        default_timer_count: usize,
+        callback_event_type: String,
+        default_event_type: String,
+        callback_event_name: String,
+        default_event_name: String,
+    }
+
+    fn get_timer_results(py: Python<'_>, module_name: &str) -> TimerStrategyResults {
+        let module = py
+            .import(module_name)
+            .expect("test strategy module should import");
+        let results_obj = module.getattr("RESULTS").expect("RESULTS should exist");
+        let results = results_obj
+            .cast::<PyDict>()
+            .expect("RESULTS should be a dict");
+
+        TimerStrategyResults {
+            on_start: results
+                .get_item("on_start")
+                .expect("on_start key should exist")
+                .extract::<usize>()
+                .expect("on_start should extract"),
+            callback_timer_count: results
+                .get_item("callback_timer_count")
+                .expect("callback_timer_count key should exist")
+                .extract::<usize>()
+                .expect("callback_timer_count should extract"),
+            default_timer_count: results
+                .get_item("default_timer_count")
+                .expect("default_timer_count key should exist")
+                .extract::<usize>()
+                .expect("default_timer_count should extract"),
+            callback_event_type: results
+                .get_item("callback_event_type")
+                .expect("callback_event_type key should exist")
+                .extract::<String>()
+                .expect("callback_event_type should extract"),
+            default_event_type: results
+                .get_item("default_event_type")
+                .expect("default_event_type key should exist")
+                .extract::<String>()
+                .expect("default_event_type should extract"),
+            callback_event_name: results
+                .get_item("callback_event_name")
+                .expect("callback_event_name key should exist")
+                .extract::<String>()
+                .expect("callback_event_name should extract"),
+            default_event_name: results
+                .get_item("default_event_name")
+                .expect("default_event_name key should exist")
+                .extract::<String>()
+                .expect("default_event_name should extract"),
+        }
+    }
+
     #[cfg(feature = "examples")]
     #[rstest]
     #[case("CompositeMarketMaker")]
@@ -1653,6 +1892,174 @@ class HistoricalBarsStrategy(Strategy):
 
             assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
         });
+    }
+
+    #[rstest]
+    fn test_run_live_node_detached_releases_gil() {
+        Python::initialize();
+
+        let mut node = LiveNode::builder(TraderId::from("TESTER-001"), Environment::Sandbox)
+            .unwrap()
+            .with_reconciliation(false)
+            .with_delay_post_stop_secs(0)
+            .with_timeout_connection(1)
+            .build()
+            .unwrap();
+
+        let handle = node.handle();
+        let (gil_tx, gil_rx) = mpsc::channel();
+        let acquired_before_stop = Arc::new(AtomicBool::new(false));
+        let acquired_before_stop_for_thread = acquired_before_stop.clone();
+
+        let stop_thread = thread::spawn(move || {
+            if gil_rx.recv_timeout(Duration::from_secs(1)).is_ok() {
+                acquired_before_stop_for_thread.store(true, Ordering::SeqCst);
+            }
+            handle.stop();
+        });
+
+        let gil_thread = thread::spawn(move || {
+            Python::attach(|_| {});
+            let _ = gil_tx.send(());
+        });
+
+        Python::attach(|py| {
+            super::run_live_node_detached(py, &mut node).expect("node should run cleanly");
+        });
+
+        stop_thread.join().expect("stop thread should join");
+        gil_thread.join().expect("GIL thread should join");
+
+        assert!(
+            acquired_before_stop.load(Ordering::SeqCst),
+            "worker thread should acquire the GIL while LiveNode::run is blocked"
+        );
+    }
+
+    #[rstest]
+    fn test_live_node_pystrategy_timer_callbacks_run_on_event_loop() {
+        Python::initialize();
+
+        let module_name = "test_live_node_timer_strategy";
+        Python::attach(|py| install_timer_strategy_module(py, module_name));
+
+        let mut node = LiveNode::builder(TraderId::from("TESTER-001"), Environment::Sandbox)
+            .unwrap()
+            .with_reconciliation(false)
+            .with_delay_post_stop_secs(0)
+            .with_timeout_connection(1)
+            .build()
+            .unwrap();
+
+        let importable = ImportableStrategyConfig {
+            strategy_path: format!("{module_name}:LiveTimerStrategy"),
+            config_path: String::new(),
+            config: HashMap::new(),
+        };
+
+        Python::attach(|py| {
+            node.py_add_strategy_from_config(py, importable)
+                .expect("strategy should register");
+        });
+
+        let handle = node.handle();
+        let stop_handle = handle.clone();
+        let watchdog_handle = handle;
+        let (done_tx, done_rx) = mpsc::channel();
+        let module_name_for_stop = module_name.to_string();
+
+        let stop_thread = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+
+            loop {
+                let fired = Python::attach(|py| {
+                    let results = get_timer_results(py, &module_name_for_stop);
+                    results.callback_timer_count > 0 && results.default_timer_count > 0
+                });
+
+                if fired || Instant::now() >= deadline {
+                    break;
+                }
+
+                thread::sleep(Duration::from_millis(20));
+            }
+
+            stop_handle.stop();
+        });
+
+        let watchdog_thread = thread::spawn(move || {
+            if done_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+                watchdog_handle.stop();
+            }
+        });
+
+        Python::attach(|py| {
+            super::run_live_node_detached(py, &mut node).expect("node should run cleanly");
+        });
+
+        let _ = done_tx.send(());
+        stop_thread.join().expect("stop thread should join");
+        watchdog_thread.join().expect("watchdog thread should join");
+
+        let results = Python::attach(|py| get_timer_results(py, module_name));
+
+        assert_eq!(results.on_start, 1);
+        assert!(results.callback_timer_count > 0);
+        assert!(results.default_timer_count > 0);
+        assert_eq!(results.callback_event_type, "TimeEvent");
+        assert_eq!(results.default_event_type, "TimeEvent");
+        assert_eq!(results.callback_event_name, "explicit_timer");
+        assert_eq!(results.default_event_name, "default_timer");
+    }
+
+    #[rstest]
+    fn test_add_strategy_from_config_registers_external_order_claims() {
+        Python::initialize();
+
+        let module_name = "test_live_node_claim_strategy";
+        Python::attach(|py| install_claim_strategy_module(py, module_name));
+
+        let mut node = LiveNode::builder(TraderId::from("TESTER-001"), Environment::Sandbox)
+            .unwrap()
+            .with_reconciliation(false)
+            .with_delay_post_stop_secs(0)
+            .with_timeout_connection(1)
+            .build()
+            .unwrap();
+
+        let instrument_id = InstrumentId::from("AUDUSD.SIM");
+        let strategy_id = StrategyId::from("CLAIMS-001");
+        let mut config = HashMap::new();
+        config.insert(
+            "strategy_id".to_string(),
+            serde_json::json!(strategy_id.to_string()),
+        );
+        config.insert(
+            "external_order_claims".to_string(),
+            serde_json::json!([instrument_id.to_string()]),
+        );
+        let importable = ImportableStrategyConfig {
+            strategy_path: format!("{module_name}:ClaimsStrategy"),
+            config_path: format!("{module_name}:ClaimsConfig"),
+            config,
+        };
+
+        Python::attach(|py| {
+            node.py_add_strategy_from_config(py, importable)
+                .expect("strategy should register");
+        });
+
+        let result = node
+            .exec_manager_mut()
+            .claim_external_orders(instrument_id, StrategyId::from("OTHER-001"));
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("already exists for CLAIMS-001")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

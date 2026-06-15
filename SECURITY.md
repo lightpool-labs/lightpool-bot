@@ -150,14 +150,18 @@ release lifecycle:
 
 ### Runtime cryptography
 
-- **Cryptography**: All TLS and cryptographic operations use
-  [aws-lc-rs](https://github.com/aws/aws-lc-rs), the Rust binding for AWS-LC. The library runs in
+- **Cryptography**: TLS and most runtime cryptography use
+  [aws-lc-rs](https://github.com/aws/aws-lc-rs), the Rust binding for AWS-LC. Ed25519 signing uses
+  [ed25519-dalek](https://github.com/dalek-cryptography/curve25519-dalek). AWS-LC runs in
   non-FIPS mode because the FIPS 140-3 module (`aws-lc-fips-sys`) requires the Go toolchain as a
-  build dependency. The underlying cryptographic primitives (AES-GCM, SHA-2, ECDSA,
-  ChaCha20-Poly1305) are identical in both modes; the FIPS module adds runtime self-tests and
-  module boundary enforcement required for federal certification.
+  build dependency. The AWS-LC primitives used here (AES-GCM, SHA-2, ECDSA, ChaCha20-Poly1305)
+  are identical in both modes; the FIPS module adds runtime self-tests and module boundary
+  enforcement required for federal certification.
 
 For our full supply chain security policy, see <https://nautilustrader.io/security/supply-chain/>.
+
+For the end-to-end release supply chain model, see
+[Release Security Architecture](docs/developer_guide/release_security.md).
 
 For detailed CI/CD security practices, see [.github/OVERVIEW.md](.github/OVERVIEW.md#security).
 
@@ -200,8 +204,10 @@ above; the cooldown can be bypassed when a CVE warrants immediate response.
 Python release artifacts and Docker images are signed or attested via Sigstore-backed workflows.
 Cargo crates are published through crates.io Trusted Publishing. The release verifier records
 whether each crate version was published by the current release commit or already existed from an
-earlier trusted-published commit in this repository. You can independently verify artifacts before
-installing them.
+earlier trusted-published commit in this repository. Emergency token-publish recovery requires an
+explicit `CRATES_IO_MANUAL_PUBLISH_EXCEPTIONS` `crate@version` entry, and the recovered crate
+version is recorded in `crates-manifest.json` with `release_status: "manual_token_publish"`. You
+can independently verify artifacts before installing them.
 
 ### Python wheels and sdist
 

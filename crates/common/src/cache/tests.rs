@@ -1176,6 +1176,7 @@ fn test_position_ids_filtering(mut cache: Cache) {
             None,
             None,
             None,
+            None,
             UnixNanos::default(),
             UnixNanos::default(),
         )
@@ -1878,6 +1879,7 @@ fn es_option_contract() -> OptionContract {
         None,
         None,
         None,
+        None,
         None::<nautilus_core::Params>,
         UnixNanos::default(),
         UnixNanos::default(),
@@ -2230,6 +2232,27 @@ fn test_price_when_some(mut cache: Cache, audusd_sim: CurrencyPair) {
     cache.add_mark_price(mark_price).unwrap();
     let result = cache.price(&audusd_sim.id, PriceType::Mark);
     assert_eq!(result, Some(mark_price.value));
+}
+
+#[rstest]
+fn test_price_mid_uses_exact_decimal_midpoint(mut cache: Cache, audusd_sim: CurrencyPair) {
+    let quote = QuoteTick::new(
+        audusd_sim.id,
+        Price::from("1.00000"),
+        Price::from("1.00003"),
+        Quantity::from(100_000),
+        Quantity::from(100_000),
+        UnixNanos::from(5),
+        UnixNanos::from(10),
+    );
+
+    cache.add_quote(quote).unwrap();
+
+    let result = cache.price(&audusd_sim.id, PriceType::Mid).unwrap();
+
+    assert_eq!(result, Price::from("1.000015"));
+    assert_eq!(result.as_decimal(), dec!(1.000015));
+    assert_eq!(result.precision, 6);
 }
 
 #[rstest]
@@ -5122,7 +5145,7 @@ impl CacheDatabaseAdapter for SnapshotBlobTestDatabase {
         Ok(AHashMap::new())
     }
 
-    fn load_index_order_position(&self) -> anyhow::Result<AHashMap<ClientOrderId, Position>> {
+    fn load_index_order_position(&self) -> anyhow::Result<AHashMap<ClientOrderId, PositionId>> {
         Ok(AHashMap::new())
     }
 
@@ -5315,11 +5338,19 @@ impl CacheDatabaseAdapter for SnapshotBlobTestDatabase {
         Ok(())
     }
 
-    fn update_actor(&self) -> anyhow::Result<()> {
+    fn update_actor(
+        &self,
+        _component_id: &ComponentId,
+        _state: &AHashMap<String, Bytes>,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
-    fn update_strategy(&self) -> anyhow::Result<()> {
+    fn update_strategy(
+        &self,
+        _strategy_id: &StrategyId,
+        _state: &AHashMap<String, Bytes>,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -5339,7 +5370,12 @@ impl CacheDatabaseAdapter for SnapshotBlobTestDatabase {
         Ok(())
     }
 
-    fn snapshot_position_state(&self, _position: &Position) -> anyhow::Result<()> {
+    fn snapshot_position_state(
+        &self,
+        _position: &Position,
+        _ts_snapshot: UnixNanos,
+        _unrealized_pnl: Option<Money>,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -6558,6 +6594,7 @@ fn test_position_filters_with_state_and_side(mut cache: Cache) {
             None,
             None,
             None,
+            None,
             UnixNanos::default(),
             UnixNanos::default(),
         )
@@ -6919,6 +6956,7 @@ fn test_positions_query_apis_are_consistent(mut cache: Cache) {
             4,
             Price::from("0.01"),
             Quantity::from("0.0001"),
+            None,
             None,
             None,
             None,

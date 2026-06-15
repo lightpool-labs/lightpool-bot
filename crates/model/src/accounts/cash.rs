@@ -211,7 +211,7 @@ impl Account for CashAccount {
     }
 
     fn calculated_account_state(&self) -> bool {
-        false // TODO (implement this logic)
+        self.calculate_account_state
     }
 
     fn balance_total(&self, currency: Option<Currency>) -> Option<Money> {
@@ -380,7 +380,10 @@ mod tests {
         enums::{AccountType, LiquiditySide, OrderSide, OrderType},
         events::{AccountState, account::stubs::*},
         identifiers::{AccountId, InstrumentId, position_id::PositionId, stubs::uuid4},
-        instruments::{CryptoPerpetual, CurrencyPair, Equity, Instrument, InstrumentAny, stubs::*},
+        instruments::{
+            CryptoFuture, CryptoPerpetual, CurrencyPair, Equity, Instrument, InstrumentAny,
+            stubs::*,
+        },
         orders::{builder::OrderTestBuilder, stubs::TestOrderEventStubs},
         position::Position,
         types::{AccountBalance, Currency, Money, Price, Quantity},
@@ -392,6 +395,14 @@ mod tests {
             format!("{cash_account}"),
             "CashAccount(id=SIM-001, type=CASH, base=USD)"
         );
+    }
+
+    #[rstest]
+    fn test_calculated_account_state_returns_field_value(cash_account_state: AccountState) {
+        assert!(
+            CashAccount::new(cash_account_state.clone(), true, false).calculated_account_state()
+        );
+        assert!(!CashAccount::new(cash_account_state, false, false).calculated_account_state());
     }
 
     #[rstest]
@@ -566,6 +577,44 @@ mod tests {
             )
             .unwrap();
         assert_eq!(balance_locked, Money::from("800000 USD"));
+    }
+
+    #[rstest]
+    fn test_calculate_balance_locked_buy_quanto_uses_quote_currency(
+        mut cash_account_million_usd: CashAccount,
+        ethbtc_quanto: CryptoFuture,
+    ) {
+        let balance_locked = cash_account_million_usd
+            .calculate_balance_locked(
+                &ethbtc_quanto.into_any(),
+                OrderSide::Buy,
+                Quantity::from("5"),
+                Price::from("0.036"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(balance_locked, Money::from("0.18 BTC"));
+    }
+
+    #[rstest]
+    #[case(false, Money::from("0.002 BTC"))]
+    #[case(true, Money::from("100 USD"))]
+    fn test_calculate_balance_locked_buy_inverse_respects_quote_flag(
+        #[case] use_quote_for_inverse: bool,
+        #[case] expected: Money,
+        mut cash_account_million_usd: CashAccount,
+        xbtusd_inverse_perp: CryptoPerpetual,
+    ) {
+        let balance_locked = cash_account_million_usd
+            .calculate_balance_locked(
+                &xbtusd_inverse_perp.into_any(),
+                OrderSide::Buy,
+                Quantity::from("100"),
+                Price::from("50000"),
+                Some(use_quote_for_inverse),
+            )
+            .unwrap();
+        assert_eq!(balance_locked, expected);
     }
 
     #[rstest]

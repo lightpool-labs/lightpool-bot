@@ -50,8 +50,7 @@
 //! the minimum enabled interval. Each dispatch the handler checks which
 //! sub-checks are due based on elapsed nanoseconds and schedules their work.
 //! Continuous checks do not await venue HTTP in the select loop: open-order
-//! checks poll a bulk venue report future from the loop, while position checks
-//! stay disabled until a non-blocking command path exists for them.
+//! and position checks poll bulk venue report futures from the loop.
 //!
 //! # Maintenance dispatcher
 //!
@@ -89,6 +88,7 @@ use std::{
     time::Duration,
 };
 
+use indexmap::IndexSet;
 use nautilus_common::{
     actor::{Actor, DataActor},
     cache::database::CacheDatabaseAdapter,
@@ -99,7 +99,7 @@ use nautilus_common::{
     messages::{
         DataEvent, ExecutionEvent, ExecutionReport,
         data::DataCommand,
-        execution::{GenerateOrderStatusReports, TradingCommand},
+        execution::{GenerateOrderStatusReports, GeneratePositionStatusReports, TradingCommand},
     },
     timer::TimeEventHandler,
 };
@@ -109,21 +109,21 @@ use nautilus_core::{
 };
 use nautilus_model::{
     events::OrderEventAny,
-    identifiers::{ClientOrderId, TraderId},
+    identifiers::{ClientOrderId, TraderId, Venue},
     orders::Order,
-    reports::OrderStatusReport,
+    reports::{OrderStatusReport, PositionStatusReport},
 };
 use nautilus_system::{config::NautilusKernelConfig, kernel::NautilusKernel};
 use nautilus_trading::{ExecutionAlgorithm, strategy::Strategy};
 use tabled::{Table, Tabled, settings::Style};
 
-#[cfg(feature = "plugin")]
-use crate::plugin::{NodePluginAdapter, NodePlugins, load_configured_plugin_batch};
 use crate::{
     builder::LiveNodeBuilder,
     config::{LiveNodeConfig, PluginConfig},
     execution::LiveExecutionClient,
-    manager::{ExecutionManager, ExecutionManagerConfig, OpenOrderReportCheck},
+    manager::{
+        ExecutionManager, ExecutionManagerConfig, OpenOrderReportCheck, PositionReportCheck,
+    },
     runner::{AsyncRunner, AsyncRunnerChannels},
 };
 
@@ -271,7 +271,7 @@ pub struct LiveNode {
     exec_clients: Vec<LiveExecutionClient>,
     shutdown_deadline: Option<dst::time::Instant>,
     #[cfg(feature = "plugin")]
-    plugins: NodePlugins,
+    plugins: crate::plugin::NodePlugins,
     #[cfg(feature = "python")]
     #[allow(dead_code)] // TODO: Under development
     python_actors: Vec<pyo3::Py<pyo3::PyAny>>,
@@ -298,7 +298,7 @@ impl LiveNode {
             exec_clients,
             shutdown_deadline: None,
             #[cfg(feature = "plugin")]
-            plugins: NodePlugins::default(),
+            plugins: crate::plugin::NodePlugins::default(),
             #[cfg(feature = "python")]
             python_actors: Vec::new(),
         }
@@ -371,7 +371,7 @@ impl LiveNode {
             exec_clients: Vec::new(),
             shutdown_deadline: None,
             #[cfg(feature = "plugin")]
-            plugins: NodePlugins::default(),
+            plugins: crate::plugin::NodePlugins::default(),
             #[cfg(feature = "python")]
             python_actors: Vec::new(),
         };
@@ -399,7 +399,9 @@ impl LiveNode {
             anyhow::bail!("Cannot load plug-ins after the node leaves Idle state");
         }
 
-        let (loader, adapters) = load_configured_plugin_batch(&configs)?.into_parts();
+        let (loader, adapters) =
+            crate::plugin::load_configured_plugin_batch(&configs)?.into_parts();
+
         for adapter in adapters {
             self.install_plugin_adapter(adapter)?;
         }
@@ -458,11 +460,14 @@ impl LiveNode {
     }
 
     #[cfg(feature = "plugin")]
-    fn install_plugin_adapter(&mut self, adapter: NodePluginAdapter) -> anyhow::Result<()> {
+    fn install_plugin_adapter(
+        &mut self,
+        adapter: crate::plugin::NodePluginAdapter,
+    ) -> anyhow::Result<()> {
         match adapter {
-            NodePluginAdapter::Actor(adapter) => self.add_actor(*adapter),
-            NodePluginAdapter::Strategy(adapter) => self.add_strategy(*adapter),
-            NodePluginAdapter::Controller(adapter) => {
+            crate::plugin::NodePluginAdapter::Actor(adapter) => self.add_actor(*adapter),
+            crate::plugin::NodePluginAdapter::Strategy(adapter) => self.add_strategy(*adapter),
+            crate::plugin::NodePluginAdapter::Controller(adapter) => {
                 self.plugins.push_controller(adapter);
                 Ok(())
             }
@@ -731,7 +736,7 @@ impl LiveNode {
             .config
             .exec_engine
             .reconciliation_lookback_mins
-            .map(|m| m as u64);
+            .map(u64::from);
 
         let timeout = self.config.timeout_reconciliation;
         let start = dst::time::Instant::now();
@@ -942,7 +947,7 @@ impl LiveNode {
             .or_else(|| self.startup_abort_reason())
         {
             self.abort_startup(reason).await?;
-            self.drain_channels(
+            Self::drain_channels(
                 &mut time_evt_rx,
                 &mut data_evt_rx,
                 &mut data_cmd_rx,
@@ -960,7 +965,7 @@ impl LiveNode {
             #[cfg(feature = "plugin")]
             if let Err(e) = self.plugins.start_controllers() {
                 let result = self.abort_after_trader_start_failure(e).await;
-                self.drain_channels(
+                Self::drain_channels(
                     &mut time_evt_rx,
                     &mut data_evt_rx,
                     &mut data_cmd_rx,
@@ -978,32 +983,41 @@ impl LiveNode {
 
         let exec_config = &self.config.exec_engine;
         let inflight_interval_ns =
-            (exec_config.inflight_check_interval_ms as u64) * NANOSECONDS_IN_MILLISECOND;
+            u64::from(exec_config.inflight_check_interval_ms) * NANOSECONDS_IN_MILLISECOND;
         let open_interval_ns = exec_config
             .open_check_interval_secs
             .filter(|&s| s > 0.0)
             .map_or(0, secs_to_nanos_unchecked);
-        let position_check_configured = exec_config
+        let position_interval_ns = exec_config
             .position_check_interval_secs
-            .is_some_and(|interval_secs| interval_secs > 0.0);
+            .filter(|&s| s > 0.0)
+            .map_or(0, secs_to_nanos_unchecked);
         let has_clients = !self
             .kernel
             .exec_engine
             .borrow()
             .get_all_clients()
             .is_empty();
-        let recon_enabled = has_clients && (inflight_interval_ns > 0 || open_interval_ns > 0);
+        let recon_enabled = has_clients
+            && (inflight_interval_ns > 0 || open_interval_ns > 0 || position_interval_ns > 0);
 
         let recon_min_interval = if recon_enabled {
             let mut intervals = Vec::new();
 
             if exec_config.inflight_check_interval_ms > 0 {
-                intervals.push(Duration::from_millis(
-                    exec_config.inflight_check_interval_ms as u64,
-                ));
+                intervals.push(Duration::from_millis(u64::from(
+                    exec_config.inflight_check_interval_ms,
+                )));
             }
 
             if let Some(s) = exec_config.open_check_interval_secs.filter(|&s| s > 0.0) {
+                intervals.push(Duration::from_secs_f64(s));
+            }
+
+            if let Some(s) = exec_config
+                .position_check_interval_secs
+                .filter(|&s| s > 0.0)
+            {
                 intervals.push(Duration::from_secs_f64(s));
             }
 
@@ -1029,10 +1043,11 @@ impl LiveNode {
 
         let mut ts_last_inflight = self.exec_manager.generate_timestamp_ns();
         let mut ts_last_open = ts_last_inflight;
+        let mut ts_last_position = ts_last_inflight;
 
         // Per-task `(interval, next_fire)` schedules dispatched by the
         // shared `maintenance_timer` below. See module docs for rationale.
-        let far_future = Duration::from_secs(86400 * 365 * 100);
+        let far_future = Duration::from_hours(24 * 365 * 100);
 
         let make_schedule = |opt_dur: Option<Duration>| -> (Duration, dst::time::Instant) {
             let dur = opt_dur.unwrap_or(far_future);
@@ -1049,21 +1064,21 @@ impl LiveNode {
             exec_config
                 .purge_closed_orders_interval_mins
                 .filter(|&m| m > 0)
-                .map(|m| Duration::from_secs(mins_to_secs(m as u64))),
+                .map(|m| Duration::from_secs(mins_to_secs(u64::from(m)))),
         );
 
         let (purge_positions_interval, mut purge_positions_next) = make_schedule(
             exec_config
                 .purge_closed_positions_interval_mins
                 .filter(|&m| m > 0)
-                .map(|m| Duration::from_secs(mins_to_secs(m as u64))),
+                .map(|m| Duration::from_secs(mins_to_secs(u64::from(m)))),
         );
 
         let (purge_account_interval, mut purge_account_next) = make_schedule(
             exec_config
                 .purge_account_events_interval_mins
                 .filter(|&m| m > 0)
-                .map(|m| Duration::from_secs(mins_to_secs(m as u64))),
+                .map(|m| Duration::from_secs(mins_to_secs(u64::from(m)))),
         );
 
         let (own_books_interval, mut own_books_next) = make_schedule(
@@ -1074,7 +1089,7 @@ impl LiveNode {
         );
 
         let (prune_fills_interval, mut prune_fills_next) =
-            make_schedule(Some(Duration::from_secs(60)));
+            make_schedule(Some(Duration::from_mins(1)));
 
         let mut maintenance_timer = dst::time::interval(Duration::from_millis(100));
         maintenance_timer.set_missed_tick_behavior(dst::time::MissedTickBehavior::Skip);
@@ -1089,15 +1104,9 @@ impl LiveNode {
         // Running phase: runs until shutdown deadline expires
         let mut residual_events = 0usize;
         let mut open_order_report_task: Option<OpenOrderReportTask> = None;
+        let mut position_report_task: Option<PositionReportTask> = None;
         let ctrl_c = dst::signal::ctrl_c();
         tokio::pin!(ctrl_c);
-
-        if has_clients && position_check_configured {
-            log::warn!(
-                "Skipping continuous position reconciliation: no non-blocking position \
-                 reconciliation path is configured"
-            );
-        }
 
         loop {
             let shutdown_deadline = self.shutdown_deadline;
@@ -1144,6 +1153,20 @@ impl LiveNode {
                         .reconcile_open_order_reports(&result.check, result.reports);
                     self.process_reconciliation_events(&events);
                 }
+                result = async {
+                    match position_report_task.as_mut() {
+                        Some(task) => task.future.as_mut().await,
+                        None => std::future::pending::<PositionReportResult>().await,
+                    }
+                }, if position_report_task.is_some() => {
+                    position_report_task = None;
+                    let events = self.exec_manager.reconcile_position_reports(
+                        &result.check,
+                        result.reports,
+                        &result.failed_venues,
+                    );
+                    self.process_reconciliation_events(&events);
+                }
 
                 // Maintenance dispatcher (before event processing to avoid
                 // starvation). See module docs for design rationale.
@@ -1152,13 +1175,16 @@ impl LiveNode {
 
                     if recon_enabled && now >= recon_next {
                         let recon_intervals = ReconciliationCheckIntervals {
-                            inflight_ns: inflight_interval_ns,
-                            open_ns: open_interval_ns,
+                            inflight: inflight_interval_ns,
+                            open: open_interval_ns,
+                            position: position_interval_ns,
                         };
                         let mut recon_state = ReconciliationCheckState {
                             ts_last_inflight: &mut ts_last_inflight,
                             ts_last_open: &mut ts_last_open,
+                            ts_last_position: &mut ts_last_position,
                             open_order_report_task: &mut open_order_report_task,
+                            position_report_task: &mut position_report_task,
                         };
 
                         self.run_reconciliation_checks(
@@ -1228,12 +1254,8 @@ impl LiveNode {
                                     );
                                     self.exec_manager.mark_fill_processed(fill.trade_id);
                                 }
-                                OrderEventAny::Accepted(_) => {
-                                    self.exec_manager.clear_recon_tracking(
-                                        &order_evt.client_order_id(), true,
-                                    );
-                                }
-                                OrderEventAny::Rejected(_)
+                                OrderEventAny::Accepted(_)
+                                | OrderEventAny::Rejected(_)
                                 | OrderEventAny::Canceled(_)
                                 | OrderEventAny::Expired(_)
                                 | OrderEventAny::Denied(_) => {
@@ -1339,12 +1361,13 @@ impl LiveNode {
         }
 
         drop(open_order_report_task.take());
+        drop(position_report_task.take());
         let _ = self.kernel.cache().borrow().check_residuals();
 
         self.finalize_stop().await?;
 
         // Handle events that arrived during finalize_stop
-        self.drain_channels(
+        Self::drain_channels(
             &mut time_evt_rx,
             &mut data_evt_rx,
             &mut data_cmd_rx,
@@ -1453,7 +1476,6 @@ impl LiveNode {
     }
 
     fn drain_channels(
-        &self,
         time_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TimeEventHandler>,
         data_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
         data_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
@@ -1649,14 +1671,14 @@ impl LiveNode {
             .borrow()
             .prepare_strategy_for_registration(&mut strategy)?;
         if let Some(claims) = strategy.external_order_claims() {
-            for instrument_id in claims {
+            for instrument_id in &claims {
                 self.exec_manager
-                    .claim_external_orders(instrument_id, strategy_id);
+                    .claim_external_orders(*instrument_id, strategy_id)?;
             }
             log_info!(
                 "Registered external order claims for {}: {:?}",
                 strategy_id,
-                strategy.external_order_claims(),
+                claims,
                 color = LogColor::Blue
             );
         }
@@ -1700,7 +1722,7 @@ impl LiveNode {
     ) {
         let ts_now = self.exec_manager.generate_timestamp_ns();
 
-        if reconciliation_check_due(ts_now, *state.ts_last_inflight, intervals.inflight_ns) {
+        if reconciliation_check_due(ts_now, *state.ts_last_inflight, intervals.inflight) {
             if self.state() == NodeState::ShuttingDown {
                 return;
             }
@@ -1712,17 +1734,49 @@ impl LiveNode {
             *state.ts_last_inflight = ts_now;
         }
 
-        if reconciliation_check_due(ts_now, *state.ts_last_open, intervals.open_ns) {
-            if self.state() == NodeState::ShuttingDown {
-                return;
-            }
+        let open_due = reconciliation_check_due(ts_now, *state.ts_last_open, intervals.open);
+        let position_due =
+            reconciliation_check_due(ts_now, *state.ts_last_position, intervals.position);
 
-            if state.open_order_report_task.is_none() {
-                *state.open_order_report_task = self.start_open_order_report_check();
-            } else {
+        if (open_due || position_due) && self.state() == NodeState::ShuttingDown {
+            return;
+        }
+
+        if state.open_order_report_task.is_some() {
+            if open_due {
                 log::debug!("Open-order reconciliation already in progress");
+                *state.ts_last_open = ts_now;
             }
 
+            if position_due {
+                log::debug!(
+                    "Position reconciliation delayed: open-order reconciliation in progress"
+                );
+            }
+
+            return;
+        }
+
+        if state.position_report_task.is_some() {
+            if position_due {
+                log::debug!("Position reconciliation already in progress");
+                *state.ts_last_position = ts_now;
+            }
+
+            if open_due {
+                log::debug!(
+                    "Open-order reconciliation delayed: position reconciliation in progress"
+                );
+            }
+
+            return;
+        }
+
+        if position_due && (!open_due || *state.ts_last_position < *state.ts_last_open) {
+            *state.position_report_task = self.start_position_report_check();
+            *state.ts_last_position = ts_now;
+        } else if open_due {
+            *state.open_order_report_task = self.start_open_order_report_check();
             *state.ts_last_open = ts_now;
         }
     }
@@ -1746,6 +1800,30 @@ impl LiveNode {
             }),
         })
     }
+
+    fn start_position_report_check(&self) -> Option<PositionReportTask> {
+        if self.exec_clients.is_empty() {
+            log::debug!("No execution clients to check positions consistency");
+            return None;
+        }
+
+        let check = self
+            .exec_manager
+            .prepare_position_report_check(UUID4::new());
+        let command = check.command.clone();
+        let clients = self.exec_clients.clone();
+
+        Some(PositionReportTask {
+            future: Box::pin(async move {
+                let result = request_position_reports(clients, command).await;
+                PositionReportResult {
+                    check,
+                    reports: result.reports,
+                    failed_venues: result.failed_venues,
+                }
+            }),
+        })
+    }
 }
 
 async fn request_open_order_reports(
@@ -1760,7 +1838,7 @@ async fn request_open_order_reports(
                 all_reports.extend(reports);
             }
             Err(e) => {
-                log::error!(
+                log::warn!(
                     "Failed to generate order status reports from {}: {e}",
                     client.client_id()
                 );
@@ -1769,6 +1847,35 @@ async fn request_open_order_reports(
     }
 
     all_reports
+}
+
+async fn request_position_reports(
+    clients: Vec<LiveExecutionClient>,
+    command: GeneratePositionStatusReports,
+) -> PositionReportQueryResult {
+    let mut all_reports = Vec::new();
+    let mut failed_venues = IndexSet::new();
+
+    for client in clients {
+        let venue = client.venue();
+        match client.generate_position_status_reports(&command).await {
+            Ok(reports) => {
+                all_reports.extend(reports);
+            }
+            Err(e) => {
+                failed_venues.insert(venue);
+                log::warn!(
+                    "Failed to generate position status reports from {}: {e}",
+                    client.client_id()
+                );
+            }
+        }
+    }
+
+    PositionReportQueryResult {
+        reports: all_reports,
+        failed_venues,
+    }
 }
 
 fn reconciliation_check_due(ts_now: UnixNanos, ts_last: UnixNanos, interval_ns: u64) -> bool {
@@ -1780,14 +1887,17 @@ fn reconciliation_check_due(ts_now: UnixNanos, ts_last: UnixNanos, interval_ns: 
 
 #[derive(Clone, Copy)]
 struct ReconciliationCheckIntervals {
-    inflight_ns: u64,
-    open_ns: u64,
+    inflight: u64,
+    open: u64,
+    position: u64,
 }
 
 struct ReconciliationCheckState<'a> {
     ts_last_inflight: &'a mut UnixNanos,
     ts_last_open: &'a mut UnixNanos,
+    ts_last_position: &'a mut UnixNanos,
     open_order_report_task: &'a mut Option<OpenOrderReportTask>,
+    position_report_task: &'a mut Option<PositionReportTask>,
 }
 
 type OpenOrderReportFuture = Pin<Box<dyn Future<Output = OpenOrderReportResult>>>;
@@ -1799,6 +1909,23 @@ struct OpenOrderReportTask {
 struct OpenOrderReportResult {
     check: OpenOrderReportCheck,
     reports: Vec<OrderStatusReport>,
+}
+
+type PositionReportFuture = Pin<Box<dyn Future<Output = PositionReportResult>>>;
+
+struct PositionReportTask {
+    future: PositionReportFuture,
+}
+
+struct PositionReportResult {
+    check: PositionReportCheck,
+    reports: Vec<PositionStatusReport>,
+    failed_venues: IndexSet<Venue>,
+}
+
+struct PositionReportQueryResult {
+    reports: Vec<PositionStatusReport>,
+    failed_venues: IndexSet<Venue>,
 }
 
 /// Flushes data events and commands from both `pending` and the channel receivers
@@ -2195,17 +2322,22 @@ mod tests {
 
         let mut ts_last_inflight = UnixNanos::default();
         let mut ts_last_open = UnixNanos::default();
+        let mut ts_last_position = UnixNanos::default();
         let mut open_order_report_task = None;
+        let mut position_report_task = None;
 
         node.run_reconciliation_checks(
             ReconciliationCheckIntervals {
-                inflight_ns: 0,
-                open_ns: 1,
+                inflight: 0,
+                open: 1,
+                position: 0,
             },
             &mut ReconciliationCheckState {
                 ts_last_inflight: &mut ts_last_inflight,
                 ts_last_open: &mut ts_last_open,
+                ts_last_position: &mut ts_last_position,
                 open_order_report_task: &mut open_order_report_task,
+                position_report_task: &mut position_report_task,
             },
         );
 
@@ -2213,6 +2345,7 @@ mod tests {
 
         assert!(commands.is_empty());
         assert!(open_order_report_task.is_none());
+        assert!(position_report_task.is_none());
 
         ExecutionEngine::register_msgbus_handlers(&node.kernel.exec_engine);
     }
@@ -2779,7 +2912,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_flush_all_pending_drains_all_channel_types() {
+    fn test_flush_all_pending_drains_buffered_channels() {
         let (time_tx, mut time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventHandler>();
         let (data_evt_tx, mut data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
         let (data_cmd_tx, mut data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();

@@ -92,7 +92,7 @@ impl Debug for PluginActorAdapter {
             .field("plugin_name", &self.plugin_name)
             .field("type_name", &self.type_name)
             .field("actor_id", &self.core.actor_id())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -145,7 +145,9 @@ impl PluginActorAdapter {
         if handle.is_null() {
             // SAFETY: ctx came from leak_host_context above.
             unsafe { drop_host_context(ctx) };
-            anyhow::bail!("plug-in actor '{type_name}' returned a null handle from create");
+            anyhow::bail!(
+                "plug-in actor '{type_name}' returned a null handle from create (constructor failure or panic)"
+            );
         }
 
         let core = DataActorCore::new(DataActorConfig {

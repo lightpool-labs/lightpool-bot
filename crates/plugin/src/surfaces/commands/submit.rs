@@ -76,9 +76,9 @@ impl SubmitOrderCommand {
 /// heap-owned (e.g. tag vectors, exec-algorithm params), so the plug-in
 /// wraps the whole command in this `#[repr(C)]` handle and passes a
 /// borrowed pointer to the host. Equivalent layout on both sides relies
-/// on operator-side pinning (plug-in cdylibs rebuilt to match each
-/// Nautilus version); `PluginBuildId` is recorded for load diagnostics,
-/// and precision mode is enforced during manifest validation.
+/// on toolchain pinning: the loader rejects mismatched `rustc_version` or
+/// `nautilus_plugin_version` by default, and precision mode is enforced
+/// during manifest validation.
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct SubmitOrderHandle(Box<SubmitOrderCommand>);
@@ -230,9 +230,10 @@ mod tests {
         let order_id = order.client_order_id();
         let handle = SubmitOrderHandle::new(SubmitOrderCommand::new(order, None, None, None));
         assert_eq!(handle.command().order.client_order_id(), order_id);
-        // Exercise the Deref impl explicitly so a regression in the Deref
+        // Exercise the Deref coercion so a regression in the Deref
         // target binding (e.g. returning a default) fails the test.
-        assert_eq!(Deref::deref(&handle).order.client_order_id(), order_id,);
+        let deref_command: &SubmitOrderCommand = &handle;
+        assert_eq!(deref_command.order.client_order_id(), order_id);
         let recovered = handle.into_inner();
         assert_eq!(recovered.order.client_order_id(), order_id);
     }
@@ -246,8 +247,9 @@ mod tests {
             None,
         ));
         assert_eq!(handle.command().orders.len(), 2);
-        // Exercise the Deref impl explicitly.
-        assert_eq!(Deref::deref(&handle).orders.len(), 2);
+        // Exercise the Deref coercion.
+        let deref_command: &SubmitOrderListCommand = &handle;
+        assert_eq!(deref_command.orders.len(), 2);
         let recovered = handle.into_inner();
         assert_eq!(recovered.orders.len(), 2);
         assert_eq!(
