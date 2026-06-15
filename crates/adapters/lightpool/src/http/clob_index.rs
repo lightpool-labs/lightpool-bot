@@ -77,7 +77,7 @@ impl ClobIndexHttpClient {
             .client
             .post(&url)
             .json(&super::models::BalancesRequest {
-                tokens: tokens.clone(),
+                tokens: tokens.to_vec(),
             })
             .send()
             .await?;

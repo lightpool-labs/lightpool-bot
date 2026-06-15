@@ -59,8 +59,10 @@ pub struct LiquidityMaker {
     pub(super) delta_batches: AHashMap<InstrumentId, u64>,
     /// Polymarket instrument id -> paired LightPool instrument id.
     pub(super) pm_to_lp: AHashMap<InstrumentId, InstrumentId>,
-    /// Set in `on_stop` so reconcile does not emit new orders during shutdown.
-    pub(super) shutdown_requested: bool,
+    /// Polymarket instrument ids with deltas in the current reconcile batch.
+    pub(super) pending_reconcile_pm_instruments: AHashSet<InstrumentId>,
+    /// Polymarket delta count in the current reconcile batch.
+    pub(super) pending_reconcile_delta_count: u64,
 }
 
 impl LiquidityMaker {
@@ -78,7 +80,36 @@ impl LiquidityMaker {
             subscribed_instruments: AHashSet::new(),
             delta_batches: AHashMap::new(),
             pm_to_lp: AHashMap::new(),
-            shutdown_requested: false,
+            pending_reconcile_pm_instruments: AHashSet::new(),
+            pending_reconcile_delta_count: 0,
+        }
+    }
+
+    fn collect_polymarket_delta_for_reconcile(&mut self, instrument_id: InstrumentId) {
+        if !self.config.trading_enabled {
+            return;
+        }
+        self.pending_reconcile_pm_instruments.insert(instrument_id);
+        self.pending_reconcile_delta_count += 1;
+        if self.pending_reconcile_delta_count >= self.config.reconcile_delta_batch_size {
+            self.reconcile_batched_polymarket_deltas();
+        }
+    }
+
+    fn reconcile_batched_polymarket_deltas(&mut self) {
+        if !self.config.trading_enabled {
+            self.pending_reconcile_pm_instruments.clear();
+            self.pending_reconcile_delta_count = 0;
+            return;
+        }
+        let instrument_ids: Vec<InstrumentId> = self.pending_reconcile_pm_instruments.drain().collect();
+        self.pending_reconcile_delta_count = 0;
+        for instrument_id in instrument_ids {
+            if let Err(e) = self.reconcile_from_polymarket_delta(instrument_id) {
+                log::warn!(
+                    "Failed to reconcile LightPool liquidity for {instrument_id}: {e:#}"
+                );
+            }
         }
     }
 
@@ -155,15 +186,6 @@ impl LiquidityMaker {
 
     }
 
-    fn maybe_reconcile_lightpool(&mut self, instrument_id: InstrumentId) {
-        if self.shutdown_requested || !self.config.trading_enabled || instrument_id.venue.as_str() != LIGHTPOOL_VENUE {
-            return;
-        }
-        if let Err(e) = self.reconcile_from_lightpool_order_event(instrument_id) {
-            log::warn!("Failed to reconcile after LightPool order event {instrument_id}: {e:#}");
-        }
-    }
-
     fn slug_for_condition(&self, condition_id: &str) -> Option<&str> {
         self.slug_to_conditions
             .iter()
@@ -182,65 +204,6 @@ impl LiquidityMaker {
             LIGHTPOOL_VENUE => "Lightpool",
             _ => "Unknown",
         }
-    }
-
-    fn log_cache_book(&self, instrument_id: InstrumentId, batch: u64) {
-        let venue_label = Self::venue_label(instrument_id);
-        let market_key = self
-            .instrument_to_market_key
-            .get(&instrument_id)
-            .map(String::as_str)
-            .unwrap_or("unknown");
-        let slug = if instrument_id.venue.as_str() == LIGHTPOOL_VENUE {
-            market_key
-        } else {
-            self.slug_for_condition(market_key)
-                .unwrap_or("unknown")
-        };
-
-        let snapshot = {
-            let cache = self.cache();
-            let Some(book) = cache.order_book(&instrument_id) else {
-                log::warn!(
-                    "cache.order_book() is None for venue={venue_label} slug={slug} \
-                     market_key={market_key} instrument_id={instrument_id} batch={batch}; \
-                     ensure managed_book=true"
-                );
-                return;
-            };
-            let depth = self.config.depth.max(1);
-            (
-                book.sequence,
-                book.update_count,
-                format_book_side(book, true, depth),
-                format_book_side(book, false, depth),
-            )
-        };
-
-        log::debug!(
-            "{venue_label} cache order book slug={slug} market_key={market_key} \
-             instrument_id={instrument_id} batch={batch} sequence={} update_count={} \
-             bids=[{}] asks=[{}]",
-            snapshot.0,
-            snapshot.1,
-            snapshot.2,
-            snapshot.3,
-        );
-    }
-
-    fn venue_logging_enabled(&self, instrument_id: InstrumentId) -> bool {
-        match instrument_id.venue.as_str() {
-            POLYMARKET_VENUE => self.config.log_polymarket,
-            LIGHTPOOL_VENUE => false,
-            _ => false,
-        }
-    }
-
-    fn should_log(&self, batch: u64) -> bool {
-        if batch == 1 {
-            return true;
-        }
-        self.config.log_interval > 0 && batch.is_multiple_of(self.config.log_interval)
     }
 
     fn warn_missing_lightpool_markets(&self) {
@@ -276,13 +239,13 @@ fn format_book_side(book: &OrderBook, bids: bool, depth: usize) -> String {
 }
 
 nautilus_strategy!(LiquidityMaker, {
-    fn on_order_accepted(&mut self, event: OrderAccepted) {
-        self.maybe_reconcile_lightpool(event.instrument_id);
-    }
+    // fn on_order_accepted(&mut self, event: OrderAccepted) {
+    //     self.maybe_reconcile_lightpool(event.instrument_id);
+    // }
 
-    fn on_order_updated(&mut self, event: OrderUpdated) {
-        self.maybe_reconcile_lightpool(event.instrument_id);
-    }
+    // fn on_order_updated(&mut self, event: OrderUpdated) {
+    //     self.maybe_reconcile_lightpool(event.instrument_id);
+    // }
 });
 
 impl Debug for LiquidityMaker {
@@ -319,35 +282,17 @@ impl DataActor for LiquidityMaker {
         self.warn_missing_lightpool_markets();
         if self.config.trading_enabled {
             log::info!(
-                "LightPool mirroring enabled depth={} client_id={}",
+                "LightPool mirroring enabled depth={} client_id={} reconcile_delta_batch_size={}",
                 self.config.depth,
                 self.config.lightpool_client_id,
-            );
-        }
-        Ok(())
-    }
-
-    fn on_instrument(&mut self, instrument: &InstrumentAny) -> anyhow::Result<()> {
-        let instrument_id = instrument.id();
-        let venue = instrument_id.venue.as_str();
-        if venue != POLYMARKET_VENUE && venue != LIGHTPOOL_VENUE {
-            return Ok(());
-        }
-        self.sync_markets_from_cache();
-        self.reconcile_subscriptions();
-        self.rebuild_instrument_pairs();
-        if venue == LIGHTPOOL_VENUE {
-            log::debug!(
-                "LightPool instrument loaded instrument_id={instrument_id} lightpool_markets={}",
-                self.lightpool_markets.len(),
+                self.config.reconcile_delta_batch_size,
             );
         }
         Ok(())
     }
 
     fn on_stop(&mut self) -> anyhow::Result<()> {
-        self.shutdown_requested = true;
-        log::info!("LiquidityMaker stopping; disabling LightPool order reconciliation");
+        log::info!("LiquidityMaker stopping; unsubscribing Polymarket book deltas");
         for instrument_id in self.subscribed_instruments.clone() {
             self.unsubscribe_book_deltas(instrument_id, None, None);
         }
@@ -355,48 +300,16 @@ impl DataActor for LiquidityMaker {
     }
 
     fn on_book_deltas(&mut self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
-        self.sync_markets_from_cache();
-        //self.reconcile_subscriptions();
-        //self.rebuild_instrument_pairs();
+        log::info!("OrderBookDeltas {:?}", deltas);
 
         let instrument_id = deltas.instrument_id;
         let venue = instrument_id.venue.as_str();
 
-        if venue == POLYMARKET_VENUE && self.config.trading_enabled && !self.shutdown_requested {
-            if let Err(e) = self.reconcile_from_polymarket_delta(instrument_id) {
-                log::warn!(
-                    "Failed to reconcile LightPool liquidity for {instrument_id}: {e:#}"
-                );
-            }
-        }
-
-        if !self.venue_logging_enabled(instrument_id) {
-            return Ok(());
-        }
-
-        let batch = {
-            let count = self
-                .delta_batches
-                .entry(instrument_id)
-                .and_modify(|count| *count = count.saturating_add(1))
-                .or_insert(1);
-            *count
-        };
-
-        if self.should_log(batch) {
-            self.log_cache_book(instrument_id, batch);
+        if venue == POLYMARKET_VENUE {
+            self.collect_polymarket_delta_for_reconcile(instrument_id);
         }
 
         Ok(())
     }
 
-    fn on_order_canceled(&mut self, event: &OrderCanceled) -> anyhow::Result<()> {
-        self.maybe_reconcile_lightpool(event.instrument_id);
-        Ok(())
-    }
-
-    fn on_order_filled(&mut self, event: &OrderFilled) -> anyhow::Result<()> {
-        self.maybe_reconcile_lightpool(event.instrument_id);
-        Ok(())
-    }
 }

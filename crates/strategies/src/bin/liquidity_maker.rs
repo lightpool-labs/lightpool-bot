@@ -72,6 +72,9 @@ struct Args {
     /// Disable LightPool order mirroring (data/logging only).
     #[arg(long, default_value_t = false)]
     no_trading: bool,
+    /// Number of Polymarket book deltas to batch before reconciling once.
+    #[arg(long, default_value_t = 10)]
+    reconcile_delta_batch_size: u64,
 }
 
 fn require_non_empty(name: &str, value: &str) -> Result<String> {
@@ -202,6 +205,7 @@ async fn main() -> Result<()> {
         .with_lightpool_enabled(lightpool_enabled)
         .with_log_polymarket(!args.no_polymarket_log)
         .with_trading_enabled(trading_enabled)
+        .with_reconcile_delta_batch_size(args.reconcile_delta_batch_size)
         .with_strategy_id(strategy_id);
 
     log::info!(

@@ -2317,6 +2317,21 @@ impl ExecutionEngine {
     fn handle_event(&mut self, event: &OrderEventAny) {
         self.event_count += 1;
 
+        if let OrderEventAny::Updated(updated) = event {
+            let cache_status = self
+                .cache
+                .borrow()
+                .order(&updated.client_order_id)
+                .map(|order| format!("{:?}", order.status()))
+                .unwrap_or_else(|| "NOT_IN_CACHE".into());
+            log::info!(
+                "[LP-TRACE] ⑤ exec_engine handle_event Updated client_order_id={} venue_order_id={:?} cache_status={}",
+                updated.client_order_id,
+                updated.venue_order_id,
+                cache_status,
+            );
+        }
+
         if self.config.debug {
             log::debug!("{RECV}{EVT} {event:?}");
         }
@@ -2440,8 +2455,37 @@ impl ExecutionEngine {
                 }
             }
             _ => {
-                if self.update_cached_order(client_order_id, &event).is_some() {
+                if let OrderEventAny::Updated(updated) = &event {
+                    log::info!(
+                        "[LP-TRACE] ⑥ exec_engine before update_cached_order Updated client_order_id={} venue_order_id={:?}",
+                        updated.client_order_id,
+                        updated.venue_order_id,
+                    );
+                }
+                if let Some(order) = self.update_cached_order(client_order_id, &event) {
+                    if let OrderEventAny::Updated(updated) = &event {
+                        log::info!(
+                            "[LP-TRACE] ⑥ exec_engine update_cached_order OK client_order_id={} venue_order_id={:?} qty={} status={:?} strategy_id={}",
+                            updated.client_order_id,
+                            updated.venue_order_id,
+                            updated.quantity,
+                            order.status(),
+                            updated.strategy_id,
+                        );
+                    }
                     self.publish_order_event(&event);
+                    if let OrderEventAny::Updated(updated) = &event {
+                        log::info!(
+                            "[LP-TRACE] ⑥ exec_engine publish_order_event OK strategy_id={}",
+                            updated.strategy_id,
+                        );
+                    }
+                } else if let OrderEventAny::Updated(updated) = &event {
+                    log::info!(
+                        "[LP-TRACE] ⑥ exec_engine update_cached_order FAILED client_order_id={} venue_order_id={:?} (see InvalidStateTrigger warn)",
+                        updated.client_order_id,
+                        updated.venue_order_id,
+                    );
                 }
             }
         }

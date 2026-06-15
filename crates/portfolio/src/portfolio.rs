@@ -2412,6 +2412,17 @@ fn update_order(
     log::debug!("Updated {event}");
 }
 
+fn order_event_id_for_account_republish(event: &OrderEventAny) -> UUID4 {
+    match event {
+        OrderEventAny::Accepted(e) => e.event_id,
+        OrderEventAny::Canceled(e) => e.event_id,
+        OrderEventAny::Expired(e) => e.event_id,
+        OrderEventAny::Rejected(e) => e.event_id,
+        OrderEventAny::Updated(e) => e.event_id,
+        _ => unreachable!("on_order_event only handles account-republish order events"),
+    }
+}
+
 fn on_order_event(
     cache: &Rc<RefCell<Cache>>,
     inner: &Rc<RefCell<PortfolioState>>,
@@ -2445,9 +2456,26 @@ fn on_order_event(
         .and_then(|account| account.last_event());
 
     if let Some(account_state) = account_state {
+        log::info!(
+            "[LP-TRACE] portfolio on_order_event republish trigger={:?} client_order_id={} venue_order_id={:?} order_event_id={} account_state_event_id={} is_reported={}",
+            event.event_type(),
+            event.client_order_id(),
+            event.venue_order_id(),
+            order_event_id_for_account_republish(event),
+            account_state.event_id,
+            account_state.is_reported,
+        );
         msgbus::publish_account_state(
             format!("events.account.{account_id}").into(),
             &account_state,
+        );
+    } else {
+        log::info!(
+            "[LP-TRACE] portfolio on_order_event no last_event trigger={:?} client_order_id={} venue_order_id={:?} order_event_id={}",
+            event.event_type(),
+            event.client_order_id(),
+            event.venue_order_id(),
+            order_event_id_for_account_republish(event),
         );
     }
 }
@@ -2582,6 +2610,14 @@ fn update_account(
             .is_some_and(|last_event| last_event.event_id == event.event_id)
     };
 
+    log::info!(
+        "[LP-TRACE] portfolio update_account entry account_id={} account_state_event_id={} is_reported={} already_applied={}",
+        event.account_id,
+        event.event_id,
+        event.is_reported,
+        already_applied,
+    );
+
     if !already_applied && let Err(e) = cache.borrow_mut().update_account_state(event) {
         log::error!("Failed to update account state: {e}");
         return;
@@ -2611,7 +2647,7 @@ fn update_account(
     };
 
     if should_log {
-        log::info!("Updated {event}");
+        log::info!("Xiaoyu1998 Updated {event}");
     }
 }
 

@@ -33,12 +33,14 @@ use crate::{
             decimal_to_raw_amount, format_token_amount, limit_price_string,
             probability_to_limit_price, tick_size_from_instrument_info,
         },
-        balances::fetch_account_balances,
+        balances::{
+            collect_balance_token_specs_from_cache, fetch_account_balances,
+        },
         currency::collateral_currency_code,
         signer::signer_from_private_key,
     },
     config::LightpoolExecClientConfig,
-    http::{clob_index::ClobIndexHttpClient, models::OrderQueryResponse},
+    http::{clob_index::ClobIndexHttpClient, models::{BalanceTokenSpec, OrderQueryResponse}},
 };
 
 #[derive(Debug, Clone)]
@@ -115,6 +117,10 @@ impl LightpoolExecutionClient {
         vec![AccountBalance::new(zero.clone(), zero.clone(), zero)]
     }
 
+    fn balance_token_specs_from_cache(&self) -> Vec<BalanceTokenSpec> {
+        collect_balance_token_specs_from_cache(&*self.core.cache())
+    }
+
     fn spawn_account_state_refresh(&self) {
         if self.is_stopped() {
             return;
@@ -128,7 +134,7 @@ impl LightpoolExecutionClient {
             private_key,
             self.clob_client.clone(),
             self.emitter.clone(),
-            self.core.cache(),
+            self.balance_token_specs_from_cache(),
             self.config.market_slugs.clone(),
             self.stopped.clone(),
         );
@@ -163,8 +169,6 @@ impl LightpoolExecutionClient {
         let client_order_id = order.client_order_id();
         let pending_submits = self.pending_submits.clone();
         let stopped = self.stopped.clone();
-        let refresh_cache = self.core.cache();
-        let refresh_market_slugs = self.config.market_slugs.clone();
 
         self.pending_submits
             .insert(client_order_id, SubmitOutcome::Pending);
@@ -204,14 +208,6 @@ impl LightpoolExecutionClient {
                         &order,
                         VenueOrderId::from(chain_order_id.as_str()),
                         ts_event,
-                    );
-                    spawn_account_balance_refresh(
-                        private_key.clone(),
-                        clob_client.clone(),
-                        emitter.clone(),
-                        refresh_cache,
-                        refresh_market_slugs.clone(),
-                        stopped.clone(),
                     );
                 }
                 Err(e) => {
@@ -466,9 +462,10 @@ impl ExecutionClient for LightpoolExecutionClient {
         if let Some(private_key) = self.private_key.as_deref() {
             if let Ok(signer) = signer_from_private_key(private_key) {
                 let address = signer.address().to_string();
+                let cache_specs = self.balance_token_specs_from_cache();
                 match fetch_account_balances(
                     &self.clob_client,
-                    &self.core.cache(),
+                    cache_specs,
                     &self.config.market_slugs,
                     &address,
                 )
@@ -578,8 +575,6 @@ impl ExecutionClient for LightpoolExecutionClient {
         let emitter = self.emitter.clone();
         let ts_event = self.ts_event();
         let stopped = self.stopped.clone();
-        let refresh_cache = self.core.cache();
-        let refresh_market_slugs = self.config.market_slugs.clone();
 
         get_runtime().spawn(async move {
             if stopped.load(Ordering::Acquire) {
@@ -607,14 +602,6 @@ impl ExecutionClient for LightpoolExecutionClient {
             {
                 Ok(()) => {
                     emitter.emit_order_canceled(&order, Some(venue_order_id), ts_event);
-                    spawn_account_balance_refresh(
-                        private_key.clone(),
-                        clob_client.clone(),
-                        emitter.clone(),
-                        refresh_cache,
-                        refresh_market_slugs.clone(),
-                        stopped.clone(),
-                    );
                 }
                 Err(e) => emitter.emit_order_cancel_rejected(
                     &order,
@@ -679,7 +666,7 @@ impl ExecutionClient for LightpoolExecutionClient {
             .as_str()
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid venue order id: {e}"))?;
-        log::debug!(
+        log::info!(
             "modify_order: start client_order_id={} venue_order_id={} instrument_id={} spot_market={} new_quantity={}",
             order.client_order_id(),
             venue_order_id,
@@ -691,8 +678,6 @@ impl ExecutionClient for LightpoolExecutionClient {
         let emitter = self.emitter.clone();
         let ts_event = self.ts_event();
         let stopped = self.stopped.clone();
-        let refresh_cache = self.core.cache();
-        let refresh_market_slugs = self.config.market_slugs.clone();
 
         get_runtime().spawn(async move {
             if stopped.load(Ordering::Acquire) {
@@ -733,7 +718,7 @@ impl ExecutionClient for LightpoolExecutionClient {
             .await
             {
                 Ok(digest) => {
-                    log::debug!(
+                    log::info!(
                         "modify_order: receipt received client_order_id={} venue_order_id={} chain_order_id={} digest={digest} new_quantity={}",
                         order.client_order_id(),
                         venue_order_id,
@@ -748,14 +733,6 @@ impl ExecutionClient for LightpoolExecutionClient {
                         None,
                         None,
                         ts_event,
-                    );
-                    spawn_account_balance_refresh(
-                        private_key.clone(),
-                        clob_client.clone(),
-                        emitter.clone(),
-                        refresh_cache,
-                        refresh_market_slugs.clone(),
-                        stopped.clone(),
                     );
                 }
                 Err(e) => {
@@ -983,7 +960,7 @@ fn spawn_account_balance_refresh(
     private_key: String,
     clob_client: ClobIndexHttpClient,
     emitter: ExecutionEventEmitter,
-    cache: nautilus_common::cache::CacheView,
+    cache_specs: Vec<BalanceTokenSpec>,
     market_slugs: Vec<String>,
     stopped: Arc<AtomicBool>,
 ) {
@@ -1001,14 +978,14 @@ fn spawn_account_balance_refresh(
         };
         let address = signer.address().to_string();
 
-        match fetch_account_balances(&clob_client, &cache, &market_slugs, &address).await {
+        match fetch_account_balances(&clob_client, cache_specs, &market_slugs, &address).await {
             Ok(balances) => {
                 let ts_event = get_atomic_clock_realtime().get_time_ns();
-                emitter.emit_account_state(balances, vec![], true, ts_event);
                 log::debug!(
                     "Lightpool account balances refreshed address={address} entries={}",
                     balances.len()
                 );
+                emitter.emit_account_state(balances, vec![], true, ts_event);
             }
             Err(e) => {
                 log::warn!(

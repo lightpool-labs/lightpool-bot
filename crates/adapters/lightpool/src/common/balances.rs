@@ -1,10 +1,10 @@
 use std::str::FromStr;
 
 use ahash::AHashSet;
-use nautilus_common::cache::CacheView;
+use nautilus_common::cache::Cache;
 use nautilus_core::Params;
 use nautilus_model::{
-    instruments::InstrumentAny,
+    instruments::{Instrument, InstrumentAny},
     types::{AccountBalance, Currency},
 };
 use rust_decimal::Decimal;
@@ -40,7 +40,11 @@ fn push_token_spec(
     }
 }
 
-fn push_market_token_specs(specs: &mut Vec<BalanceTokenSpec>, seen: &mut AHashSet<String>, market: &Market) {
+fn push_market_token_specs(
+    specs: &mut Vec<BalanceTokenSpec>,
+    seen: &mut AHashSet<String>,
+    market: &Market,
+) {
     let collateral_symbol = collateral_currency_code();
     push_token_spec(specs, seen, &collateral_symbol, &market.collateral_token);
     push_token_spec(specs, seen, "YES", &market.yes_token);
@@ -64,7 +68,8 @@ fn outcome_symbol_from_instrument(instrument: &InstrumentAny) -> String {
         }
     }
 
-    let symbol = instrument.id().symbol.as_str();
+    let instrument_id = instrument.id();
+    let symbol = instrument_id.symbol.as_str();
     if let Some(suffix) = symbol.rsplit('-').next() {
         let upper = suffix.to_ascii_uppercase();
         if upper == "YES" || upper == "NO" {
@@ -75,13 +80,12 @@ fn outcome_symbol_from_instrument(instrument: &InstrumentAny) -> String {
     "OUTCOME".to_string()
 }
 
-pub fn collect_balance_token_specs_from_cache(cache: &CacheView) -> Vec<BalanceTokenSpec> {
+pub fn collect_balance_token_specs_from_cache(cache: &Cache) -> Vec<BalanceTokenSpec> {
     let mut specs = Vec::new();
     let mut seen = AHashSet::new();
     let collateral_symbol = collateral_currency_code();
-    let cache_ref = cache.borrow();
 
-    for instrument in cache_ref.instruments(&*LIGHTPOOL_VENUE, None) {
+    for instrument in cache.instruments(&*LIGHTPOOL_VENUE, None) {
         let Some(info) = instrument_info(instrument) else {
             continue;
         };
@@ -99,12 +103,22 @@ pub fn collect_balance_token_specs_from_cache(cache: &CacheView) -> Vec<BalanceT
     specs
 }
 
-pub async fn balance_token_specs_for_refresh(
+fn apply_default_collateral_spec(specs: &mut Vec<BalanceTokenSpec>) {
+    if !specs.is_empty() {
+        return;
+    }
+    let collateral_symbol = collateral_currency_code();
+    let address = resolve_collateral_token();
+    let mut seen = AHashSet::new();
+    push_token_spec(specs, &mut seen, &collateral_symbol, &address);
+}
+
+pub async fn resolve_balance_token_specs(
     clob_client: &ClobIndexHttpClient,
-    cache: &CacheView,
+    cache_specs: Vec<BalanceTokenSpec>,
     market_slugs: &[String],
 ) -> anyhow::Result<Vec<BalanceTokenSpec>> {
-    let mut specs = collect_balance_token_specs_from_cache(cache);
+    let mut specs = cache_specs;
     if specs.is_empty() && !market_slugs.is_empty() {
         let markets = clob_client.fetch_markets_by_slugs(market_slugs).await?;
         let mut seen: AHashSet<String> = specs
@@ -116,13 +130,7 @@ pub async fn balance_token_specs_for_refresh(
         }
     }
 
-    if specs.is_empty() {
-        let collateral_symbol = collateral_currency_code();
-        let address = resolve_collateral_token();
-        let mut seen = AHashSet::new();
-        push_token_spec(&mut specs, &mut seen, &collateral_symbol, &address);
-    }
-
+    apply_default_collateral_spec(&mut specs);
     Ok(specs)
 }
 
@@ -160,11 +168,11 @@ pub fn parse_balance_entries(entries: &[BalanceEntry]) -> anyhow::Result<Vec<Acc
 
 pub async fn fetch_account_balances(
     clob_client: &ClobIndexHttpClient,
-    cache: &CacheView,
+    cache_specs: Vec<BalanceTokenSpec>,
     market_slugs: &[String],
     user_address: &str,
 ) -> anyhow::Result<Vec<AccountBalance>> {
-    let specs = balance_token_specs_for_refresh(clob_client, cache, market_slugs).await?;
+    let specs = resolve_balance_token_specs(clob_client, cache_specs, market_slugs).await?;
     if specs.is_empty() {
         anyhow::bail!("no token addresses available for balance refresh");
     }

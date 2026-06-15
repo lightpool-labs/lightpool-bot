@@ -642,6 +642,16 @@ fn log_cmd_send(command: &TradingCommand) {
     } else {
         log::info!("{CMD}{SEND} {command}");
     }
+
+    if let TradingCommand::ModifyOrder(cmd) = command {
+        log::info!(
+            "[LP-TRACE] CMD ModifyOrder client_order_id={} venue_order_id={:?} qty={:?} instrument_id={}",
+            cmd.client_order_id,
+            cmd.venue_order_id,
+            cmd.quantity,
+            cmd.instrument_id,
+        );
+    }
 }
 
 #[inline(always)]
