@@ -2708,7 +2708,7 @@ fn update_account(
     };
 
     if should_log {
-        log::info!("Xiaoyu1998 Updated {event}");
+        log::info!("Updated {event}");
     }
 }
 
