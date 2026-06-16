@@ -110,6 +110,7 @@ use nautilus_core::{
 use nautilus_model::{
     events::OrderEventAny,
     identifiers::{ClientOrderId, TraderId, Venue},
+    instruments::Instrument,
     orders::Order,
     reports::{OrderStatusReport, PositionStatusReport},
 };
@@ -1235,28 +1236,7 @@ impl LiveNode {
                     // }
                 }
                 Some(evt) = exec_evt_rx.recv() => {
-                    // if is_shutting_down {
-                    //     log::debug!("Residual exec event: {evt:?}");
-                    //     residual_events += 1;
-                    // }
-                    log::info!(
-                        "[LP-TRACE] xiaoyu2  start exec_evt_rx"
-                    );
-
                     let mut close_ids: Vec<ClientOrderId> = Vec::new();
-
-                    let trace_updated = if let ExecutionEvent::Order(OrderEventAny::Updated(updated)) =
-                        &evt
-                    {
-                        Some((updated.client_order_id, updated.venue_order_id))
-                    } else {
-                        None
-                    };
-                    if let Some((client_order_id, venue_order_id)) = trace_updated {
-                        log::info!(
-                            "[LP-TRACE] ③ node exec_evt_rx Updated client_order_id={client_order_id} venue_order_id={venue_order_id:?}",
-                        );
-                    }
 
                     match &evt {
                         ExecutionEvent::Order(order_evt) => {
@@ -1321,12 +1301,6 @@ impl LiveNode {
 
                     AsyncRunner::handle_exec_event(evt);
 
-                    if let Some((client_order_id, venue_order_id)) = trace_updated {
-                        log::info!(
-                            "[LP-TRACE] ③ node after handle_exec_event Updated client_order_id={client_order_id} venue_order_id={venue_order_id:?}",
-                        );
-                    }
-
                     // Post-dispatch: clear tracking when order closes
                     for coid in &close_ids {
                         let is_closed = self.kernel.cache().borrow()
@@ -1337,11 +1311,6 @@ impl LiveNode {
                     }
                 }
                 Some(cmd) = exec_cmd_rx.recv() => {
-                    // if is_shutting_down {
-                    //     log::debug!("Residual exec command: {cmd:?}");
-                    //     residual_events += 1;
-                    // }
-
                     match &cmd {
                         TradingCommand::SubmitOrder(submit) => {
                             self.exec_manager.register_inflight(submit.client_order_id);
@@ -1362,17 +1331,9 @@ impl LiveNode {
                     AsyncRunner::handle_exec_command(cmd);
                 }
                 Some(evt) = data_evt_rx.recv() => {
-                    // if is_shutting_down {
-                    //     log::debug!("Residual data event: {evt:?}");
-                    //     residual_events += 1;
-                    // }
                     AsyncRunner::handle_data_event(evt);
                 }
                 Some(cmd) = data_cmd_rx.recv() => {
-                    // if is_shutting_down {
-                    //     log::debug!("Residual data command: {cmd:?}");
-                    //     residual_events += 1;
-                    // }
                     AsyncRunner::handle_data_command(cmd);
                 }
             }

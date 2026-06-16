@@ -1,10 +1,4 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-
 use async_trait::async_trait;
-use dashmap::DashMap;
 use lightpool_sdk::{
     spot_events::extract_order_id_from_events, ActionBuilder, CancelOrderParams,
     OrderParamsType, OrderSide, PlaceOrderParams, Signer, TimeInForce, TransactionBuilder,
@@ -43,21 +37,12 @@ use crate::{
     http::{clob_index::ClobIndexHttpClient, models::{BalanceTokenSpec, OrderQueryResponse}},
 };
 
-#[derive(Debug, Clone)]
-enum SubmitOutcome {
-    Pending,
-    Accepted { chain_order_id: String },
-    Denied { reason: String },
-}
-
 pub struct LightpoolExecutionClient {
     core: ExecutionClientCore,
     emitter: ExecutionEventEmitter,
     config: LightpoolExecClientConfig,
     clob_client: ClobIndexHttpClient,
     private_key: Option<String>,
-    pending_submits: Arc<DashMap<ClientOrderId, SubmitOutcome>>,
-    stopped: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for LightpoolExecutionClient {
@@ -67,7 +52,6 @@ impl std::fmt::Debug for LightpoolExecutionClient {
             .field("emitter", &self.emitter)
             .field("config", &self.config)
             .field("has_private_key", &self.private_key.is_some())
-            .field("stopped", &self.stopped.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -98,13 +82,7 @@ impl LightpoolExecutionClient {
             config,
             clob_client,
             private_key,
-            pending_submits: Arc::new(DashMap::new()),
-            stopped: Arc::new(AtomicBool::new(false)),
         })
-    }
-
-    fn is_stopped(&self) -> bool {
-        self.stopped.load(Ordering::Acquire)
     }
 
     fn ts_event(&self) -> UnixNanos {
@@ -122,9 +100,6 @@ impl LightpoolExecutionClient {
     }
 
     fn spawn_account_state_refresh(&self) {
-        if self.is_stopped() {
-            return;
-        }
 
         let Some(private_key) = self.private_key.clone() else {
             return;
@@ -136,17 +111,10 @@ impl LightpoolExecutionClient {
             self.emitter.clone(),
             self.balance_token_specs_from_cache(),
             self.config.market_slugs.clone(),
-            self.stopped.clone(),
         );
     }
 
     fn submit_limit_order(&self, order: OrderAny) {
-        if self.is_stopped() {
-            self.emitter
-                .emit_order_denied(&order, "Lightpool execution client stopped");
-            return;
-        }
-
         let Some(private_key) = self.private_key.clone() else {
             self.emitter
                 .emit_order_denied(&order, "LIGHTPOOL_PRIVATE_KEY not configured");
@@ -166,24 +134,14 @@ impl LightpoolExecutionClient {
         let emitter = self.emitter.clone();
         let clob_client = self.clob_client.clone();
         let ts_event = self.ts_event();
-        let client_order_id = order.client_order_id();
-        let pending_submits = self.pending_submits.clone();
-        let stopped = self.stopped.clone();
 
-        self.pending_submits
-            .insert(client_order_id, SubmitOutcome::Pending);
         self.emitter.emit_order_submitted(&order);
 
         get_runtime().spawn(async move {
-            if stopped.load(Ordering::Acquire) {
-                emitter.emit_order_denied(&order, "Lightpool execution client stopped");
-                return;
-            }
             let signer = match signer_from_private_key(&private_key) {
                 Ok(signer) => signer,
                 Err(e) => {
                     let reason = format!("invalid signer: {e:#}");
-                    pending_submits.insert(client_order_id, SubmitOutcome::Denied { reason: reason.clone() });
                     emitter.emit_order_denied(&order, &reason);
                     return;
                 }
@@ -198,12 +156,6 @@ impl LightpoolExecutionClient {
             .await
             {
                 Ok(chain_order_id) => {
-                    pending_submits.insert(
-                        client_order_id,
-                        SubmitOutcome::Accepted {
-                            chain_order_id: chain_order_id.clone(),
-                        },
-                    );
                     emitter.emit_order_accepted(
                         &order,
                         VenueOrderId::from(chain_order_id.as_str()),
@@ -211,12 +163,7 @@ impl LightpoolExecutionClient {
                     );
                 }
                 Err(e) => {
-                    let reason = e.to_string();
-                    pending_submits.insert(
-                        client_order_id,
-                        SubmitOutcome::Denied { reason: reason.clone() },
-                    );
-                    emitter.emit_order_denied(&order, &reason);
+                    emitter.emit_order_denied(&order, &e.to_string());
                 }
             }
         });
@@ -429,11 +376,6 @@ impl ExecutionClient for LightpoolExecutionClient {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
-        if self.stopped.swap(true, Ordering::AcqRel) {
-            return Ok(());
-        }
-        log::info!("Lightpool execution client stopped; rejecting new execution commands");
-        self.core.set_stopped();
         self.core.set_disconnected();
         Ok(())
     }
@@ -506,17 +448,6 @@ impl ExecutionClient for LightpoolExecutionClient {
     }
 
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
-        if self.is_stopped() {
-            let order = self
-                .core
-                .cache()
-                .order(&cmd.client_order_id)
-                .ok_or_else(|| anyhow::anyhow!("order not found: {}", cmd.client_order_id))?
-                .clone();
-            self.emitter
-                .emit_order_denied(&order, "Lightpool execution client stopped");
-            return Ok(());
-        }
 
         let order = self
             .core
@@ -546,16 +477,6 @@ impl ExecutionClient for LightpoolExecutionClient {
             .venue_order_id()
             .ok_or_else(|| anyhow::anyhow!("order has no venue order id"))?;
 
-        if self.is_stopped() {
-            self.emitter.emit_order_cancel_rejected(
-                &order,
-                Some(venue_order_id),
-                "Lightpool execution client stopped",
-                self.ts_event(),
-            );
-            return Ok(());
-        }
-
         let private_key = self
             .private_key
             .clone()
@@ -574,18 +495,8 @@ impl ExecutionClient for LightpoolExecutionClient {
         let clob_client = self.clob_client.clone();
         let emitter = self.emitter.clone();
         let ts_event = self.ts_event();
-        let stopped = self.stopped.clone();
 
         get_runtime().spawn(async move {
-            if stopped.load(Ordering::Acquire) {
-                emitter.emit_order_cancel_rejected(
-                    &order,
-                    Some(venue_order_id),
-                    "Lightpool execution client stopped",
-                    ts_event,
-                );
-                return;
-            }
             let signer = match signer_from_private_key(&private_key) {
                 Ok(signer) => signer,
                 Err(e) => {
@@ -622,16 +533,6 @@ impl ExecutionClient for LightpoolExecutionClient {
             .ok_or_else(|| anyhow::anyhow!("order not found: {}", cmd.client_order_id))?
             .clone();
 
-        if self.is_stopped() {
-            self.emitter.emit_order_modify_rejected(
-                &order,
-                cmd.venue_order_id.or(order.venue_order_id()),
-                "Lightpool execution client stopped",
-                self.ts_event(),
-            );
-            return Ok(());
-        }
-
         let private_key = self
             .private_key
             .clone()
@@ -666,7 +567,7 @@ impl ExecutionClient for LightpoolExecutionClient {
             .as_str()
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid venue order id: {e}"))?;
-        log::info!(
+        log::debug!(
             "modify_order: start client_order_id={} venue_order_id={} instrument_id={} spot_market={} new_quantity={}",
             order.client_order_id(),
             venue_order_id,
@@ -677,23 +578,8 @@ impl ExecutionClient for LightpoolExecutionClient {
         let clob_client = self.clob_client.clone();
         let emitter = self.emitter.clone();
         let ts_event = self.ts_event();
-        let stopped = self.stopped.clone();
 
         get_runtime().spawn(async move {
-            if stopped.load(Ordering::Acquire) {
-                log::warn!(
-                    "modify_order: rejected client_order_id={} venue_order_id={} reason=execution_client_stopped",
-                    order.client_order_id(),
-                    venue_order_id,
-                );
-                emitter.emit_order_modify_rejected(
-                    &order,
-                    Some(venue_order_id),
-                    "Lightpool execution client stopped",
-                    ts_event,
-                );
-                return;
-            }
             let signer = match signer_from_private_key(&private_key) {
                 Ok(signer) => signer,
                 Err(e) => {
@@ -718,7 +604,7 @@ impl ExecutionClient for LightpoolExecutionClient {
             .await
             {
                 Ok(digest) => {
-                    log::info!(
+                    log::debug!(
                         "modify_order: receipt received client_order_id={} venue_order_id={} chain_order_id={} digest={digest} new_quantity={}",
                         order.client_order_id(),
                         venue_order_id,
@@ -760,48 +646,19 @@ impl ExecutionClient for LightpoolExecutionClient {
     }
 
     fn query_order(&self, cmd: QueryOrder) -> anyhow::Result<()> {
-        log::debug!("query_order: client_order_id={}", cmd.client_order_id);
-
-        let order = {
-            let cache = self.core.cache();
-            let Some(order_ref) = cache.order(&cmd.client_order_id) else {
-                log::debug!("query_order: order not in cache {}", cmd.client_order_id);
-                return Ok(());
-            };
-            order_ref.cloned()
+        let client_order_id = cmd.client_order_id;
+        let Some(order) = self
+            .core
+            .cache()
+            .order(&client_order_id)
+            .map(|order_ref| order_ref.cloned())
+        else {
+            return Ok(());
         };
-
-        if let Some(outcome) = self.pending_submits.get(&cmd.client_order_id) {
-            match outcome.value() {
-                SubmitOutcome::Denied { reason } => {
-                    self.emitter.emit_order_denied(&order, reason);
-                    self.pending_submits.remove(&cmd.client_order_id);
-                    return Ok(());
-                }
-                SubmitOutcome::Accepted { chain_order_id } => {
-                    if order.venue_order_id().is_none() {
-                        self.emitter.emit_order_accepted(
-                            &order,
-                            VenueOrderId::from(chain_order_id.as_str()),
-                            self.ts_event(),
-                        );
-                    }
-                    self.pending_submits.remove(&cmd.client_order_id);
-                    return Ok(());
-                }
-                SubmitOutcome::Pending => {}
-            }
-        }
 
         let instrument = match self.core.cache().instrument(&order.instrument_id()) {
             Some(instrument) => instrument.clone(),
-            None => {
-                log::debug!(
-                    "query_order: instrument not found for {}",
-                    order.instrument_id()
-                );
-                return Ok(());
-            }
+            None => return Ok(()),
         };
 
         let spot_market = instrument.raw_symbol().to_string();
@@ -962,12 +819,8 @@ fn spawn_account_balance_refresh(
     emitter: ExecutionEventEmitter,
     cache_specs: Vec<BalanceTokenSpec>,
     market_slugs: Vec<String>,
-    stopped: Arc<AtomicBool>,
 ) {
     get_runtime().spawn(async move {
-        if stopped.load(Ordering::Acquire) {
-            return;
-        }
 
         let signer = match signer_from_private_key(&private_key) {
             Ok(signer) => signer,

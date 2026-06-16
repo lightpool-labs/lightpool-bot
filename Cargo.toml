@@ -117,7 +117,7 @@ nautilus-okx = { path = "crates/adapters/okx", version = "0.59.0", default-featu
 nautilus-polymarket = { path = "crates/adapters/polymarket", version = "0.59.0", default-features = false }
 nautilus-sandbox = { path = "crates/adapters/sandbox", version = "0.59.0", default-features = false }
 nautilus-tardis = { path = "crates/adapters/tardis", version = "0.59.0", default-features = false }
-
+nautilus-lightpool = { path = "crates/adapters/lightpool", version = "0.59.0", default-features = false }
 # -----------------------------------------------------------------------------
 # Core dependencies
 #

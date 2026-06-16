@@ -117,6 +117,7 @@ pub fn create_instrument(
         None,
         None,
         None,
+        None,
         Some(info),
         ts_init,
         ts_init,

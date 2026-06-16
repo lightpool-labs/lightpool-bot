@@ -55,6 +55,8 @@ fn resolve_proxy_url(configured: &Option<String>) -> Option<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .or_else(proxy_url_from_env)
+}
+
 const DEFAULT_UPDOWN_INTERVAL_MINS: u64 = 5;
 const DEFAULT_UPDOWN_PERIODS: u64 = 3;
 

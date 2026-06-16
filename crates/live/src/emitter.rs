@@ -225,12 +225,6 @@ impl ExecutionEventEmitter {
         protection_price: Option<Price>,
         ts_event: UnixNanos,
     ) {
-
-        log::info!(
-            "[LP-TRACE] xiaoyu1  start emit_order_updated {}",
-            venue_order_id,
-        );
-
         let event = self.factory.generate_order_updated(
             order,
             venue_order_id,
@@ -242,11 +236,6 @@ impl ExecutionEventEmitter {
             self.ts_init(),
         );
         self.send_order_event(event);
-
-        log::info!(
-            "[LP-TRACE] xiaoyu1  end emit_order_updated {}",
-            venue_order_id,
-        );
     }
 
     /// Generates and emits an order canceled event.

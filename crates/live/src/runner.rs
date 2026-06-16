@@ -413,14 +413,6 @@ impl AsyncRunner {
     pub fn handle_exec_event(event: ExecutionEvent) {
         match event {
             ExecutionEvent::Order(order_event) => {
-                if let OrderEventAny::Updated(updated) = &order_event {
-                    log::info!(
-                        "[LP-TRACE] ④ runner send_order_event exec_engine_process Updated client_order_id={} venue_order_id={:?} qty={}",
-                        updated.client_order_id,
-                        updated.venue_order_id,
-                        updated.quantity,
-                    );
-                }
                 msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), order_event);
             }
             ExecutionEvent::OrderSubmittedBatch(batch) => {
