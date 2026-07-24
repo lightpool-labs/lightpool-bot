@@ -1,3 +1,6 @@
+// Copyright (c) LightPool Labs
+// Author: xiaoyu1998
+
 use nautilus_model::{
     enums::CurrencyType,
     types::Currency,

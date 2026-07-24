@@ -1,3 +1,6 @@
+// Copyright (c) LightPool Labs
+// Author: xiaoyu1998
+
 //! Smoke test for the LightPool live data client.
 //!
 //! Run with:

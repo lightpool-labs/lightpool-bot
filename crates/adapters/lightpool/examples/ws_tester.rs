@@ -1,3 +1,6 @@
+// Copyright (c) LightPool Labs
+// Author: xiaoyu1998
+
 //! Direct clob-index orderbook WebSocket tester for the LightPool adapter.
 //!
 //! Resolves a market slug to a spot market via HTTP, prints an initial REST snapshot,

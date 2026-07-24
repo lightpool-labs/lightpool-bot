@@ -1,3 +1,6 @@
+// Copyright (c) LightPool Labs
+// Author: xiaoyu1998
+
 use std::{fmt::Debug, path::PathBuf};
 
 use serde::{Deserialize, Serialize};

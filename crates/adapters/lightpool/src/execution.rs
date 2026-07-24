@@ -1,3 +1,6 @@
+// Copyright (c) LightPool Labs
+// Author: xiaoyu1998
+
 use async_trait::async_trait;
 use lightpool_sdk::{
     spot_events::extract_order_id_from_events, ActionBuilder, CancelOrderParams,

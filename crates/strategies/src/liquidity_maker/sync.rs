@@ -1,3 +1,6 @@
+// Copyright (c) LightPool Labs
+// Author: xiaoyu1998
+
 //! Reconcile LightPool resting liquidity against Polymarket cache books using bot-owned orders.
 
 use indexmap::IndexMap;

@@ -1,3 +1,6 @@
+// Copyright (c) LightPool Labs
+// Author: xiaoyu1998
+
 use std::str::FromStr;
 
 use lightpool_sdk::TOKEN_SCALE;

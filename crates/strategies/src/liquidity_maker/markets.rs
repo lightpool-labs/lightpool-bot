@@ -1,3 +1,6 @@
+// Copyright (c) LightPool Labs
+// Author: xiaoyu1998
+
 //! Slug-to-market id mapping built from Polymarket and LightPool instrument caches.
 
 use ahash::{AHashMap, AHashSet};

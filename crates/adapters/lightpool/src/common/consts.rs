@@ -1,3 +1,6 @@
+// Copyright (c) LightPool Labs
+// Author: xiaoyu1998
+
 use std::sync::LazyLock;
 
 use nautilus_model::identifiers::{ClientId, Venue};
