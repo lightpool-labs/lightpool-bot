@@ -3,7 +3,7 @@
 
 //! Slug-to-market id mapping built from Polymarket and LightPool instrument caches.
 
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashMap;
 use nautilus_common::cache::Cache;
 use nautilus_model::{
     identifiers::{InstrumentId, Venue},
@@ -21,7 +21,7 @@ pub struct SlugMarketIds {
 }
 
 /// Builds paired YES/NO markets from Polymarket binary options in cache.
-pub fn discover_markets_from_cache(cache: &Cache) -> AHashMap<String, SlugMarketIds> {
+pub fn discover_polymarket_markets_from_cache(cache: &Cache) -> AHashMap<String, SlugMarketIds> {
     let venue = Venue::from("POLYMARKET");
     let mut by_condition: AHashMap<String, (Option<InstrumentId>, Option<InstrumentId>)> =
         AHashMap::new();
@@ -141,15 +141,25 @@ pub fn assign_lightpool_markets_to_slugs(
     new_count
 }
 
-/// Assigns discovered markets to configured event slugs.
-pub fn assign_markets_to_slugs(
+/// Assigns discovered Polymarket markets to the flat condition map and configured event slugs.
+pub fn assign_polymarket_markets_to_slugs(
     slugs: &[String],
     discovered: &AHashMap<String, SlugMarketIds>,
+    markets: &mut AHashMap<String, SlugMarketIds>,
     slug_markets: &mut AHashMap<String, AHashMap<String, SlugMarketIds>>,
-    slug_to_conditions: &mut AHashMap<String, AHashSet<String>>,
 ) -> usize {
+    let mut new_count = 0;
+    for (condition_id, market) in discovered {
+        if markets
+            .insert(condition_id.clone(), market.clone())
+            .is_none()
+        {
+            new_count += 1;
+        }
+    }
+
     if slugs.is_empty() {
-        return 0;
+        return new_count;
     }
 
     let target_slugs: Vec<&String> = if slugs.len() == 1 {
@@ -161,18 +171,10 @@ pub fn assign_markets_to_slugs(
         vec![&slugs[0]]
     };
 
-    let mut new_count = 0;
     for slug in target_slugs {
-        let conditions = slug_to_conditions.entry(slug.clone()).or_default();
         let markets_for_slug = slug_markets.entry(slug.clone()).or_default();
         for (condition_id, market) in discovered {
-            if markets_for_slug
-                .insert(condition_id.clone(), market.clone())
-                .is_none()
-            {
-                conditions.insert(condition_id.clone());
-                new_count += 1;
-            }
+            markets_for_slug.insert(condition_id.clone(), market.clone());
         }
     }
     new_count

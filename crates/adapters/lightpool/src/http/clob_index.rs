@@ -102,6 +102,24 @@ impl ClobIndexHttpClient {
         Ok(page.markets)
     }
 
+    pub async fn fetch_markets_by_addresses(
+        &self,
+        addresses: &[String],
+    ) -> anyhow::Result<Vec<Market>> {
+        if addresses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let joined = addresses.join(",");
+        let url = format!(
+            "{}/api/markets?market_addresses={joined}&limit={}",
+            self.base_url,
+            addresses.len().max(1)
+        );
+        let response = self.client.get(&url).send().await?;
+        let page: MarketsPage = decode_response(response).await?;
+        Ok(page.markets)
+    }
+
     pub async fn submit_transaction(
         &self,
         tx: SignedTransaction,

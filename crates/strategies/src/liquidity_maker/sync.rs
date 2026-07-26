@@ -273,84 +273,87 @@ fn build_reconcile_actions(
 impl LiquidityMaker {
     pub(super) fn rebuild_instrument_pairs(&mut self) {
         self.pm_to_lp.clear();
-        if !self.config.lightpool_enabled || !self.config.trading_enabled {
+        if self.config.lightpool_slugs.is_empty() || !self.config.trading_enabled {
             return;
         }
 
-        let Some(lp_slug) = self.config.lightpool_slugs.first() else {
-            return;
-        };
-        let Some(lp_market) = self.lightpool_markets.get(lp_slug) else {
-            return;
-        };
-        let Some(pm_slug) = self.config.polymarket_slugs.first() else {
-            return;
-        };
-        let Some(pm_markets) = self.slug_markets.get(pm_slug) else {
-            return;
-        };
-
-        let lp_market = lp_market.clone();
-        let pm_markets: Vec<SlugMarketIds> = pm_markets.values().cloned().collect();
-
         let new_pairs = {
             let cache = self.cache();
-            let Some((lp_yes_id, lp_no_id)) = resolve_yes_no_pair(&cache, &lp_market) else {
-                return;
-            };
-            let lp_yes_outcome = instrument_outcome_side(&cache, lp_yes_id);
-            let lp_no_outcome = instrument_outcome_side(&cache, lp_no_id);
-            let lp_yes_spot = instrument_spot_market(&cache, lp_yes_id);
-            let lp_no_spot = instrument_spot_market(&cache, lp_no_id);
-
-            log::debug!(
-                "LightPool pair slug={lp_slug} yes_id={lp_yes_id} ({}) spot={} \
-                 no_id={lp_no_id} ({}) spot={}",
-                lp_yes_outcome.as_str(),
-                lp_yes_spot.as_deref().unwrap_or("-"),
-                lp_no_outcome.as_str(),
-                lp_no_spot.as_deref().unwrap_or("-"),
-            );
-
-            if lp_yes_spot.is_some() && lp_yes_spot == lp_no_spot {
-                log::warn!(
-                    "LightPool YES and NO instruments share the same spot_market={:?}; \
-                     books will mix YES (~16c) and NO (~84c) prices",
-                    lp_yes_spot,
-                );
-            }
-
             let mut pairs = Vec::new();
-            for pm_market in &pm_markets {
-                let Some((pm_yes_id, pm_no_id)) = resolve_yes_no_pair(&cache, pm_market) else {
-                    continue;
-                };
-                let pm_yes_outcome = instrument_outcome_side(&cache, pm_yes_id);
-                let pm_no_outcome = instrument_outcome_side(&cache, pm_no_id);
 
-                if pm_yes_outcome != lp_yes_outcome || pm_no_outcome != lp_no_outcome {
-                    log::warn!(
-                        "PM/LP outcome label mismatch for condition={} \
-                         pm_yes={pm_yes_id} ({}) -> lp_yes={lp_yes_id} ({}) \
-                         pm_no={pm_no_id} ({}) -> lp_no={lp_no_id} ({})",
-                        pm_market.condition_id,
-                        pm_yes_outcome.as_str(),
-                        lp_yes_outcome.as_str(),
-                        pm_no_outcome.as_str(),
-                        lp_no_outcome.as_str(),
+            if !self.config.market_pairs.is_empty() {
+                // N:N — each PM condition_id maps to its own LP slug.
+                for pair in &self.config.market_pairs {
+                    let Some(pm_market) = self.polymarket_markets.get(&pair.condition_id).cloned()
+                    else {
+                        log::warn!(
+                            "missing Polymarket instruments for condition={}",
+                            pair.condition_id
+                        );
+                        continue;
+                    };
+                    let Some(lp_market) =
+                        self.lightpool_markets.get(&pair.lightpool_slug).cloned()
+                    else {
+                        log::warn!(
+                            "missing LightPool instruments for slug={}",
+                            pair.lightpool_slug
+                        );
+                        continue;
+                    };
+
+                    let Some((pm_yes_id, pm_no_id)) = resolve_yes_no_pair(&cache, &pm_market)
+                    else {
+                        continue;
+                    };
+                    let Some((lp_yes_id, lp_no_id)) = resolve_yes_no_pair(&cache, &lp_market)
+                    else {
+                        continue;
+                    };
+
+                    log::info!(
+                        "pm_to_lp N:N condition={} -> slug={} \
+                         pm_yes={pm_yes_id} lp_yes={lp_yes_id} \
+                         pm_no={pm_no_id} lp_no={lp_no_id}",
+                        pair.condition_id,
+                        pair.lightpool_slug,
                     );
+                    pairs.push((pm_yes_id, lp_yes_id));
+                    pairs.push((pm_no_id, lp_no_id));
                 }
+            } else {
+                // Legacy M:1 — all PM conditions under first event slug → first LP slug.
+                let Some(lp_slug) = self.config.lightpool_slugs.first() else {
+                    return;
+                };
+                let Some(lp_market) = self.lightpool_markets.get(lp_slug).cloned() else {
+                    return;
+                };
+                let Some(pm_slug) = self.config.polymarket_slugs.first() else {
+                    return;
+                };
+                let Some(pm_markets) = self.polymarket_slug_markets.get(pm_slug) else {
+                    return;
+                };
+                let pm_markets: Vec<SlugMarketIds> = pm_markets.values().cloned().collect();
+                let Some((lp_yes_id, lp_no_id)) = resolve_yes_no_pair(&cache, &lp_market) else {
+                    return;
+                };
 
-                log::debug!(
-                    "pm_to_lp mapping condition={} \
-                     pm_yes={pm_yes_id} -> lp_yes={lp_yes_id} \
-                     pm_no={pm_no_id} -> lp_no={lp_no_id}",
-                    pm_market.condition_id,
-                );
-
-                pairs.push((pm_yes_id, lp_yes_id));
-                pairs.push((pm_no_id, lp_no_id));
+                for pm_market in &pm_markets {
+                    let Some((pm_yes_id, pm_no_id)) = resolve_yes_no_pair(&cache, pm_market)
+                    else {
+                        continue;
+                    };
+                    log::debug!(
+                        "pm_to_lp M:1 condition={} -> slug={lp_slug}",
+                        pm_market.condition_id,
+                    );
+                    pairs.push((pm_yes_id, lp_yes_id));
+                    pairs.push((pm_no_id, lp_no_id));
+                }
             }
+
             pairs
         };
 
@@ -386,7 +389,7 @@ impl LiquidityMaker {
         polymarket_instrument_id: InstrumentId,
         lightpool_instrument_id: InstrumentId,
     ) -> anyhow::Result<()> {
-        if !self.config.trading_enabled || !self.config.lightpool_enabled {
+        if !self.config.trading_enabled || self.config.lightpool_slugs.is_empty() {
             return Ok(());
         }
 

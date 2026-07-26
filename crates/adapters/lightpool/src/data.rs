@@ -31,7 +31,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    common::consts::{DEFAULT_TICK_SIZE_RAW, LIGHTPOOL_VENUE},
+    common::{
+        amounts::parse_token_amount_str,
+        consts::{DEFAULT_TICK_SIZE_RAW, LIGHTPOOL_VENUE},
+    },
     config::LightpoolDataClientConfig,
     http::clob_index::ClobIndexHttpClient,
     parse::{instruments_for_market, parse_book_delta, parse_book_snapshot},
@@ -76,6 +79,37 @@ impl LightpoolDataClient {
         }
     }
 
+    async fn resolve_tick_size_raw(&self, spot_market: &str) -> u64 {
+        match self.http_client.fetch_spot_info(spot_market).await {
+            Ok(info) => match parse_token_amount_str(&info.tick_size) {
+                Ok(raw) if raw > 0 => raw,
+                Ok(_) => {
+                    log::warn!(
+                        "spot {spot_market} tick_size={} rounds to 0; using default={}",
+                        info.tick_size,
+                        DEFAULT_TICK_SIZE_RAW
+                    );
+                    DEFAULT_TICK_SIZE_RAW
+                }
+                Err(e) => {
+                    log::warn!(
+                        "invalid tick_size '{}' for spot {spot_market}: {e:#}; using default={}",
+                        info.tick_size,
+                        DEFAULT_TICK_SIZE_RAW
+                    );
+                    DEFAULT_TICK_SIZE_RAW
+                }
+            },
+            Err(e) => {
+                log::warn!(
+                    "failed to fetch spot info for {spot_market}: {e:#}; using default={}",
+                    DEFAULT_TICK_SIZE_RAW
+                );
+                DEFAULT_TICK_SIZE_RAW
+            }
+        }
+    }
+
     async fn bootstrap_instruments(&mut self) -> anyhow::Result<()> {
         let markets = self
             .http_client
@@ -85,12 +119,13 @@ impl LightpoolDataClient {
         let mut count = 0usize;
 
         for market in markets {
-            for instrument in instruments_for_market(
-                &market,
-                DEFAULT_TICK_SIZE_RAW,
-                DEFAULT_TICK_SIZE_RAW,
-                ts_init,
-            )? {
+            let yes_tick = self.resolve_tick_size_raw(&market.yes_spot_market).await;
+            let no_tick = self.resolve_tick_size_raw(&market.no_spot_market).await;
+            log::info!(
+                "Lightpool market slug={} yes_tick_raw={yes_tick} no_tick_raw={no_tick}",
+                market.slug,
+            );
+            for instrument in instruments_for_market(&market, yes_tick, no_tick, ts_init)? {
                 let instrument_id = instrument.id();
                 let spot_market = instrument.raw_symbol().to_string();
                 self.spot_market_by_instrument

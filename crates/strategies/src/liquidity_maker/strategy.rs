@@ -20,8 +20,8 @@ use nautilus_trading::{nautilus_strategy, strategy::StrategyCore};
 
 use super::config::LiquidityMakerConfig;
 use super::markets::{
-    SlugMarketIds, assign_lightpool_markets_to_slugs, assign_markets_to_slugs,
-    discover_lightpool_markets_from_cache, discover_markets_from_cache,
+    SlugMarketIds, assign_lightpool_markets_to_slugs, assign_polymarket_markets_to_slugs,
+    discover_lightpool_markets_from_cache, discover_polymarket_markets_from_cache,
 };
 
 const POLYMARKET_VENUE: &str = "POLYMARKET";
@@ -35,11 +35,9 @@ pub struct LiquidityMaker {
     pub(super) core: StrategyCore,
     pub(super) config: LiquidityMakerConfig,
     /// Event slug -> condition_id -> YES/NO instrument ids (Polymarket).
-    pub(super) slug_markets: AHashMap<String, AHashMap<String, SlugMarketIds>>,
-    /// Event slug -> condition ids discovered for that slug (Polymarket).
-    pub(super) slug_to_conditions: AHashMap<String, AHashSet<String>>,
+    pub(super) polymarket_slug_markets: AHashMap<String, AHashMap<String, SlugMarketIds>>,
     /// condition_id -> YES/NO instrument ids (Polymarket).
-    pub(super) markets: AHashMap<String, SlugMarketIds>,
+    pub(super) polymarket_markets: AHashMap<String, SlugMarketIds>,
     /// market_slug -> YES/NO instrument ids (LightPool).
     pub(super) lightpool_markets: AHashMap<String, SlugMarketIds>,
     pub(super) instrument_to_market_key: AHashMap<InstrumentId, String>,
@@ -60,9 +58,8 @@ impl LiquidityMaker {
         Self {
             core: StrategyCore::new(config.base.clone()),
             config,
-            slug_markets: AHashMap::new(),
-            slug_to_conditions: AHashMap::new(),
-            markets: AHashMap::new(),
+            polymarket_slug_markets: AHashMap::new(),
+            polymarket_markets: AHashMap::new(),
             lightpool_markets: AHashMap::new(),
             instrument_to_market_key: AHashMap::new(),
             subscribed_instruments: AHashSet::new(),
@@ -102,22 +99,32 @@ impl LiquidityMaker {
     }
 
     fn sync_polymarket_markets_from_cache(&mut self) -> usize {
-        let discovered = discover_markets_from_cache(&self.cache());
-        for (condition_id, market) in &discovered {
-            self.markets
-                .entry(condition_id.clone())
-                .or_insert_with(|| market.clone());
-        }
-        assign_markets_to_slugs(
+        let discovered = discover_polymarket_markets_from_cache(&self.cache());
+        let new_count = assign_polymarket_markets_to_slugs(
             &self.config.polymarket_slugs,
             &discovered,
-            &mut self.slug_markets,
-            &mut self.slug_to_conditions,
-        )
+            &mut self.polymarket_markets,
+            &mut self.polymarket_slug_markets,
+        );
+        log::info!(
+            "sync_polymarket_markets_from_cache discovered={} assigned_new={} \
+             polymarket_markets={}",
+            discovered.len(),
+            new_count,
+            self.polymarket_markets.len(),
+        );
+        for (condition_id, market) in &self.polymarket_markets {
+            log::info!(
+                "polymarket market condition={condition_id} yes={} no={}",
+                market.yes_id,
+                market.no_id,
+            );
+        }
+        new_count
     }
 
     fn sync_lightpool_markets_from_cache(&mut self) -> usize {
-        if !self.config.lightpool_enabled {
+        if self.config.lightpool_slugs.is_empty() {
             return 0;
         }
         let discovered = discover_lightpool_markets_from_cache(&self.cache());
@@ -167,23 +174,11 @@ impl LiquidityMaker {
             return;
         };
 
-        let polymarket_markets: Vec<SlugMarketIds> = self.markets.values().cloned().collect();
+        let polymarket_markets: Vec<SlugMarketIds> =
+            self.polymarket_markets.values().cloned().collect();
         for market in polymarket_markets {
             self.subscribe_market(&market, depth, "Polymarket");
         }
-
-    }
-
-    fn slug_for_condition(&self, condition_id: &str) -> Option<&str> {
-        self.slug_to_conditions
-            .iter()
-            .find_map(|(slug, conditions)| {
-                if conditions.contains(condition_id) {
-                    Some(slug.as_str())
-                } else {
-                    None
-                }
-            })
     }
 
     fn venue_label(instrument_id: InstrumentId) -> &'static str {
@@ -194,18 +189,6 @@ impl LiquidityMaker {
         }
     }
 
-    fn warn_missing_lightpool_markets(&self) {
-        if !self.config.lightpool_enabled || !self.lightpool_markets.is_empty() {
-            return;
-        }
-        let discovered = discover_lightpool_markets_from_cache(&self.cache());
-        log::warn!(
-            "No LightPool markets matched lightpool_slugs={:?}; \
-             available_lightpool_slugs_in_cache={:?}",
-            self.config.lightpool_slugs,
-            discovered.keys().collect::<Vec<_>>(),
-        );
-    }
 }
 
 fn format_book_side(book: &OrderBook, bids: bool, depth: usize) -> String {
@@ -242,7 +225,7 @@ impl Debug for LiquidityMaker {
             .field("polymarket_slugs", &self.config.polymarket_slugs)
             .field("lightpool_slugs", &self.config.lightpool_slugs)
             .field("depth", &self.config.depth)
-            .field("polymarket_markets", &self.markets.len())
+            .field("polymarket_markets", &self.polymarket_markets.len())
             .field("lightpool_markets", &self.lightpool_markets.len())
             .finish()
     }
@@ -257,17 +240,14 @@ impl DataActor for LiquidityMaker {
         let synced = self.sync_markets_from_cache();
         log::info!(
             "LiquidityMaker started polymarket_slugs={:?} lightpool_slugs={:?} \
-             synced_markets={synced} polymarket_markets={} lightpool_markets={} \
-             lightpool_enabled={}",
+             synced_markets={synced} polymarket_markets={} lightpool_markets={}",
             self.config.polymarket_slugs,
             self.config.lightpool_slugs,
-            self.markets.len(),
+            self.polymarket_markets.len(),
             self.lightpool_markets.len(),
-            self.config.lightpool_enabled,
         );
         self.reconcile_subscriptions();
         self.rebuild_instrument_pairs();
-        self.warn_missing_lightpool_markets();
         if self.config.trading_enabled {
             log::info!(
                 "LightPool mirroring enabled depth={} client_id={} reconcile_delta_batch_size={}",

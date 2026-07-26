@@ -54,7 +54,8 @@ pub fn format_token_amount(raw: u64) -> String {
 pub fn tick_size_from_instrument_info(info: Option<&nautilus_core::Params>) -> u64 {
     info.and_then(|params| params.get("tick_size_raw"))
         .and_then(|value| value.as_u64())
-        .unwrap_or(1_000)
+        .filter(|tick| *tick > 0)
+        .unwrap_or(crate::common::consts::DEFAULT_TICK_SIZE_RAW)
 }
 
 pub fn format_price_pieces(raw: u64) -> String {

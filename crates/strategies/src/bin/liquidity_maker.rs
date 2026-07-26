@@ -3,22 +3,33 @@
 
 //! Live runner for the dual-venue liquidity maker strategy.
 //!
-//! Subscribes to Polymarket and LightPool order book deltas and logs managed cache books.
+//! Subscribes to Polymarket and LightPool order book deltas and mirrors depth onto LightPool.
 //!
 //! # Usage
 //!
+//! Bootstrap top-5 Polymarket markets into LightPool, then mirror:
 //! ```sh
 //! cargo run -p lightpool-strategies --bin liquidity-maker -- \
 //!   --polymarket-slug world-cup-winner \
-//!   --lightpool-slug france-world-cup-2026 \
-//!   --log-interval 50
+//!   --bootstrap-markets \
+//!   --max-markets 5
+//! ```
+//!
+//! Or use an existing LightPool market slug:
+//! ```sh
+//! cargo run -p lightpool-strategies --bin liquidity-maker -- \
+//!   --polymarket-slug world-cup-winner \
+//!   --lightpool-slug france-world-cup-2026
 //! ```
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use lightpool_strategies::{LiquidityMaker, LiquidityMakerConfig};
+use lightpool_strategies::{
+    BootstrapConfig, LiquidityMaker, LiquidityMakerConfig, MarketPair,
+    bootstrap_markets_from_polymarket,
+};
 use log::LevelFilter;
 use nautilus_common::{enums::Environment, logging::logger::LoggerConfig};
 use nautilus_lightpool::{
@@ -36,15 +47,24 @@ use nautilus_polymarket::{
 
 #[derive(Parser, Debug)]
 #[command(
-    about = "Dual-venue liquidity maker: Polymarket + LightPool order book delta logging."
+    about = "Dual-venue liquidity maker: Polymarket + LightPool order book mirroring."
 )]
 struct Args {
     /// Polymarket event slug (Gamma event slug).
     #[arg(long)]
     polymarket_slug: String,
-    /// LightPool market slug (clob-index market slug).
+    /// LightPool market slug (clob-index). Required unless --bootstrap-markets or --polymarket-only.
     #[arg(long)]
     lightpool_slug: Option<String>,
+    /// Create+mint top-N LightPool markets from Polymarket before starting the node.
+    #[arg(long, default_value_t = false)]
+    bootstrap_markets: bool,
+    /// Max Polymarket markets to bootstrap / subscribe (by liquidity).
+    #[arg(long, default_value_t = 5)]
+    max_markets: u32,
+    /// Collateral amount to mint per market (raw units, 6 decimals). Default 1e9 tokens.
+    #[arg(long, default_value_t = 1_000_000_000_000_000)]
+    mint_amount: u64,
     /// Number of book levels to track per side.
     #[arg(long, default_value_t = 10)]
     depth: usize,
@@ -87,16 +107,43 @@ async fn main() -> Result<()> {
     let polymarket_slug = require_non_empty("--polymarket-slug", &args.polymarket_slug)?;
     let polymarket_slugs = vec![polymarket_slug.clone()];
     let lightpool_enabled = !args.polymarket_only;
-    let lightpool_slug = if lightpool_enabled {
-        let slug = args
-            .lightpool_slug
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("--lightpool-slug is required unless --polymarket-only"))?;
-        Some(require_non_empty("--lightpool-slug", slug)?)
+
+    if args.bootstrap_markets && args.polymarket_only {
+        bail!("--bootstrap-markets cannot be used with --polymarket-only");
+    }
+    if args.bootstrap_markets && args.lightpool_slug.is_some() {
+        log::warn!("--lightpool-slug ignored when --bootstrap-markets is set");
+    }
+
+    let market_pairs: Vec<MarketPair> = if args.bootstrap_markets {
+        let boot_cfg = BootstrapConfig {
+            polymarket_event_slug: polymarket_slug.clone(),
+            max_markets: args.max_markets.max(1),
+            mint_amount: args.mint_amount,
+            order_field: "liquidity".into(),
+        };
+        bootstrap_markets_from_polymarket(&boot_cfg)
+            .await
+            .context("bootstrap LightPool markets from Polymarket")?
     } else {
-        None
+        Vec::new()
     };
-    let lightpool_slugs = lightpool_slug.iter().cloned().collect::<Vec<_>>();
+
+    let lightpool_slugs: Vec<String> = if !market_pairs.is_empty() {
+        market_pairs
+            .iter()
+            .map(|p| p.lightpool_slug.clone())
+            .collect()
+    } else if lightpool_enabled {
+        let slug = args.lightpool_slug.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--lightpool-slug is required unless --bootstrap-markets or --polymarket-only"
+            )
+        })?;
+        vec![require_non_empty("--lightpool-slug", slug)?]
+    } else {
+        Vec::new()
+    };
 
     let proxy_url = proxy_url();
 
@@ -108,6 +155,9 @@ async fn main() -> Result<()> {
         active: Some(true),
         closed: Some(false),
         archived: Some(false),
+        order: Some("liquidity".into()),
+        ascending: Some(false),
+        max_markets: Some(args.max_markets.max(1)),
         ..Default::default()
     };
 
@@ -120,7 +170,7 @@ async fn main() -> Result<()> {
 
     let polymarket_data_config = PolymarketDataClientConfig {
         instrument_config: Some(PolymarketInstrumentProviderConfig {
-            market_slugs: Some(polymarket_slugs.clone()),
+            event_slugs: Some(polymarket_slugs.clone()),
             ..Default::default()
         }),
         proxy_url,
@@ -186,22 +236,34 @@ async fn main() -> Result<()> {
 
     let mut node = node_builder.build()?;
 
-    let strategy_config = LiquidityMakerConfig::new(polymarket_slugs)
-        .with_lightpool_slugs(lightpool_slugs)
+    let mut strategy_config = LiquidityMakerConfig::new(polymarket_slugs)
         .with_depth(args.depth)
         .with_log_interval(args.log_interval)
-        .with_lightpool_enabled(lightpool_enabled)
         .with_log_polymarket(!args.no_polymarket_log)
         .with_trading_enabled(trading_enabled)
         .with_reconcile_delta_batch_size(args.reconcile_delta_batch_size)
         .with_strategy_id(strategy_id);
 
+    if !market_pairs.is_empty() {
+        for pair in &market_pairs {
+            log::info!(
+                "market pair condition={} -> slug={} ({})",
+                pair.condition_id,
+                pair.lightpool_slug,
+                pair.question
+            );
+        }
+        strategy_config = strategy_config.with_market_pairs(market_pairs);
+    } else {
+        strategy_config = strategy_config.with_lightpool_slugs(lightpool_slugs.clone());
+    }
+
     log::info!(
         "Starting liquidity maker polymarket_slug={polymarket_slug} \
-         lightpool_slug={} depth={} lightpool_enabled={lightpool_enabled} \
-         trading_enabled={trading_enabled}",
-        lightpool_slug.as_deref().unwrap_or("-"),
+         lightpool_slugs={lightpool_slugs:?} depth={} trading_enabled={trading_enabled} \
+         bootstrap={}",
         args.depth,
+        args.bootstrap_markets,
     );
 
     let strategy = LiquidityMaker::new(strategy_config);

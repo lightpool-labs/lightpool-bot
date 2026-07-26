@@ -674,11 +674,11 @@ impl PolymarketGammaHttpClient {
     /// - `order`: sort field (`"liquidity"`, `"volume"`, `"volume24hr"`)
     /// - `ascending`: sort direction (default: descending)
     /// - `max_markets`: truncate after sorting
-    pub async fn request_instruments_by_event_query(
+    pub async fn request_gamma_markets_by_event_query(
         &self,
         event_slug: &str,
         params: GetGammaMarketsParams,
-    ) -> anyhow::Result<Vec<InstrumentAny>> {
+    ) -> anyhow::Result<Vec<GammaMarket>> {
         let events = self.inner.get_gamma_events_by_slug(event_slug).await?;
         let mut markets = flatten_event_markets(events);
 
@@ -738,6 +738,18 @@ impl PolymarketGammaHttpClient {
             markets.truncate(cap as usize);
         }
 
+        Ok(markets)
+    }
+
+    /// Same as [`Self::request_gamma_markets_by_event_query`] but returns Nautilus instruments.
+    pub async fn request_instruments_by_event_query(
+        &self,
+        event_slug: &str,
+        params: GetGammaMarketsParams,
+    ) -> anyhow::Result<Vec<InstrumentAny>> {
+        let markets = self
+            .request_gamma_markets_by_event_query(event_slug, params)
+            .await?;
         let ts_init = self.clock.get_time_ns();
         let instruments = parse_markets_to_instruments(&markets, ts_init);
         log::debug!(

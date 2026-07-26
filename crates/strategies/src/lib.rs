@@ -3,4 +3,7 @@
 
 pub mod liquidity_maker;
 
-pub use liquidity_maker::{LiquidityMaker, LiquidityMakerConfig, SlugMarketIds};
+pub use liquidity_maker::{
+    BootstrapConfig, LiquidityMaker, LiquidityMakerConfig, MarketPair, SlugMarketIds,
+    bootstrap_markets_from_polymarket,
+};

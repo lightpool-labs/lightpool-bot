@@ -33,5 +33,5 @@ pub const DEFAULT_CLOB_INDEX_HTTP_TIMEOUT_SECS: u64 = 90;
 /// TCP connect timeout for lightpool-clob-index HTTP.
 pub const DEFAULT_CLOB_INDEX_HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
 
-/// Default spot tick size (0.001) in raw token units.
+/// Default spot tick size (0.001) in raw token units — matches liquidity_maker bootstrap.
 pub const DEFAULT_TICK_SIZE_RAW: u64 = 1_000;

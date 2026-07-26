@@ -6,6 +6,8 @@
 use nautilus_model::identifiers::{ClientId, StrategyId};
 use nautilus_trading::strategy::StrategyConfig;
 
+use super::bootstrap::MarketPair;
+
 /// Configuration for subscribing Polymarket order book deltas with managed cache books.
 #[derive(Debug, Clone)]
 pub struct LiquidityMakerConfig {
@@ -15,6 +17,8 @@ pub struct LiquidityMakerConfig {
     pub polymarket_slugs: Vec<String>,
     /// LightPool market slugs to mirror (resolved via clob-index bootstrap).
     pub lightpool_slugs: Vec<String>,
+    /// Explicit PM condition_id ↔ LP slug pairs (N:N). When non-empty, used for pairing.
+    pub market_pairs: Vec<MarketPair>,
     /// Number of price levels to retain per side.
     pub depth: usize,
     /// Log top-of-book snapshot every N delta batches. `0` disables logging.
@@ -22,8 +26,6 @@ pub struct LiquidityMakerConfig {
     /// When `true`, subscribe with managed books so the data engine also
     /// maintains an `OrderBook` in cache (`cache.order_book()`).
     pub managed_book: bool,
-    /// When `true`, resolve LightPool markets for trading (no order book subscription).
-    pub lightpool_enabled: bool,
     /// When `true`, print Polymarket order book snapshots from cache.
     pub log_polymarket: bool,
     /// When `true`, mirror Polymarket depth onto LightPool via execution client.
@@ -46,10 +48,10 @@ impl LiquidityMakerConfig {
             },
             polymarket_slugs,
             lightpool_slugs: Vec::new(),
+            market_pairs: Vec::new(),
             depth: 10,
             log_interval: 0,
             managed_book: true,
-            lightpool_enabled: true,
             log_polymarket: true,
             trading_enabled: false,
             lightpool_client_id: ClientId::from("LIGHTPOOL"),
@@ -60,6 +62,16 @@ impl LiquidityMakerConfig {
     #[must_use]
     pub fn with_lightpool_slugs(mut self, lightpool_slugs: Vec<String>) -> Self {
         self.lightpool_slugs = lightpool_slugs;
+        self
+    }
+
+    #[must_use]
+    pub fn with_market_pairs(mut self, market_pairs: Vec<MarketPair>) -> Self {
+        self.lightpool_slugs = market_pairs
+            .iter()
+            .map(|pair| pair.lightpool_slug.clone())
+            .collect();
+        self.market_pairs = market_pairs;
         self
     }
 
@@ -78,12 +90,6 @@ impl LiquidityMakerConfig {
     #[must_use]
     pub fn with_managed_book(mut self, managed: bool) -> Self {
         self.managed_book = managed;
-        self
-    }
-
-    #[must_use]
-    pub fn with_lightpool_enabled(mut self, enabled: bool) -> Self {
-        self.lightpool_enabled = enabled;
         self
     }
 
