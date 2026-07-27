@@ -64,7 +64,7 @@ npm run dev
 
 UI: `http://127.0.0.1:3000`
 
-### 5. Bootstrap chain sample (`run_all.py` via `lightpool-node`)
+### 5. Bootstrap chain sample (`setup.py` via `lightpool-node`)
 
 Creates USDT, transfers collateral, and creates a vault. Market create/mint is handled later by the liquidity maker (`--bootstrap-markets`).
 
@@ -73,7 +73,7 @@ From **`lightpool-node`** (so `lightpool-cli` from `env.sh` is on `PATH`):
 ```bash
 cd ../lightpool-node
 source ./env.sh
-python3 ../lightpool/crates/lightpool-cli/scripts/event-contract-setup/run_all.py
+python3 scripts/event-contract-setup/setup.py
 ```
 
 ### 6. Run liquidity maker (`lightpool-bot`)
