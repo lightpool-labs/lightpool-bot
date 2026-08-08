@@ -61,9 +61,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|level| format!("{}@{}", level.size, level.price))
             .unwrap_or_else(|| "-".into());
         log::info!(
-            "Book sequence={} best bid: {best_bid}, best ask: {best_ask}",
-            book.sequence
+            "Book sequence={} bids={} asks={} best bid: {best_bid}, best ask: {best_ask}",
+            book.sequence,
+            book.bids.len(),
+            book.asks.len()
         );
+        for (i, level) in book.bids.iter().enumerate() {
+            log::info!("  bid[{}]: {} @ {}", i + 1, level.size, level.price);
+        }
+        for (i, level) in book.asks.iter().enumerate() {
+            log::info!("  ask[{}]: {} @ {}", i + 1, level.size, level.price);
+        }
     }
 
     Ok(())
