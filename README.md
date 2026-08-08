@@ -120,7 +120,7 @@ export LIGHTPOOL_PRIVATE_KEY=...   # base64 secret key; required for execution
 HTTP / WebSocket proxy for Polymarket (also loaded from `.env`):
 
 ```bash
-export HTTPS_PROXY=http://127.0.0.1:7890
+export HTTPS_PROXY=http://127.0.0.1:8118
 ```
 
 ## Build only

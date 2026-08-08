@@ -3,9 +3,8 @@
 
 use async_trait::async_trait;
 use lightpool_sdk::{
-    spot_events::extract_order_id_from_events, ActionBuilder, CancelOrderParams,
-    OrderParamsType, OrderSide, PlaceOrderParams, Signer, TimeInForce, TransactionBuilder,
-    UpdateOrderParams, parse_token_contract,
+    ActionBuilder, OrderParamsType, OrderSide, PlaceOrderParams, Signer, TimeInForce,
+    TransactionBuilder, UpdateOrderParams, parse_token_contract,
 };
 use nautilus_common::{
     clients::ExecutionClient,
@@ -236,7 +235,7 @@ async fn query_order_from_index(
 ) -> anyhow::Result<Option<OrderQueryResponse>> {
     if let Some(venue_order_id) = venue_order_id {
         return clob_client
-            .query_order_by_chain_id(spot_market, venue_order_id.as_str(), user_address)
+            .query_order(spot_market, venue_order_id.as_str(), user_address)
             .await;
     }
 
@@ -267,9 +266,7 @@ async fn submit_limit_order_via_index(
     order: &OrderAny,
     spot_market_str: &str,
 ) -> anyhow::Result<String> {
-    let spot_market = parse_token_contract(spot_market_str)
-        .map_err(|e| anyhow::anyhow!("invalid spot market: {e}"))?;
-    let spot_market_display = spot_market.to_string();
+    let spot_market_display = spot_market_str.to_string();
 
     let price_decimal = order.price().map(|p| p.as_decimal());
     let price_decimal = price_decimal.ok_or_else(|| anyhow::anyhow!("limit order missing price"))?;
@@ -316,20 +313,9 @@ async fn submit_limit_order_via_index(
         token_address,
     };
 
-    let action = ActionBuilder::place_order(spot_market, params)?;
-    let tx = TransactionBuilder::new()
-        .sender(signer.address())
-        .expiration(u64::MAX)
-        .add_action(action)
-        .build_and_sign_only(signer)?;
-
-    let response = clob_client.submit_transaction(tx).await?;
-    if !response.receipt.is_success() {
-        anyhow::bail!("place_order failed: {:?}", response.receipt.status);
-    }
-
-    let chain_order_id = extract_order_id_from_events(&response.receipt)
-        .ok_or_else(|| anyhow::anyhow!("order_created event missing from receipt"))?;
+    let (_digest, chain_order_id) = clob_client
+        .submit_order_params(signer, spot_market_str, params)
+        .await?;
     Ok(chain_order_id.to_string())
 }
 
@@ -727,21 +713,9 @@ async fn cancel_order_via_index(
     spot_market: &str,
     chain_order_id: u64,
 ) -> anyhow::Result<()> {
-    let spot_market = parse_token_contract(spot_market)
-        .map_err(|e| anyhow::anyhow!("invalid spot market: {e}"))?;
-    let params = CancelOrderParams {
-        order_id: chain_order_id,
-    };
-    let action = ActionBuilder::cancel_order(spot_market, params)?;
-    let tx = TransactionBuilder::new()
-        .sender(signer.address())
-        .expiration(u64::MAX)
-        .add_action(action)
-        .build_and_sign_only(signer)?;
-    let response = clob_client.submit_transaction(tx).await?;
-    if !response.receipt.is_success() {
-        anyhow::bail!("cancel_order failed: {:?}", response.receipt.status);
-    }
+    let _digest = clob_client
+        .cancel_order_params(signer, spot_market, chain_order_id)
+        .await?;
     Ok(())
 }
 

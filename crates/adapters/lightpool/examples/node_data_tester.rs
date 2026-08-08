@@ -77,6 +77,7 @@ async fn main() -> Result<()> {
         .client_id(client_id)
         .instrument_ids(vec![instrument_id])
         .subscribe_book_deltas(true)
+        .subscribe_quotes(true)
         .manage_book(true)
         .build();
     let tester = DataTester::new(tester_config);

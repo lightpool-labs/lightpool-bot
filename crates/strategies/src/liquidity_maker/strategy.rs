@@ -268,7 +268,7 @@ impl DataActor for LiquidityMaker {
     }
 
     fn on_book_deltas(&mut self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
-        log::debug!("OrderBookDeltas {:?}", deltas);
+        log::info!("OrderBookDeltas {:?}", deltas);
 
         let instrument_id = deltas.instrument_id;
         let venue = instrument_id.venue.as_str();

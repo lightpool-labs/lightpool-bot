@@ -50,12 +50,54 @@ tokio-tungstenite = { workspace = true }
 tokio-util = { workspace = true }
 ustr = { workspace = true }
 uuid = { workspace = true }
+clap = { version = "4.5", features = ["derive"] }
+dotenvy = "0.15"
 
 [dev-dependencies]
 nautilus-testkit = { workspace = true }
 nautilus-trading = { workspace = true }
-clap = { version = "4.5", features = ["derive"] }
-dotenvy = "0.15"
+
+[[bin]]
+name = "lightpool-http-public"
+path = "bin/http_public.rs"
+doc = false
+test = false
+
+[[bin]]
+name = "lightpool-http-private"
+path = "bin/http_private.rs"
+doc = false
+test = false
+
+[[bin]]
+name = "lightpool-ws-data"
+path = "bin/ws_data.rs"
+doc = false
+test = false
+
+[[bin]]
+name = "lightpool-ws-user"
+path = "bin/ws_user.rs"
+doc = false
+test = false
+
+[[bin]]
+name = "lightpool-http-exec"
+path = "bin/http_exec.rs"
+doc = false
+test = false
+
+[[bin]]
+name = "lightpool-http-outcome-order"
+path = "bin/http_outcome_order.rs"
+doc = false
+test = false
+
+[[bin]]
+name = "lightpool-http-user-outcome"
+path = "bin/http_user_outcome.rs"
+doc = false
+test = false
 
 [[example]]
 name = "lightpool-data-tester"
@@ -63,7 +105,9 @@ path = "examples/node_data_tester.rs"
 required-features = ["examples"]
 doc = false
 
+# Run with `cargo run -p nautilus-lightpool --example lightpool-exec-tester --features examples`.
 [[example]]
-name = "lightpool-ws-tester"
-path = "examples/ws_tester.rs"
+name = "lightpool-exec-tester"
+path = "examples/node_exec_tester.rs"
+required-features = ["examples"]
 doc = false

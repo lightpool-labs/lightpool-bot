@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 use nautilus_core::{Params, UnixNanos};
 use nautilus_model::{
-    data::{BookOrder, OrderBookDelta, OrderBookDeltas},
+    data::{BookOrder, OrderBookDelta, OrderBookDeltas, QuoteTick},
     enums::{AssetClass, BookAction, OrderSide, RecordFlag},
     identifiers::{InstrumentId, Symbol},
     instruments::{BinaryOption, InstrumentAny},
@@ -21,6 +21,7 @@ use crate::{
         currency::collateral_currency,
     },
     http::models::{BookLevel, BookSnapshot, Market},
+    websocket::models::{QuoteDelta, QuoteSnapshot},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,6 +251,56 @@ pub fn parse_book_snapshot(
     }
 
     Ok(OrderBookDeltas::new(instrument_id, deltas))
+}
+
+pub fn parse_quote_tick(
+    best_bid: Option<&BookLevel>,
+    best_ask: Option<&BookLevel>,
+    instrument_id: InstrumentId,
+    ts_init: UnixNanos,
+) -> anyhow::Result<Option<QuoteTick>> {
+    let (Some(bid), Some(ask)) = (best_bid, best_ask) else {
+        return Ok(None);
+    };
+    let bid_price = parse_price(&bid.price)?;
+    let ask_price = parse_price(&ask.price)?;
+    let bid_size = parse_quantity(&bid.size)?;
+    let ask_size = parse_quantity(&ask.size)?;
+    Ok(Some(QuoteTick::new_checked(
+        instrument_id,
+        bid_price,
+        ask_price,
+        bid_size,
+        ask_size,
+        ts_init,
+        ts_init,
+    )?))
+}
+
+pub fn parse_quote_snapshot(
+    snapshot: &QuoteSnapshot,
+    instrument_id: InstrumentId,
+    ts_init: UnixNanos,
+) -> anyhow::Result<Option<QuoteTick>> {
+    parse_quote_tick(
+        snapshot.best_bid.as_ref(),
+        snapshot.best_ask.as_ref(),
+        instrument_id,
+        ts_init,
+    )
+}
+
+pub fn parse_quote_delta(
+    delta: &QuoteDelta,
+    instrument_id: InstrumentId,
+    ts_init: UnixNanos,
+) -> anyhow::Result<Option<QuoteTick>> {
+    parse_quote_tick(
+        delta.best_bid.as_ref(),
+        delta.best_ask.as_ref(),
+        instrument_id,
+        ts_init,
+    )
 }
 
 pub fn parse_book_delta(
