@@ -13,9 +13,9 @@
 //!   (default `1000000000` = 1000 tokens at 6 decimals)
 //!
 //! Prerequisites:
-//! - lightpool node + `lightpool-clob-index` running
+//! - lightpool node + `lightpool-clob-indexer` running
 //! - default wallet `~/.lightpool/wallet.json` with enough collateral
-//!   (`lightpool-cli create-wallet`; optional `LIGHTPOOL_PRIVATE_KEY` override)
+//!   (`lightpool create-wallet`; optional `LIGHTPOOL_PRIVATE_KEY` override)
 //!
 //! Run:
 //! ```sh
@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
     let collateral = resolve_collateral_token();
 
     let client = ClobIndexHttpClient::from_env().context(
-        "Default wallet missing: run `lightpool-cli create-wallet` (~/.lightpool/wallet.json)",
+        "Default wallet missing: run `lightpool create-wallet` (~/.lightpool/wallet.json)",
     )?;
     let wallet = client.get_user_address()?;
     log::info!("Wallet (default ~/.lightpool/wallet.json): {wallet}");

@@ -132,6 +132,7 @@ pub struct SubmitTxRequest {
 #[derive(Debug, Deserialize)]
 pub struct SubmitTxResponse {
     pub digest: String,
+    pub block_num: u64,
     pub receipt: TransactionReceipt,
 }
 

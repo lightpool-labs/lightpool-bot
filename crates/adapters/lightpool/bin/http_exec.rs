@@ -11,7 +11,7 @@
 //! - `LIGHTPOOL_EXEC_QTY` — size in shares (default `1`)
 //!
 //! Prerequisites:
-//! - `lightpool-clob-index` running
+//! - `lightpool-clob-indexer` running
 //! - `LIGHTPOOL_PRIVATE_KEY` or `~/.lightpool/wallet.json`
 //!
 //! Run:

@@ -14,7 +14,7 @@
 //!   optional for merge/burn: omit to burn min(YES, NO) available balance)
 //!
 //! Prerequisites:
-//! - `lightpool-clob-index` running
+//! - `lightpool-clob-indexer` running
 //! - `LIGHTPOOL_PRIVATE_KEY` or `~/.lightpool/wallet.json`
 //!
 //! Run:

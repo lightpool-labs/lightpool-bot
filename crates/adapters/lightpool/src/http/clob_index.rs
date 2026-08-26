@@ -307,6 +307,7 @@ impl ClobIndexHttpClient {
         let body: SubmitTxResponse = decode_response(response).await?;
         Ok(SubmitTransactionResponse {
             digest: body.digest,
+            block_num: body.block_num,
             receipt: body.receipt,
         })
     }

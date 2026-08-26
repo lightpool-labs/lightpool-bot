@@ -5,7 +5,7 @@ LightPool adapter for NautilusTrader / lightpool-bot.
 - **Data**: clob-index HTTP market bootstrap + WebSocket `orderbook_delta`
 - **Execution**: signed transactions submitted via clob-index `/api/tx/submit`
 
-The bot does not connect to the lightpool node directly. Run `lightpool-clob-index` separately; it owns the node RPC/WS connection.
+The bot does not connect to the lightpool node directly. Run `lightpool-clob-indexer` separately; it owns the node RPC/WS connection.
 
 ## Example
 

@@ -7,7 +7,7 @@
 //! [`ExecTester`] against one YES/NO instrument resolved from a market slug.
 //!
 //! Prerequisites:
-//! - `lightpool-clob-index` running (HTTP/WS)
+//! - `lightpool-clob-indexer` running (HTTP/WS)
 //! - Signing key via `LIGHTPOOL_PRIVATE_KEY` or `~/.lightpool/wallet.json`
 //!
 //! Run:

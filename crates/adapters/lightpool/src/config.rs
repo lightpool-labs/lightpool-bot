@@ -21,7 +21,7 @@ fn reject_lightpool_node_endpoint(name: &str, url: &str) {
     if url.contains(":26300") || url.contains(":26400") {
         log::warn!(
             "{name}={url} looks like a lightpool node endpoint; \
-             point it at lightpool-clob-index instead (default http://127.0.0.1:3002)"
+             point it at lightpool-clob-indexer instead (default http://127.0.0.1:3002)"
         );
     }
 }

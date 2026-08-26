@@ -9,7 +9,7 @@ The bot talks to LightPool through **clob-index** (HTTP + WebSocket). It does no
 - Rust **1.96.0** (see `rust-version` in `Cargo.toml`)
 - Sibling repos under `lightpool-labs/`:
   - `lightpool-node`
-  - `lightpool-clob-index`
+  - `lightpool-clob-indexer`
   - `event-contract-app` (backend + frontend)
   - `lightpool` (CLI scripts)
 - Network access to Polymarket Gamma / CLOB HTTP and WebSocket APIs
@@ -31,12 +31,12 @@ Default local ports: RPC `http://127.0.0.1:26300`, WS `ws://127.0.0.1:26400`, me
 
 See `lightpool-node/README.md` for wallet setup and multi-node scripts.
 
-### 2. CLOB index (`lightpool-clob-index`)
+### 2. CLOB index (`lightpool-clob-indexer`)
 
 Indexes chain events and exposes market / order book / tx APIs for the bot and app.
 
 ```bash
-cd ../lightpool-clob-index
+cd ../lightpool-clob-indexer
 cp .env.example .env   # if present
 cargo run --release
 ```

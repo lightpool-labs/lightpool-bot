@@ -7,7 +7,7 @@
 //! resolve wallet → list user orders → query one order.
 //!
 //! Prerequisites:
-//! - `lightpool-clob-index` running
+//! - `lightpool-clob-indexer` running
 //! - `LIGHTPOOL_PRIVATE_KEY` or `~/.lightpool/wallet.json`
 //!
 //! Run:
