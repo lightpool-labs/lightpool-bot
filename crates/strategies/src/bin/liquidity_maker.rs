@@ -62,6 +62,9 @@ struct Args {
     /// Max Polymarket markets to bootstrap / subscribe (by liquidity).
     #[arg(long, default_value_t = 5)]
     max_markets: u32,
+    /// Skip Polymarket markets where Yes or No price is >= this many cents (still-active filter).
+    #[arg(long, default_value_t = 96.0)]
+    max_outcome_price_cents: f64,
     /// Collateral amount to mint per market (raw units, 6 decimals). Default 1e9 tokens.
     #[arg(long, default_value_t = 1_000_000_000_000_000)]
     mint_amount: u64,
@@ -116,11 +119,17 @@ async fn main() -> Result<()> {
     }
 
     let market_pairs: Vec<MarketPair> = if args.bootstrap_markets {
+        let max_outcome_price = if args.max_outcome_price_cents > 1.5 {
+            args.max_outcome_price_cents / 100.0
+        } else {
+            args.max_outcome_price_cents
+        };
         let boot_cfg = BootstrapConfig {
             polymarket_event_slug: polymarket_slug.clone(),
             max_markets: args.max_markets.max(1),
             mint_amount: args.mint_amount,
             order_field: "liquidity".into(),
+            max_outcome_price,
         };
         bootstrap_markets_from_polymarket(&boot_cfg)
             .await

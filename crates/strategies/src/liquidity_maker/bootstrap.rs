@@ -35,6 +35,9 @@ pub struct BootstrapConfig {
     pub max_markets: u32,
     pub mint_amount: u64,
     pub order_field: String,
+    /// Skip markets where any Yes/No outcome price is >= this value (0–1 scale).
+    /// Default 0.96 (= 96¢) keeps only still-active markets.
+    pub max_outcome_price: f64,
 }
 
 impl Default for BootstrapConfig {
@@ -44,6 +47,7 @@ impl Default for BootstrapConfig {
             max_markets: 5,
             mint_amount: 1_000_000_000_000_000, // 1e9 tokens at 6 decimals
             order_field: "liquidity".into(),
+            max_outcome_price: 0.96,
         }
     }
 }
@@ -69,10 +73,52 @@ fn parse_resolution_deadline(end_date: Option<&str>) -> u64 {
     FALLBACK
 }
 
+fn parse_outcome_prices(raw: &Option<String>) -> Option<Vec<f64>> {
+    let raw = raw.as_ref()?.trim();
+    let body = raw
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))?
+        .trim();
+    if body.is_empty() {
+        return None;
+    }
+    let mut values = Vec::new();
+    for part in body.split(',') {
+        let token = part.trim().trim_matches('"').trim_matches('\'');
+        values.push(token.parse::<f64>().ok()?);
+    }
+    (!values.is_empty()).then_some(values)
+}
+
+fn normalize_outcome_price(price: f64) -> f64 {
+    // Gamma usually returns 0–1; accept cents (e.g. 96) as well.
+    if price > 1.5 {
+        price / 100.0
+    } else {
+        price
+    }
+}
+
+/// Still-active market: every Yes/No outcome price is strictly below `max_price` (0–1).
+fn is_still_active_market(market: &GammaMarket, max_price: f64) -> bool {
+    let Some(prices) = parse_outcome_prices(&market.outcome_prices) else {
+        return false;
+    };
+    if prices.is_empty() {
+        return false;
+    }
+    prices
+        .iter()
+        .copied()
+        .map(normalize_outcome_price)
+        .all(|price| price < max_price)
+}
+
 async fn fetch_top_polymarket_markets(
     event_slug: &str,
     max_markets: u32,
     order_field: &str,
+    max_outcome_price: f64,
 ) -> Result<Vec<GammaMarket>> {
     let proxy = proxy_url_from_env().or_else(|| Some("http://127.0.0.1:8118".into()));
     let client = PolymarketGammaHttpClient::new_with_proxy(
@@ -83,13 +129,14 @@ async fn fetch_top_polymarket_markets(
     )
     .context("create Polymarket Gamma HTTP client")?;
 
+    // Fetch full sorted list first, then filter near-final markets, then take top-N.
     let params = GetGammaMarketsParams {
         active: Some(true),
         closed: Some(false),
         archived: Some(false),
         order: Some(order_field.to_string()),
         ascending: Some(false),
-        max_markets: Some(max_markets),
+        max_markets: None,
         ..Default::default()
     };
 
@@ -101,7 +148,30 @@ async fn fetch_top_polymarket_markets(
     if markets.is_empty() {
         bail!("no Polymarket markets found for event '{event_slug}'");
     }
-    Ok(markets)
+
+    let mut active = Vec::new();
+    for market in markets {
+        if is_still_active_market(&market, max_outcome_price) {
+            active.push(market);
+        } else {
+            log::info!(
+                "skip near-final PM market condition={} prices={:?} (need all < {max_outcome_price})",
+                market.condition_id,
+                market.outcome_prices,
+            );
+        }
+        if active.len() >= max_markets as usize {
+            break;
+        }
+    }
+
+    if active.is_empty() {
+        bail!(
+            "no still-active Polymarket markets for event '{event_slug}' \
+             (all outcomes must be < {max_outcome_price})"
+        );
+    }
+    Ok(active)
 }
 
 /// Fetch top-N Polymarket markets, create+mint matching LightPool markets, return pairs.
@@ -117,14 +187,17 @@ pub async fn bootstrap_markets_from_polymarket(
         &config.polymarket_event_slug,
         config.max_markets,
         &config.order_field,
+        config.max_outcome_price,
     )
     .await?;
 
     log::info!(
-        "Bootstrapping {} LightPool markets from Polymarket event '{}' (mint_amount={})",
+        "Bootstrapping {} LightPool markets from Polymarket event '{}' \
+         (mint_amount={}, max_outcome_price={})",
         pm_markets.len(),
         config.polymarket_event_slug,
         config.mint_amount,
+        config.max_outcome_price,
     );
 
     let mut pairs = Vec::with_capacity(pm_markets.len());
