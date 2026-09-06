@@ -2,6 +2,8 @@
 
 LightPool adapter for NautilusTrader / lightpool-bot.
 
+**LightPool stack version:** `0.5.0`
+
 - **Data**: clob-index HTTP market bootstrap + WebSocket `orderbook_delta`
 - **Execution**: signed transactions submitted via clob-index `/api/tx/submit`
 

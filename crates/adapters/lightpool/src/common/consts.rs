@@ -8,6 +8,9 @@ use ustr::Ustr;
 
 pub const LIGHTPOOL: &str = "LIGHTPOOL";
 
+/// LightPool stack release this adapter targets (node / sdk / indexer / bridge).
+pub const LIGHTPOOL_STACK_VERSION: &str = "0.5.0";
+
 pub static LIGHTPOOL_VENUE: LazyLock<Venue> = LazyLock::new(|| Venue::new(Ustr::from(LIGHTPOOL)));
 
 pub static LIGHTPOOL_CLIENT_ID: LazyLock<ClientId> =
