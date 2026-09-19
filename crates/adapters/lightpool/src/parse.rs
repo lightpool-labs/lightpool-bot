@@ -8,7 +8,7 @@ use nautilus_model::{
     data::{BookOrder, OrderBookDelta, OrderBookDeltas, QuoteTick},
     enums::{AssetClass, BookAction, OrderSide, RecordFlag},
     identifiers::{InstrumentId, Symbol},
-    instruments::{BinaryOption, InstrumentAny},
+    instruments::{BinaryOption, CurrencyPair, InstrumentAny},
     types::{Price, Quantity},
 };
 use rust_decimal::Decimal;
@@ -16,10 +16,11 @@ use ustr::Ustr;
 
 use crate::{
     common::{
-        amounts::raw_to_decimal,
+        amounts::{raw_to_decimal, PriceUnit},
         consts::{LIGHTPOOL_VENUE, MAX_PRICE, MIN_PRICE},
-        currency::collateral_currency,
+        currency::{collateral_currency, register_currency},
     },
+    config::SpotMarketBootstrap,
     http::models::{BookLevel, BookSnapshot, Market},
     websocket::models::{QuoteDelta, QuoteSnapshot},
 };
@@ -97,6 +98,10 @@ pub fn create_instrument(
         "question".to_string(),
         serde_json::Value::String(market.question.clone()),
     );
+    info.insert(
+        "price_unit".to_string(),
+        serde_json::Value::String("cents".to_string()),
+    );
 
     let binary_option = BinaryOption::new_checked(
         instrument_id,
@@ -130,14 +135,113 @@ pub fn create_instrument(
     Ok(InstrumentAny::BinaryOption(binary_option))
 }
 
+/// Bootstrap a LightPool equity spot as a [`CurrencyPair`] with decimal prices.
+pub fn create_spot_instrument(
+    spot: &SpotMarketBootstrap,
+    tick_size_raw: u64,
+    ts_init: UnixNanos,
+) -> anyhow::Result<InstrumentAny> {
+    let symbol_text = spot.symbol.trim().to_ascii_uppercase();
+    if symbol_text.is_empty() {
+        anyhow::bail!("spot market symbol must be non-empty");
+    }
+    let spot_market = spot.spot_market.trim();
+    if spot_market.is_empty() {
+        anyhow::bail!("spot_market address must be non-empty for {symbol_text}");
+    }
+    let base_token = spot.base_token.trim();
+    let quote_token = spot.quote_token.trim();
+    if base_token.is_empty() || quote_token.is_empty() {
+        anyhow::bail!("base_token and quote_token are required for {symbol_text}");
+    }
+
+    let symbol = Symbol::new(format!("{symbol_text}-USDT"));
+    let instrument_id = InstrumentId::new(symbol, *LIGHTPOOL_VENUE);
+    let raw_symbol = Symbol::new(spot_market);
+    let base_currency = register_currency(&symbol_text);
+    let quote_currency = collateral_currency();
+    let price_increment = Price::from_decimal_dp(raw_to_decimal(tick_size_raw), 6)
+        .map_err(|e| anyhow::anyhow!("invalid tick size {tick_size_raw}: {e}"))?;
+    let price_precision = price_increment.precision;
+    let size_increment = Quantity::from("0.000001");
+
+    let mut info = Params::new();
+    info.insert(
+        "tick_size_raw".to_string(),
+        serde_json::Value::from(tick_size_raw),
+    );
+    info.insert(
+        "symbol".to_string(),
+        serde_json::Value::String(symbol_text.clone()),
+    );
+    info.insert(
+        "spot_market".to_string(),
+        serde_json::Value::String(spot_market.to_string()),
+    );
+    info.insert(
+        "base_token".to_string(),
+        serde_json::Value::String(base_token.to_string()),
+    );
+    info.insert(
+        "quote_token".to_string(),
+        serde_json::Value::String(quote_token.to_string()),
+    );
+    info.insert(
+        "collateral_token".to_string(),
+        serde_json::Value::String(quote_token.to_string()),
+    );
+    info.insert(
+        "outcome_token".to_string(),
+        serde_json::Value::String(base_token.to_string()),
+    );
+    info.insert(
+        "price_unit".to_string(),
+        serde_json::Value::String("decimal".to_string()),
+    );
+
+    let currency_pair = CurrencyPair::new_checked(
+        instrument_id,
+        raw_symbol,
+        base_currency,
+        quote_currency,
+        price_precision,
+        6,
+        price_increment,
+        size_increment,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(info),
+        ts_init,
+        ts_init,
+    )
+    .map_err(|e| anyhow::anyhow!("invalid CurrencyPair for equity spot: {e}"))?;
+
+    Ok(InstrumentAny::CurrencyPair(currency_pair))
+}
+
 fn cents_to_decimal(price: &str) -> anyhow::Result<Decimal> {
     let value = Decimal::from_str(price.trim())
         .map_err(|e| anyhow::anyhow!("invalid cents price '{price}': {e}"))?;
     Ok(value / Decimal::from(100))
 }
 
-fn parse_price(price: &str) -> anyhow::Result<Price> {
-    let value = cents_to_decimal(price)?;
+fn parse_price(price: &str, unit: PriceUnit) -> anyhow::Result<Price> {
+    let value = match unit {
+        PriceUnit::Cents => cents_to_decimal(price)?,
+        PriceUnit::Decimal => Decimal::from_str(price.trim())
+            .map_err(|e| anyhow::anyhow!("invalid decimal price '{price}': {e}"))?,
+    };
     Price::from_decimal_dp(value, 6)
         .map_err(|e| anyhow::anyhow!("invalid price '{price}': {e}"))
 }
@@ -181,6 +285,7 @@ fn level_to_delta(
     sequence: u64,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
+    price_unit: PriceUnit,
 ) -> anyhow::Result<OrderBookDelta> {
     let size_value = Decimal::from_str(level.size.trim()).unwrap_or(Decimal::ZERO);
     let action = if size_value.is_zero() {
@@ -188,7 +293,7 @@ fn level_to_delta(
     } else {
         BookAction::Update
     };
-    let price = parse_price(&level.price)?;
+    let price = parse_price(&level.price, price_unit)?;
     let size = parse_quantity(&level.size)?;
     let order = BookOrder::new(side, price, size, 0);
     OrderBookDelta::new_checked(
@@ -207,6 +312,15 @@ pub fn parse_book_snapshot(
     snapshot: &BookSnapshot,
     instrument_id: InstrumentId,
     ts_init: UnixNanos,
+) -> anyhow::Result<OrderBookDeltas> {
+    parse_book_snapshot_with_unit(snapshot, instrument_id, ts_init, PriceUnit::Cents)
+}
+
+pub fn parse_book_snapshot_with_unit(
+    snapshot: &BookSnapshot,
+    instrument_id: InstrumentId,
+    ts_init: UnixNanos,
+    price_unit: PriceUnit,
 ) -> anyhow::Result<OrderBookDeltas> {
     let ts_event = ts_init;
     let total = snapshot.bids.len() + snapshot.asks.len();
@@ -230,6 +344,7 @@ pub fn parse_book_snapshot(
             snapshot.sequence,
             ts_event,
             ts_init,
+            price_unit,
         )?);
     }
 
@@ -247,6 +362,7 @@ pub fn parse_book_snapshot(
             snapshot.sequence,
             ts_event,
             ts_init,
+            price_unit,
         )?);
     }
 
@@ -259,11 +375,27 @@ pub fn parse_quote_tick(
     instrument_id: InstrumentId,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Option<QuoteTick>> {
+    parse_quote_tick_with_unit(
+        best_bid,
+        best_ask,
+        instrument_id,
+        ts_init,
+        PriceUnit::Cents,
+    )
+}
+
+pub fn parse_quote_tick_with_unit(
+    best_bid: Option<&BookLevel>,
+    best_ask: Option<&BookLevel>,
+    instrument_id: InstrumentId,
+    ts_init: UnixNanos,
+    price_unit: PriceUnit,
+) -> anyhow::Result<Option<QuoteTick>> {
     let (Some(bid), Some(ask)) = (best_bid, best_ask) else {
         return Ok(None);
     };
-    let bid_price = parse_price(&bid.price)?;
-    let ask_price = parse_price(&ask.price)?;
+    let bid_price = parse_price(&bid.price, price_unit)?;
+    let ask_price = parse_price(&ask.price, price_unit)?;
     let bid_size = parse_quantity(&bid.size)?;
     let ask_size = parse_quantity(&ask.size)?;
     Ok(Some(QuoteTick::new_checked(
@@ -282,11 +414,21 @@ pub fn parse_quote_snapshot(
     instrument_id: InstrumentId,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Option<QuoteTick>> {
-    parse_quote_tick(
+    parse_quote_snapshot_with_unit(snapshot, instrument_id, ts_init, PriceUnit::Cents)
+}
+
+pub fn parse_quote_snapshot_with_unit(
+    snapshot: &QuoteSnapshot,
+    instrument_id: InstrumentId,
+    ts_init: UnixNanos,
+    price_unit: PriceUnit,
+) -> anyhow::Result<Option<QuoteTick>> {
+    parse_quote_tick_with_unit(
         snapshot.best_bid.as_ref(),
         snapshot.best_ask.as_ref(),
         instrument_id,
         ts_init,
+        price_unit,
     )
 }
 
@@ -295,11 +437,21 @@ pub fn parse_quote_delta(
     instrument_id: InstrumentId,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Option<QuoteTick>> {
-    parse_quote_tick(
+    parse_quote_delta_with_unit(delta, instrument_id, ts_init, PriceUnit::Cents)
+}
+
+pub fn parse_quote_delta_with_unit(
+    delta: &QuoteDelta,
+    instrument_id: InstrumentId,
+    ts_init: UnixNanos,
+    price_unit: PriceUnit,
+) -> anyhow::Result<Option<QuoteTick>> {
+    parse_quote_tick_with_unit(
         delta.best_bid.as_ref(),
         delta.best_ask.as_ref(),
         instrument_id,
         ts_init,
+        price_unit,
     )
 }
 
@@ -309,6 +461,17 @@ pub fn parse_book_delta(
     instrument_id: InstrumentId,
     sequence: u64,
     ts_init: UnixNanos,
+) -> anyhow::Result<OrderBookDeltas> {
+    parse_book_delta_with_unit(bids, asks, instrument_id, sequence, ts_init, PriceUnit::Cents)
+}
+
+pub fn parse_book_delta_with_unit(
+    bids: &[BookLevel],
+    asks: &[BookLevel],
+    instrument_id: InstrumentId,
+    sequence: u64,
+    ts_init: UnixNanos,
+    price_unit: PriceUnit,
 ) -> anyhow::Result<OrderBookDeltas> {
     let ts_event = ts_init;
     let total = bids.len() + asks.len();
@@ -332,6 +495,7 @@ pub fn parse_book_delta(
             sequence,
             ts_event,
             ts_init,
+            price_unit,
         )?);
     }
 
@@ -349,6 +513,7 @@ pub fn parse_book_delta(
             sequence,
             ts_event,
             ts_init,
+            price_unit,
         )?);
     }
 

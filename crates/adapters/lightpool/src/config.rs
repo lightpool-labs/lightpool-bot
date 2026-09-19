@@ -111,12 +111,27 @@ pub fn resolve_private_key() -> anyhow::Result<String> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpotMarketBootstrap {
+    /// Equity ticker as shown in Admin / registry (e.g. `AAPL`).
+    pub symbol: String,
+    /// LightPool spot market ContractAddress (`0x03…`).
+    pub spot_market: String,
+    /// Base (stock) token ContractAddress (`0x02…`).
+    pub base_token: String,
+    /// Quote (USDT) token ContractAddress (`0x02…`).
+    pub quote_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LightpoolDataClientConfig {
     pub clob_index_http_url: String,
     pub clob_index_ws_url: String,
-    /// Market slugs to bootstrap from clob-index.
+    /// Market slugs to bootstrap from clob-index (BinaryOption event markets).
     pub market_slugs: Vec<String>,
+    /// Equity / currency-pair spots to bootstrap without Gamma/slug lookup.
+    pub spot_markets: Vec<SpotMarketBootstrap>,
     /// Default book depth for subscriptions and snapshots.
     pub book_depth: u32,
 }
@@ -127,6 +142,7 @@ impl Default for LightpoolDataClientConfig {
             clob_index_http_url: clob_index_http_from_env(),
             clob_index_ws_url: clob_index_ws_from_env(),
             market_slugs: Vec::new(),
+            spot_markets: Vec::new(),
             book_depth: 10,
         }
     }
@@ -146,6 +162,12 @@ impl LightpoolDataClientConfig {
         self.book_depth = depth;
         self
     }
+
+    #[must_use]
+    pub fn with_spot_markets(mut self, spot_markets: Vec<SpotMarketBootstrap>) -> Self {
+        self.spot_markets = spot_markets;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +177,8 @@ pub struct LightpoolExecClientConfig {
     pub private_key: Option<String>,
     /// Market slugs used to resolve collateral and outcome token addresses before cache is warm.
     pub market_slugs: Vec<String>,
+    /// Equity spots used to resolve base/quote token addresses for balances.
+    pub spot_markets: Vec<SpotMarketBootstrap>,
 }
 
 impl Default for LightpoolExecClientConfig {
@@ -163,6 +187,7 @@ impl Default for LightpoolExecClientConfig {
             clob_index_http_url: clob_index_http_from_env(),
             private_key: private_key_from_env(),
             market_slugs: Vec::new(),
+            spot_markets: Vec::new(),
         }
     }
 }
@@ -181,5 +206,11 @@ impl LightpoolExecClientConfig {
                     "LightPool private key not found: set LIGHTPOOL_PRIVATE_KEY or create a wallet with lightpool-cli (~/.lightpool/wallet.json)"
                 )
             })
+    }
+
+    #[must_use]
+    pub fn with_spot_markets(mut self, spot_markets: Vec<SpotMarketBootstrap>) -> Self {
+        self.spot_markets = spot_markets;
+        self
     }
 }

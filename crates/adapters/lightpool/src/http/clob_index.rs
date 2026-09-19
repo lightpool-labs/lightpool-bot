@@ -9,7 +9,7 @@ use std::{
 
 use reqwest::Client;
 
-use nautilus_core::{Params, time::get_atomic_clock_realtime};
+use nautilus_core::time::get_atomic_clock_realtime;
 use nautilus_model::{
     enums::{OrderSide as NautilusOrderSide, OrderType, TimeInForce as NautilusTimeInForce},
     identifiers::InstrumentId,
@@ -25,10 +25,13 @@ use super::models::{
 use crate::{
     common::{
         amounts::{
-            decimal_to_raw_amount, parse_token_amount_str, probability_to_limit_price,
-            tick_size_from_instrument_info,
+            decimal_to_raw_amount, parse_token_amount_str, tick_size_from_instrument_info,
+            to_limit_price_raw,
         },
         consts::DEFAULT_TICK_SIZE_RAW,
+        instrument_meta::{
+            base_token_from_info, instrument_info, price_unit_for_instrument, quote_token_from_info,
+        },
         signer::signer_from_private_key,
     },
     config::{
@@ -335,8 +338,20 @@ impl ClobIndexHttpClient {
         if !response.receipt.is_success() {
             anyhow::bail!("place_order failed: {:?}", response.receipt.status);
         }
-        let chain_order_id = extract_order_id_from_events(&response.receipt)
-            .ok_or_else(|| anyhow::anyhow!("order_created event missing from receipt"))?;
+        let Some(chain_order_id) = extract_order_id_from_events(&response.receipt) else {
+            log::warn!(
+                "order_created event missing from receipt digest={} block_num={} receipt={:?}",
+                response.digest,
+                response.block_num,
+                response.receipt,
+            );
+            anyhow::bail!(
+                "order_created event missing from receipt digest={} block_num={} receipt={:?}",
+                response.digest,
+                response.block_num,
+                response.receipt,
+            );
+        };
         Ok((response.digest, chain_order_id))
     }
 
@@ -411,8 +426,11 @@ impl ClobIndexHttpClient {
                 let Some(price) = price else {
                     anyhow::bail!("limit orders require a price");
                 };
-                let limit_price =
-                    probability_to_limit_price(price.as_decimal(), tick_size)?;
+                let limit_price = to_limit_price_raw(
+                    price.as_decimal(),
+                    tick_size,
+                    price_unit_for_instrument(&instrument),
+                )?;
                 (
                     OrderParamsType::Limit { tif },
                     limit_price,
@@ -617,13 +635,6 @@ impl ClobIndexHttpClient {
     }
 }
 
-fn instrument_info(instrument: &InstrumentAny) -> Option<&Params> {
-    match instrument {
-        InstrumentAny::BinaryOption(binary_option) => binary_option.info.as_ref(),
-        _ => None,
-    }
-}
-
 fn token_address_for_side(
     instrument: &InstrumentAny,
     side: OrderSide,
@@ -631,19 +642,13 @@ fn token_address_for_side(
 ) -> anyhow::Result<lightpool_sdk::ContractAddress> {
     let info = instrument_info(instrument);
     if side == OrderSide::Buy {
-        let collateral = info
-            .and_then(|params| params.get("collateral_token"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let collateral = quote_token_from_info(info).unwrap_or("");
         parse_token_contract(collateral)
             .or_else(|_| parse_token_contract(spot_market))
-            .map_err(|e| anyhow::anyhow!("missing collateral token for buy order: {e}"))
+            .map_err(|e| anyhow::anyhow!("missing collateral/quote token for buy order: {e}"))
     } else {
-        let outcome_token = info
-            .and_then(|params| params.get("outcome_token"))
-            .and_then(|v| v.as_str())
-            .unwrap_or(spot_market);
+        let outcome_token = base_token_from_info(info).unwrap_or(spot_market);
         parse_token_contract(outcome_token)
-            .map_err(|e| anyhow::anyhow!("missing outcome token for sell order: {e}"))
+            .map_err(|e| anyhow::anyhow!("missing base/outcome token for sell order: {e}"))
     }
 }

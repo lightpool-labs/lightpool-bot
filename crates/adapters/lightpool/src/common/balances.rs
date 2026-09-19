@@ -5,7 +5,6 @@ use std::str::FromStr;
 
 use ahash::AHashSet;
 use nautilus_common::cache::Cache;
-use nautilus_core::Params;
 use nautilus_model::{
     instruments::{Instrument, InstrumentAny},
     types::{AccountBalance, Currency},
@@ -16,8 +15,11 @@ use crate::{
     common::{
         consts::LIGHTPOOL_VENUE,
         currency::{collateral_currency, collateral_currency_code, register_currency},
+        instrument_meta::{
+            base_token_from_info, instrument_info, quote_token_from_info,
+        },
     },
-    config::resolve_collateral_token,
+    config::{resolve_collateral_token, SpotMarketBootstrap},
     http::{
         clob_index::ClobIndexHttpClient,
         models::{BalanceEntry, BalanceTokenSpec, Market},
@@ -54,15 +56,24 @@ fn push_market_token_specs(
     push_token_spec(specs, seen, "NO", &market.no_token);
 }
 
-fn instrument_info(instrument: &InstrumentAny) -> Option<&Params> {
-    match instrument {
-        InstrumentAny::BinaryOption(binary_option) => binary_option.info.as_ref(),
-        _ => None,
-    }
+fn push_spot_token_specs(
+    specs: &mut Vec<BalanceTokenSpec>,
+    seen: &mut AHashSet<String>,
+    spot: &SpotMarketBootstrap,
+) {
+    let collateral_symbol = collateral_currency_code();
+    push_token_spec(specs, seen, &collateral_symbol, &spot.quote_token);
+    push_token_spec(specs, seen, &spot.symbol, &spot.base_token);
 }
 
 fn outcome_symbol_from_instrument(instrument: &InstrumentAny) -> String {
     if let Some(info) = instrument_info(instrument) {
+        if let Some(symbol) = info.get("symbol").and_then(|v| v.as_str()) {
+            let trimmed = symbol.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_ascii_uppercase();
+            }
+        }
         if let Some(outcome) = info.get("outcome").and_then(|v| v.as_str()) {
             let upper = outcome.to_ascii_uppercase();
             if upper == "YES" || upper == "NO" {
@@ -73,6 +84,11 @@ fn outcome_symbol_from_instrument(instrument: &InstrumentAny) -> String {
 
     let instrument_id = instrument.id();
     let symbol = instrument_id.symbol.as_str();
+    if let Some((base, _)) = symbol.split_once('-') {
+        if !base.is_empty() && base != symbol {
+            return base.to_ascii_uppercase();
+        }
+    }
     if let Some(suffix) = symbol.rsplit('-').next() {
         let upper = suffix.to_ascii_uppercase();
         if upper == "YES" || upper == "NO" {
@@ -93,13 +109,13 @@ pub fn collect_balance_token_specs_from_cache(cache: &Cache) -> Vec<BalanceToken
             continue;
         };
 
-        if let Some(collateral) = info.get("collateral_token").and_then(|v| v.as_str()) {
+        if let Some(collateral) = quote_token_from_info(Some(info)) {
             push_token_spec(&mut specs, &mut seen, &collateral_symbol, collateral);
         }
 
-        if let Some(outcome_token) = info.get("outcome_token").and_then(|v| v.as_str()) {
+        if let Some(base_token) = base_token_from_info(Some(info)) {
             let symbol = outcome_symbol_from_instrument(instrument);
-            push_token_spec(&mut specs, &mut seen, &symbol, outcome_token);
+            push_token_spec(&mut specs, &mut seen, &symbol, base_token);
         }
     }
 
@@ -120,17 +136,23 @@ pub async fn resolve_balance_token_specs(
     clob_client: &ClobIndexHttpClient,
     cache_specs: Vec<BalanceTokenSpec>,
     market_slugs: &[String],
+    spot_markets: &[SpotMarketBootstrap],
 ) -> anyhow::Result<Vec<BalanceTokenSpec>> {
     let mut specs = cache_specs;
+    let mut seen: AHashSet<String> = specs
+        .iter()
+        .map(|spec| spec.address.to_ascii_lowercase())
+        .collect();
+
     if specs.is_empty() && !market_slugs.is_empty() {
         let markets = clob_client.fetch_markets_by_slugs(market_slugs).await?;
-        let mut seen: AHashSet<String> = specs
-            .iter()
-            .map(|spec| spec.address.to_ascii_lowercase())
-            .collect();
         for market in &markets {
             push_market_token_specs(&mut specs, &mut seen, market);
         }
+    }
+
+    for spot in spot_markets {
+        push_spot_token_specs(&mut specs, &mut seen, spot);
     }
 
     apply_default_collateral_spec(&mut specs);
@@ -173,9 +195,11 @@ pub async fn fetch_account_balances(
     clob_client: &ClobIndexHttpClient,
     cache_specs: Vec<BalanceTokenSpec>,
     market_slugs: &[String],
+    spot_markets: &[SpotMarketBootstrap],
     user_address: &str,
 ) -> anyhow::Result<Vec<AccountBalance>> {
-    let specs = resolve_balance_token_specs(clob_client, cache_specs, market_slugs).await?;
+    let specs =
+        resolve_balance_token_specs(clob_client, cache_specs, market_slugs, spot_markets).await?;
     if specs.is_empty() {
         anyhow::bail!("no token addresses available for balance refresh");
     }

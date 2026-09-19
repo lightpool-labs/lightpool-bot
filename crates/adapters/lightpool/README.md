@@ -9,6 +9,11 @@ LightPool adapter for NautilusTrader / lightpool-bot.
 
 The bot does not connect to the lightpool node directly. Run `lightpool-clob-indexer` separately; it owns the node RPC/WS connection.
 
+## Markets
+
+- **Event BinaryOption** (Polymarket path): bootstrap via `market_slugs`; book prices are cents (`price_unit=cents`).
+- **Equity CurrencyPair** spots: bootstrap via `spot_markets: Vec<SpotMarketBootstrap>` (symbol, spot_market, base_token, quote_token); book/order prices are human decimals (`price_unit=decimal`). Buy locks quote/USDT; sell locks base.
+
 ## Example
 
 ```sh

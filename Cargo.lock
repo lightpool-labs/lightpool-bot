@@ -5418,7 +5418,7 @@ dependencies = [
 
 [[package]]
 name = "lightpool-sdk"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "alloy-primitives 0.4.2",
  "anyhow",
@@ -5460,6 +5460,7 @@ dependencies = [
  "log",
  "nautilus-common",
  "nautilus-core",
+ "nautilus-hyperliquid",
  "nautilus-lightpool",
  "nautilus-live",
  "nautilus-model",
@@ -5467,6 +5468,8 @@ dependencies = [
  "nautilus-polymarket",
  "nautilus-trading",
  "rust_decimal",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

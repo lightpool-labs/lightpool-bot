@@ -1,6 +1,12 @@
 // Copyright (c) LightPool Labs
 // Author: xiaoyu1998
 
+use std::{
+    collections::HashMap,
+    str::FromStr,
+    sync::{Arc, Mutex},
+};
+
 use async_trait::async_trait;
 use lightpool_sdk::{
     ActionBuilder, OrderParamsType, OrderSide, PlaceOrderParams, Signer, TimeInForce,
@@ -11,32 +17,38 @@ use nautilus_common::{
     live::{get_runtime, runner::get_exec_event_sender},
     messages::execution::{CancelOrder, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder},
 };
-use nautilus_core::{Params, UnixNanos, time::get_atomic_clock_realtime};
+use nautilus_core::{UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
 use nautilus_model::{
     accounts::AccountAny,
-    enums::{OmsType, OrderSide as NautilusOrderSide, OrderStatus, OrderType},
-    identifiers::{AccountId, ClientId, ClientOrderId, Venue, VenueOrderId},
+    enums::{LiquiditySide, OmsType, OrderSide as NautilusOrderSide, OrderStatus, OrderType},
+    identifiers::{AccountId, ClientId, TradeId, Venue, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
     reports::OrderStatusReport,
     types::{AccountBalance, MarginBalance, Money, Quantity},
 };
+use tokio::task::JoinHandle;
 
 use crate::{
-    common::{
+        common::{
         amounts::{
-            decimal_to_raw_amount, format_token_amount, limit_price_string,
-            probability_to_limit_price, tick_size_from_instrument_info,
+            decimal_to_raw_amount, format_token_amount, limit_price_string_for_unit,
+            tick_size_from_instrument_info, to_limit_price_raw,
         },
         balances::{
             collect_balance_token_specs_from_cache, fetch_account_balances,
         },
-        currency::collateral_currency_code,
+        currency::{collateral_currency, collateral_currency_code},
+        instrument_meta::{
+            base_token_from_info, instrument_info, price_unit_for_instrument, quote_token_from_info,
+        },
         signer::signer_from_private_key,
     },
-    config::LightpoolExecClientConfig,
+    config::{LightpoolExecClientConfig, clob_index_ws_from_env},
     http::{clob_index::ClobIndexHttpClient, models::{BalanceTokenSpec, OrderQueryResponse}},
+    websocket::clob_index::{ClobIndexWsClient, ClobIndexWsMessage},
+    websocket::models::{UserOrderMessage, UserTradeMessage},
 };
 
 pub struct LightpoolExecutionClient {
@@ -45,6 +57,8 @@ pub struct LightpoolExecutionClient {
     config: LightpoolExecClientConfig,
     clob_client: ClobIndexHttpClient,
     private_key: Option<String>,
+    ws_stream_handle: Mutex<Option<JoinHandle<()>>>,
+    tracked_orders: Arc<Mutex<HashMap<String, OrderAny>>>,
 }
 
 impl std::fmt::Debug for LightpoolExecutionClient {
@@ -84,6 +98,8 @@ impl LightpoolExecutionClient {
             config,
             clob_client,
             private_key,
+            ws_stream_handle: Mutex::new(None),
+            tracked_orders: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -113,6 +129,7 @@ impl LightpoolExecutionClient {
             self.emitter.clone(),
             self.balance_token_specs_from_cache(),
             self.config.market_slugs.clone(),
+            self.config.spot_markets.clone(),
         );
     }
 
@@ -135,6 +152,7 @@ impl LightpoolExecutionClient {
         let spot_market = instrument.raw_symbol().to_string();
         let emitter = self.emitter.clone();
         let clob_client = self.clob_client.clone();
+        let tracked_orders = self.tracked_orders.clone();
         let ts_event = self.ts_event();
 
         self.emitter.emit_order_submitted(&order);
@@ -158,6 +176,7 @@ impl LightpoolExecutionClient {
             .await
             {
                 Ok(chain_order_id) => {
+                    track_order(&tracked_orders, &chain_order_id, &order);
                     emitter.emit_order_accepted(
                         &order,
                         VenueOrderId::from(chain_order_id.as_str()),
@@ -170,12 +189,52 @@ impl LightpoolExecutionClient {
             }
         });
     }
-}
 
-fn instrument_info(instrument: &InstrumentAny) -> Option<&Params> {
-    match instrument {
-        InstrumentAny::BinaryOption(binary_option) => binary_option.info.as_ref(),
-        _ => None,
+    async fn start_ws_stream(&mut self, user_address: String) -> anyhow::Result<()> {
+        if let Some(handle) = self
+            .ws_stream_handle
+            .lock()
+            .expect("ws stream handle")
+            .take()
+        {
+            handle.abort();
+        }
+
+        let mut ws = ClobIndexWsClient::new(clob_index_ws_from_env());
+        ws.connect()
+            .await
+            .map_err(|e| anyhow::anyhow!("LightPool user stream connect failed: {e:#}"))?;
+        ws.subscribe_user(&user_address)
+            .await
+            .map_err(|e| anyhow::anyhow!("LightPool user stream subscribe failed: {e:#}"))?;
+        log::info!("Subscribed to LightPool execution updates for {user_address}");
+
+        let emitter = self.emitter.clone();
+        let tracked_orders = self.tracked_orders.clone();
+        let handle = get_runtime().spawn(async move {
+            loop {
+                match ws.next_event().await {
+                    Some(ClobIndexWsMessage::UserOrder(message)) => {
+                        apply_user_order(&tracked_orders, &emitter, &message);
+                    }
+                    Some(ClobIndexWsMessage::UserTrade(message)) => {
+                        apply_user_trade(&tracked_orders, &emitter, &message);
+                    }
+                    Some(ClobIndexWsMessage::Error(error)) => {
+                        log::warn!("LightPool user stream error: {error}");
+                    }
+                    None => {
+                        log::debug!("LightPool user stream closed");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        *self.ws_stream_handle.lock().expect("ws stream handle") = Some(handle);
+        log::info!("LightPool WebSocket execution stream started");
+        Ok(())
     }
 }
 
@@ -195,6 +254,191 @@ fn map_index_status(status: &str, filled_raw: u64) -> OrderStatus {
         "open" if filled_raw > 0 => OrderStatus::PartiallyFilled,
         "open" => OrderStatus::Accepted,
         _ => OrderStatus::Accepted,
+    }
+}
+
+fn track_order(tracked: &Mutex<HashMap<String, OrderAny>>, chain_order_id: &str, order: &OrderAny) {
+    if let Ok(mut tracked) = tracked.lock() {
+        tracked.insert(chain_order_id.to_string(), order.clone());
+    }
+}
+
+fn tracked_order(tracked: &Mutex<HashMap<String, OrderAny>>, chain_order_id: &str) -> Option<OrderAny> {
+    tracked
+        .lock()
+        .ok()
+        .and_then(|tracked| tracked.get(chain_order_id).cloned())
+}
+
+fn apply_user_order(
+    tracked: &Mutex<HashMap<String, OrderAny>>,
+    emitter: &ExecutionEventEmitter,
+    message: &UserOrderMessage,
+) {
+    let Some(order) = tracked_order(tracked, &message.chain_order_id) else {
+        return;
+    };
+    if order.is_closed() {
+        return;
+    }
+    let venue_order_id = VenueOrderId::from(message.chain_order_id.as_str());
+    let ts_event = get_atomic_clock_realtime().get_time_ns();
+    let status = message
+        .extra
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if message.event == "cancellation" || status == "cancelled" || status == "canceled" {
+        log::info!(
+            "LightPool order cancelled client_order_id={} venue_order_id={venue_order_id}",
+            order.client_order_id(),
+        );
+        emitter.emit_order_canceled(&order, Some(venue_order_id), ts_event);
+        return;
+    }
+    if status == "filled" {
+        emit_closing_fill(emitter, &order, venue_order_id, message.block_num.unwrap_or(0), ts_event);
+        return;
+    }
+    if message.event != "update" {
+        return;
+    }
+    let Some(size) = message.extra.get("size").and_then(|value| value.as_str()) else {
+        return;
+    };
+    let Ok(quantity) = Quantity::from_str(size) else {
+        log::warn!(
+            "LightPool order update ignored client_order_id={} invalid size={size}",
+            order.client_order_id(),
+        );
+        return;
+    };
+    if !order.is_pending_update() && order.quantity().as_decimal() == quantity.as_decimal() {
+        return;
+    }
+    log::info!(
+        "LightPool order updated client_order_id={} venue_order_id={venue_order_id} quantity={quantity}",
+        order.client_order_id(),
+    );
+    emitter.emit_order_updated(
+        &order,
+        venue_order_id,
+        quantity,
+        None,
+        None,
+        None,
+        ts_event,
+    );
+}
+
+fn apply_user_trade(
+    tracked: &Mutex<HashMap<String, OrderAny>>,
+    emitter: &ExecutionEventEmitter,
+    message: &UserTradeMessage,
+) {
+    let Some(order) = tracked_order(tracked, &message.chain_order_id) else {
+        return;
+    };
+    if order.is_closed() {
+        return;
+    }
+    let Some(fill_amount) = message.fill_amount.as_deref() else {
+        return;
+    };
+    let fully_filled = message.is_fully_filled.unwrap_or(false)
+        || message
+            .remaining_amount
+            .as_deref()
+            .is_some_and(|amount| amount == "0" || amount == "0.0");
+    let Some(last_qty) = fill_quantity_for_order(&order, fill_amount, fully_filled) else {
+        return;
+    };
+    let Some(last_px) = order.price() else {
+        return;
+    };
+    let venue_order_id = VenueOrderId::from(message.chain_order_id.as_str());
+    let trade_id = lightpool_trade_id(
+        &message.chain_order_id,
+        message.block_num.unwrap_or(0),
+        "trade",
+    );
+    let ts_event = get_atomic_clock_realtime().get_time_ns();
+    log::info!(
+        "LightPool order filled client_order_id={} venue_order_id={venue_order_id} last_qty={last_qty} last_px={last_px} fully_filled={fully_filled}",
+        order.client_order_id(),
+    );
+    emitter.emit_order_filled(
+        &order,
+        venue_order_id,
+        None,
+        trade_id,
+        last_qty,
+        last_px,
+        collateral_currency(),
+        None,
+        LiquiditySide::Maker,
+        ts_event,
+    );
+}
+
+fn emit_closing_fill(
+    emitter: &ExecutionEventEmitter,
+    order: &OrderAny,
+    venue_order_id: VenueOrderId,
+    block_num: u64,
+    ts_event: UnixNanos,
+) {
+    let Some(last_qty) = order.leaves_qty().is_positive().then(|| order.leaves_qty()) else {
+        return;
+    };
+    let Some(last_px) = order.price() else {
+        return;
+    };
+    let trade_id = lightpool_trade_id(venue_order_id.as_str(), block_num, "filled");
+    log::info!(
+        "LightPool order filled from index status client_order_id={} venue_order_id={venue_order_id} last_qty={last_qty}",
+        order.client_order_id(),
+    );
+    emitter.emit_order_filled(
+        order,
+        venue_order_id,
+        None,
+        trade_id,
+        last_qty,
+        last_px,
+        collateral_currency(),
+        None,
+        LiquiditySide::Maker,
+        ts_event,
+    );
+}
+
+fn fill_quantity_for_order(order: &OrderAny, reported: &str, fully_filled: bool) -> Option<Quantity> {
+    let leaves = order.leaves_qty();
+    if let Ok(parsed) = Quantity::from_str(reported) {
+        if let Ok(aligned) =
+            Quantity::from_decimal_dp(parsed.as_decimal(), order.quantity().precision)
+        {
+            if aligned.is_positive() {
+                if leaves.is_positive() && aligned.as_decimal() > leaves.as_decimal() {
+                    return Some(leaves);
+                }
+                return Some(aligned);
+            }
+        }
+    }
+    if fully_filled && leaves.is_positive() {
+        return Some(leaves);
+    }
+    None
+}
+
+fn lightpool_trade_id(chain_order_id: &str, block_num: u64, kind: &str) -> TradeId {
+    let trade_key = format!("lp-{kind}-{chain_order_id}-{block_num}");
+    if trade_key.len() <= 36 {
+        TradeId::new(trade_key)
+    } else {
+        TradeId::new(&trade_key[trade_key.len() - 36..])
     }
 }
 
@@ -249,9 +493,10 @@ async fn query_order_from_index(
         .price()
         .ok_or_else(|| anyhow::anyhow!("limit order missing price"))?
         .as_decimal();
-    let price = limit_price_string(
+    let price = limit_price_string_for_unit(
         price_decimal,
         tick_size_from_instrument_info(instrument_info(instrument)),
+        price_unit_for_instrument(instrument),
     )?;
     let size_raw = decimal_to_raw_amount(order.quantity().as_decimal())?;
     clob_client
@@ -270,8 +515,10 @@ async fn submit_limit_order_via_index(
 
     let price_decimal = order.price().map(|p| p.as_decimal());
     let price_decimal = price_decimal.ok_or_else(|| anyhow::anyhow!("limit order missing price"))?;
-    let tick_size = tick_size_from_instrument_info(instrument_info(instrument));
-    let limit_price = probability_to_limit_price(price_decimal, tick_size)?;
+    let info = instrument_info(instrument);
+    let tick_size = tick_size_from_instrument_info(info);
+    let price_unit = price_unit_for_instrument(instrument);
+    let limit_price = to_limit_price_raw(price_decimal, tick_size, price_unit)?;
 
     let size_decimal = order.quantity().as_decimal();
     let amount = decimal_to_raw_amount(size_decimal)?;
@@ -285,22 +532,15 @@ async fn submit_limit_order_via_index(
         other => anyhow::bail!("unsupported order side: {other:?}"),
     };
 
-    let info = instrument_info(instrument);
     let token_address = if side == OrderSide::Buy {
-        let collateral = info
-            .and_then(|params| params.get("collateral_token"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let collateral = quote_token_from_info(info).unwrap_or("");
         parse_token_contract(collateral)
             .or_else(|_| parse_token_contract(&spot_market_display))
-            .map_err(|e| anyhow::anyhow!("missing collateral token for buy order: {e}"))?
+            .map_err(|e| anyhow::anyhow!("missing collateral/quote token for buy order: {e}"))?
     } else {
-        let outcome_token = info
-            .and_then(|params| params.get("outcome_token"))
-            .and_then(|v| v.as_str())
-            .unwrap_or(&spot_market_display);
+        let outcome_token = base_token_from_info(info).unwrap_or(&spot_market_display);
         parse_token_contract(outcome_token)
-            .map_err(|e| anyhow::anyhow!("missing outcome token for sell order: {e}"))?
+            .map_err(|e| anyhow::anyhow!("missing base/outcome token for sell order: {e}"))?
     };
 
     let params = PlaceOrderParams {
@@ -365,6 +605,14 @@ impl ExecutionClient for LightpoolExecutionClient {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
+        if let Some(handle) = self
+            .ws_stream_handle
+            .lock()
+            .expect("ws stream handle")
+            .take()
+        {
+            handle.abort();
+        }
         self.core.set_disconnected();
         Ok(())
     }
@@ -398,6 +646,7 @@ impl ExecutionClient for LightpoolExecutionClient {
                     &self.clob_client,
                     cache_specs,
                     &self.config.market_slugs,
+                    &self.config.spot_markets,
                     &address,
                 )
                 .await
@@ -428,6 +677,11 @@ impl ExecutionClient for LightpoolExecutionClient {
             collateral_currency_code(),
         );
         self.core.set_connected();
+        if let Some(private_key) = self.private_key.clone()
+            && let Ok(signer) = signer_from_private_key(&private_key)
+        {
+            self.start_ws_stream(signer.address().to_string()).await?;
+        }
         Ok(())
     }
 
@@ -501,6 +755,15 @@ impl ExecutionClient for LightpoolExecutionClient {
             match cancel_order_via_index(&clob_client, &signer, &spot_market, chain_order_id).await
             {
                 Ok(()) => {
+                    emitter.emit_order_canceled(&order, Some(venue_order_id), ts_event);
+                }
+                Err(e) if chain_order_missing(&e) => {
+                    log::warn!(
+                        "cancel_order: chain order missing, cancel locally client_order_id={} venue_order_id={} chain_order_id={} error={e:#}",
+                        order.client_order_id(),
+                        venue_order_id,
+                        chain_order_id,
+                    );
                     emitter.emit_order_canceled(&order, Some(venue_order_id), ts_event);
                 }
                 Err(e) => emitter.emit_order_cancel_rejected(
@@ -610,6 +873,15 @@ impl ExecutionClient for LightpoolExecutionClient {
                         ts_event,
                     );
                 }
+                Err(e) if chain_order_missing(&e) => {
+                    log::warn!(
+                        "modify_order: chain order missing, cancel locally client_order_id={} venue_order_id={} chain_order_id={} error={e:#}",
+                        order.client_order_id(),
+                        venue_order_id,
+                        chain_order_id,
+                    );
+                    emitter.emit_order_canceled(&order, Some(venue_order_id), ts_event);
+                }
                 Err(e) => {
                     log::warn!(
                         "modify_order: failed client_order_id={} venue_order_id={} chain_order_id={} error={e:#}",
@@ -707,6 +979,10 @@ impl ExecutionClient for LightpoolExecutionClient {
     }
 }
 
+fn chain_order_missing(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("Order meta not found")
+}
+
 async fn cancel_order_via_index(
     clob_client: &ClobIndexHttpClient,
     signer: &Signer,
@@ -729,20 +1005,14 @@ fn token_address_for_order(
     let spot_market_display = spot_market_str.to_string();
 
     if side == NautilusOrderSide::Buy {
-        let collateral = info
-            .and_then(|params| params.get("collateral_token"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let collateral = quote_token_from_info(info).unwrap_or("");
         parse_token_contract(collateral)
             .or_else(|_| parse_token_contract(&spot_market_display))
-            .map_err(|e| anyhow::anyhow!("missing collateral token for buy order: {e}"))
+            .map_err(|e| anyhow::anyhow!("missing collateral/quote token for buy order: {e}"))
     } else {
-        let outcome_token = info
-            .and_then(|params| params.get("outcome_token"))
-            .and_then(|v| v.as_str())
-            .unwrap_or(&spot_market_display);
+        let outcome_token = base_token_from_info(info).unwrap_or(&spot_market_display);
         parse_token_contract(outcome_token)
-            .map_err(|e| anyhow::anyhow!("missing outcome token for sell order: {e}"))
+            .map_err(|e| anyhow::anyhow!("missing base/outcome token for sell order: {e}"))
     }
 }
 
@@ -796,6 +1066,7 @@ fn spawn_account_balance_refresh(
     emitter: ExecutionEventEmitter,
     cache_specs: Vec<BalanceTokenSpec>,
     market_slugs: Vec<String>,
+    spot_markets: Vec<crate::config::SpotMarketBootstrap>,
 ) {
     get_runtime().spawn(async move {
 
@@ -808,7 +1079,15 @@ fn spawn_account_balance_refresh(
         };
         let address = signer.address().to_string();
 
-        match fetch_account_balances(&clob_client, cache_specs, &market_slugs, &address).await {
+        match fetch_account_balances(
+            &clob_client,
+            cache_specs,
+            &market_slugs,
+            &spot_markets,
+            &address,
+        )
+        .await
+        {
             Ok(balances) => {
                 let ts_event = get_atomic_clock_realtime().get_time_ns();
                 log::debug!(

@@ -34,14 +34,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     common::{
-        amounts::parse_token_amount_str,
+        amounts::{parse_token_amount_str, PriceUnit},
         consts::{DEFAULT_TICK_SIZE_RAW, LIGHTPOOL_VENUE},
+        instrument_meta::price_unit_for_instrument,
     },
     config::LightpoolDataClientConfig,
     http::clob_index::ClobIndexHttpClient,
     parse::{
-        instruments_for_market, parse_book_delta, parse_book_snapshot, parse_quote_delta,
-        parse_quote_snapshot,
+        create_spot_instrument, instruments_for_market, parse_book_delta_with_unit,
+        parse_book_snapshot_with_unit, parse_quote_delta_with_unit, parse_quote_snapshot_with_unit,
     },
     websocket::clob_index::{ClobIndexWsClient, ClobIndexWsMessage},
 };
@@ -117,36 +118,58 @@ impl LightpoolDataClient {
         }
     }
 
+    fn register_bootstrapped_instrument(
+        &mut self,
+        instrument: InstrumentAny,
+        cached: &mut Vec<InstrumentAny>,
+        count: &mut usize,
+    ) {
+        let instrument_id = instrument.id();
+        let spot_market = instrument.raw_symbol().to_string();
+        self.spot_market_by_instrument
+            .insert(instrument_id, spot_market.clone());
+        self.instrument_by_spot_market
+            .insert(spot_market, instrument_id);
+        self.instruments.insert(instrument_id, instrument.clone());
+        cached.push(instrument.clone());
+        if let Err(e) = self.data_sender.send(DataEvent::Instrument(instrument)) {
+            log::warn!("Failed to publish instrument {instrument_id}: {e}");
+        }
+        *count += 1;
+    }
+
     async fn bootstrap_instruments(&mut self) -> anyhow::Result<()> {
-        let markets = self
-            .http_client
-            .fetch_markets_by_slugs(&self.config.market_slugs)
-            .await?;
         let ts_init = self.clock.get_time_ns();
         let mut count = 0usize;
         let mut cached = Vec::new();
 
-        for market in markets {
-            let yes_tick = self.resolve_tick_size_raw(&market.yes_spot_market).await;
-            let no_tick = self.resolve_tick_size_raw(&market.no_spot_market).await;
-            log::info!(
-                "Lightpool market slug={} yes_tick_raw={yes_tick} no_tick_raw={no_tick}",
-                market.slug,
-            );
-            for instrument in instruments_for_market(&market, yes_tick, no_tick, ts_init)? {
-                let instrument_id = instrument.id();
-                let spot_market = instrument.raw_symbol().to_string();
-                self.spot_market_by_instrument
-                    .insert(instrument_id, spot_market.clone());
-                self.instrument_by_spot_market
-                    .insert(spot_market, instrument_id);
-                self.instruments.insert(instrument_id, instrument.clone());
-                cached.push(instrument.clone());
-                if let Err(e) = self.data_sender.send(DataEvent::Instrument(instrument)) {
-                    log::warn!("Failed to publish instrument {instrument_id}: {e}");
+        if !self.config.market_slugs.is_empty() {
+            let markets = self
+                .http_client
+                .fetch_markets_by_slugs(&self.config.market_slugs)
+                .await?;
+            for market in markets {
+                let yes_tick = self.resolve_tick_size_raw(&market.yes_spot_market).await;
+                let no_tick = self.resolve_tick_size_raw(&market.no_spot_market).await;
+                log::info!(
+                    "Lightpool market slug={} yes_tick_raw={yes_tick} no_tick_raw={no_tick}",
+                    market.slug,
+                );
+                for instrument in instruments_for_market(&market, yes_tick, no_tick, ts_init)? {
+                    self.register_bootstrapped_instrument(instrument, &mut cached, &mut count);
                 }
-                count += 1;
             }
+        }
+
+        for spot in self.config.spot_markets.clone() {
+            let tick = self.resolve_tick_size_raw(&spot.spot_market).await;
+            log::info!(
+                "Lightpool equity spot symbol={} spot_market={} tick_raw={tick}",
+                spot.symbol,
+                spot.spot_market,
+            );
+            let instrument = create_spot_instrument(&spot, tick, ts_init)?;
+            self.register_bootstrapped_instrument(instrument, &mut cached, &mut count);
         }
 
         self.ws_client.cache_instruments(cached);
@@ -161,9 +184,18 @@ impl LightpoolDataClient {
         let data_sender = self.data_sender.clone();
         let clock = self.clock;
         let instrument_by_spot_market = self.instrument_by_spot_market.clone();
+        let instruments = self.instruments.clone();
         let active_delta_subs = self.active_delta_subs.clone();
         let active_quote_subs = self.active_quote_subs.clone();
         let cancel = self.cancellation_token.child_token();
+
+        let price_unit_of = move |instrument_id: InstrumentId| -> PriceUnit {
+            instruments
+                .load()
+                .get(&instrument_id)
+                .map(price_unit_for_instrument)
+                .unwrap_or(PriceUnit::Cents)
+        };
 
         let handle = get_runtime().spawn(async move {
             loop {
@@ -189,9 +221,13 @@ impl LightpoolDataClient {
                                     asks: snapshot.asks,
                                     last_trade_price: snapshot.last_trade_price,
                                 };
-                                if let Ok(deltas) =
-                                    parse_book_snapshot(&book, instrument_id, ts_init)
-                                {
+                                let price_unit = price_unit_of(instrument_id);
+                                if let Ok(deltas) = parse_book_snapshot_with_unit(
+                                    &book,
+                                    instrument_id,
+                                    ts_init,
+                                    price_unit,
+                                ) {
                                     let _ = data_sender.send(DataEvent::Data(
                                         NautilusData::Deltas(OrderBookDeltas_API::new(deltas)),
                                     ));
@@ -207,12 +243,14 @@ impl LightpoolDataClient {
                                 if !active_delta_subs.contains_key(&instrument_id) {
                                     continue;
                                 }
-                                if let Ok(deltas) = parse_book_delta(
+                                let price_unit = price_unit_of(instrument_id);
+                                if let Ok(deltas) = parse_book_delta_with_unit(
                                     &delta.bids,
                                     &delta.asks,
                                     instrument_id,
                                     delta.sequence,
                                     ts_init,
+                                    price_unit,
                                 ) {
                                     let _ = data_sender.send(DataEvent::Data(
                                         NautilusData::Deltas(OrderBookDeltas_API::new(deltas)),
@@ -229,7 +267,13 @@ impl LightpoolDataClient {
                                 if !active_quote_subs.contains_key(&instrument_id) {
                                     continue;
                                 }
-                                match parse_quote_snapshot(&snapshot, instrument_id, ts_init) {
+                                let price_unit = price_unit_of(instrument_id);
+                                match parse_quote_snapshot_with_unit(
+                                    &snapshot,
+                                    instrument_id,
+                                    ts_init,
+                                    price_unit,
+                                ) {
                                     Ok(Some(tick)) => {
                                         let _ = data_sender
                                             .send(DataEvent::Data(NautilusData::Quote(tick)));
@@ -250,7 +294,13 @@ impl LightpoolDataClient {
                                 if !active_quote_subs.contains_key(&instrument_id) {
                                     continue;
                                 }
-                                match parse_quote_delta(&delta, instrument_id, ts_init) {
+                                let price_unit = price_unit_of(instrument_id);
+                                match parse_quote_delta_with_unit(
+                                    &delta,
+                                    instrument_id,
+                                    ts_init,
+                                    price_unit,
+                                ) {
                                     Ok(Some(tick)) => {
                                         let _ = data_sender
                                             .send(DataEvent::Data(NautilusData::Quote(tick)));

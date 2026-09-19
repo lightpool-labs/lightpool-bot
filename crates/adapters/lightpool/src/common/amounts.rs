@@ -4,8 +4,32 @@
 use std::str::FromStr;
 
 use lightpool_sdk::TOKEN_SCALE;
+use nautilus_core::Params;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+
+/// How LightPool book / order prices are encoded for an instrument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PriceUnit {
+    /// Event binary markets: API cents string, Nautilus probability in `[0, 1]`.
+    #[default]
+    Cents,
+    /// Equity / currency-pair spots: human decimal (e.g. `331.5`).
+    Decimal,
+}
+
+impl PriceUnit {
+    #[must_use]
+    pub fn from_info(info: Option<&Params>) -> Self {
+        match info
+            .and_then(|params| params.get("price_unit"))
+            .and_then(|value| value.as_str())
+        {
+            Some(unit) if unit.eq_ignore_ascii_case("decimal") => Self::Decimal,
+            _ => Self::Cents,
+        }
+    }
+}
 
 pub fn raw_to_decimal(raw: u64) -> Decimal {
     Decimal::from(raw) / Decimal::from(TOKEN_SCALE)
@@ -42,6 +66,28 @@ pub fn probability_to_limit_price(price: Decimal, tick_size: u64) -> anyhow::Res
     Ok(aligned)
 }
 
+/// Convert a Nautilus limit price to on-chain raw units for the given price unit.
+pub fn to_limit_price_raw(
+    price: Decimal,
+    tick_size: u64,
+    unit: PriceUnit,
+) -> anyhow::Result<u64> {
+    match unit {
+        PriceUnit::Cents => probability_to_limit_price(price, tick_size),
+        PriceUnit::Decimal => {
+            if price <= Decimal::ZERO {
+                anyhow::bail!("price must be positive");
+            }
+            let raw = decimal_to_raw_amount(price)?;
+            let aligned = align_raw_to_tick(raw, tick_size);
+            if aligned == 0 {
+                anyhow::bail!("price rounds to zero");
+            }
+            Ok(aligned)
+        }
+    }
+}
+
 pub fn format_token_amount(raw: u64) -> String {
     let whole = raw / TOKEN_SCALE;
     let frac = raw % TOKEN_SCALE;
@@ -51,7 +97,7 @@ pub fn format_token_amount(raw: u64) -> String {
     format!("{whole}.{frac:06}", frac = frac)
 }
 
-pub fn tick_size_from_instrument_info(info: Option<&nautilus_core::Params>) -> u64 {
+pub fn tick_size_from_instrument_info(info: Option<&Params>) -> u64 {
     info.and_then(|params| params.get("tick_size_raw"))
         .and_then(|value| value.as_u64())
         .filter(|tick| *tick > 0)
@@ -72,4 +118,17 @@ pub fn format_price_pieces(raw: u64) -> String {
 
 pub fn limit_price_string(price: Decimal, tick_size: u64) -> anyhow::Result<String> {
     Ok(format_price_pieces(probability_to_limit_price(price, tick_size)?))
+}
+
+/// Format a limit price for clob-index query matching (cents vs human decimal).
+pub fn limit_price_string_for_unit(
+    price: Decimal,
+    tick_size: u64,
+    unit: PriceUnit,
+) -> anyhow::Result<String> {
+    let raw = to_limit_price_raw(price, tick_size, unit)?;
+    Ok(match unit {
+        PriceUnit::Cents => format_price_pieces(raw),
+        PriceUnit::Decimal => format_token_amount(raw),
+    })
 }

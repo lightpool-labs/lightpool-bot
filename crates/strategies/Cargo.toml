@@ -23,6 +23,7 @@ nautilus-core = { workspace = true }
 nautilus-live = { workspace = true, features = ["node"] }
 nautilus-polymarket = { workspace = true, default-features = true }
 nautilus-lightpool = { workspace = true, default-features = true }
+nautilus-hyperliquid = { workspace = true, default-features = true }
 nautilus-network = { workspace = true }
 
 ahash = { workspace = true }
@@ -30,6 +31,8 @@ anyhow = { workspace = true }
 chrono = { workspace = true }
 indexmap = { workspace = true }
 rust_decimal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }
 dotenvy = "0.15"
 log = { workspace = true }
@@ -38,3 +41,7 @@ tokio = { workspace = true }
 [[bin]]
 name = "liquidity-maker"
 path = "src/bin/liquidity_maker.rs"
+
+[[bin]]
+name = "equity-liquidity-maker"
+path = "src/bin/equity_liquidity_maker.rs"
