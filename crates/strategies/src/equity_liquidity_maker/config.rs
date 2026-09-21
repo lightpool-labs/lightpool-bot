@@ -37,7 +37,7 @@ impl EquityLiquidityMakerConfig {
                 ..Default::default()
             },
             markets,
-            depth: 10,
+            depth: 20,
             log_interval: 50,
             managed_book: true,
             lightpool_client_id: ClientId::from("LIGHTPOOL"),

@@ -41,10 +41,10 @@ use crate::{
     parse::instruments_for_market,
 };
 use lightpool_sdk::{
-    spot_events::extract_order_id_from_events, ActionBuilder, BurnEventContractParams,
-    CancelOrderParams, MintEventContractParams, OrderParamsType, OrderSide, PlaceOrderParams,
-    Signer, TimeInForce, TransactionBuilder, lightpool_types::SignedTransaction,
-    parse_token_contract, types::SubmitTransactionResponse,
+    spot_events::{extract_order_id_from_events, place_order_fully_matched},
+    ActionBuilder, BurnEventContractParams, CancelOrderParams, MintEventContractParams,
+    OrderParamsType, OrderSide, PlaceOrderParams, Signer, TimeInForce, TransactionBuilder,
+    lightpool_types::SignedTransaction, parse_token_contract, types::SubmitTransactionResponse,
 };
 use rust_decimal::Decimal;
 
@@ -317,13 +317,14 @@ impl ClobIndexHttpClient {
 
     /// Low-level place-order: build action, sign, submit.
     ///
-    /// Returns `(digest, chain_order_id)`.
+    /// Returns `(digest, chain_order_id, fully_matched)`.
+    /// `fully_matched` is true when the receipt has fills but no resting `order_created`.
     pub async fn submit_order_params(
         &self,
         signer: &Signer,
         spot_market: &str,
         params: PlaceOrderParams,
-    ) -> anyhow::Result<(String, u64)> {
+    ) -> anyhow::Result<(String, u64, bool)> {
         let spot = parse_token_contract(spot_market)
             .map_err(|e| anyhow::anyhow!("invalid spot market: {e}"))?;
         let action = ActionBuilder::place_order(spot, params)
@@ -340,19 +341,25 @@ impl ClobIndexHttpClient {
         }
         let Some(chain_order_id) = extract_order_id_from_events(&response.receipt) else {
             log::warn!(
-                "order_created event missing from receipt digest={} block_num={} receipt={:?}",
+                "place_order receipt missing order_created and order_filled digest={} block_num={} receipt={:?}",
                 response.digest,
                 response.block_num,
                 response.receipt,
             );
             anyhow::bail!(
-                "order_created event missing from receipt digest={} block_num={} receipt={:?}",
+                "place_order receipt missing order_created and order_filled digest={} block_num={}",
                 response.digest,
                 response.block_num,
-                response.receipt,
             );
         };
-        Ok((response.digest, chain_order_id))
+        let fully_matched = place_order_fully_matched(&response.receipt);
+        if fully_matched {
+            log::info!(
+                "place_order fully matched on submit chain_order_id={chain_order_id} digest={}",
+                response.digest,
+            );
+        }
+        Ok((response.digest, chain_order_id, fully_matched))
     }
 
     /// Low-level cancel-order: build action, sign, submit.
@@ -447,9 +454,12 @@ impl ClobIndexHttpClient {
             order_type,
             limit_price,
             token_address,
+            cloid: None,
         };
-        self.submit_order_params(signer.as_ref(), &spot_market, params)
-            .await
+        let (digest, chain_order_id, _fully_matched) = self
+            .submit_order_params(signer.as_ref(), &spot_market, params)
+            .await?;
+        Ok((digest, chain_order_id))
     }
 
     /// Cancel an order using cached instrument metadata and the client signer.

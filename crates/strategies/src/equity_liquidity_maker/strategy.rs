@@ -11,6 +11,7 @@ use nautilus_common::actor::DataActor;
 use nautilus_model::{
     data::OrderBookDeltas,
     enums::BookType,
+    events::OrderCanceled,
     identifiers::InstrumentId,
 };
 use nautilus_trading::{nautilus_strategy, strategy::StrategyCore};
@@ -210,5 +211,9 @@ impl DataActor for EquityLiquidityMaker {
         self.maybe_log_book(instrument_id);
         self.collect_hl_delta_for_reconcile(instrument_id);
         Ok(())
+    }
+
+    fn on_order_canceled(&mut self, event: &OrderCanceled) -> anyhow::Result<()> {
+        self.reconcile_after_own_cancel(event.instrument_id)
     }
 }

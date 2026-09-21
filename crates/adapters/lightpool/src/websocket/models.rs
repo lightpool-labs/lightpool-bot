@@ -85,6 +85,8 @@ pub struct UserOrderMessage {
     pub user_address: String,
     pub chain_order_id: String,
     #[serde(default)]
+    pub spot_market: Option<String>,
+    #[serde(default)]
     pub block_num: Option<u64>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -117,4 +119,6 @@ pub struct UserTradeMessage {
     pub spot_market: Option<String>,
     #[serde(default)]
     pub block_num: Option<u64>,
+    #[serde(default)]
+    pub cloid: Option<String>,
 }

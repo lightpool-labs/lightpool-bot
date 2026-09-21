@@ -57,8 +57,8 @@ struct Args {
     /// LightPool spot ContractAddresses aligned with --symbol (optional if registry resolves).
     #[arg(long)]
     spot_market: Option<String>,
-    /// Number of book levels to track per side.
-    #[arg(long, default_value_t = 10)]
+    /// Number of book levels to mirror per side.
+    #[arg(long, default_value_t = 20)]
     depth: usize,
     /// Number of Hyperliquid book deltas to batch before reconciling once.
     #[arg(long, default_value_t = 1)]

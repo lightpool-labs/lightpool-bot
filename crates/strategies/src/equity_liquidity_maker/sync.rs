@@ -69,15 +69,48 @@ struct BookSnapshot {
     asks: BookSideSnapshot,
 }
 
+fn format_dropped_levels(levels: &IndexMap<Decimal, Decimal>) -> String {
+    let dropped: Vec<String> = levels
+        .iter()
+        .filter(|(_, size)| !is_mirrorable_size(**size))
+        .map(|(price, size)| format!("{price}@{size}"))
+        .collect();
+    if dropped.is_empty() {
+        "none".to_string()
+    } else {
+        dropped.join(", ")
+    }
+}
+
+struct FilteredBook {
+    snapshot: BookSnapshot,
+    hl_bid_levels: usize,
+    hl_ask_levels: usize,
+    dropped_bids: String,
+    dropped_asks: String,
+}
+
 impl BookSnapshot {
-    fn from_book(book: &OrderBook, depth: usize) -> Self {
+    fn from_book_filtered(book: &OrderBook, depth: usize) -> FilteredBook {
+        let raw_bids = BookSideSnapshot::from_book(book, depth, true);
+        let raw_asks = BookSideSnapshot::from_book(book, depth, false);
+        let hl_bid_levels = raw_bids.levels.len();
+        let hl_ask_levels = raw_asks.levels.len();
+        let dropped_bids = format_dropped_levels(&raw_bids.levels);
+        let dropped_asks = format_dropped_levels(&raw_asks.levels);
         let mut snapshot = Self {
-            bids: BookSideSnapshot::from_book(book, depth, true),
-            asks: BookSideSnapshot::from_book(book, depth, false),
+            bids: raw_bids,
+            asks: raw_asks,
         };
         snapshot.bids.levels.retain(|_, size| is_mirrorable_size(*size));
         snapshot.asks.levels.retain(|_, size| is_mirrorable_size(*size));
-        snapshot
+        FilteredBook {
+            snapshot,
+            hl_bid_levels,
+            hl_ask_levels,
+            dropped_bids,
+            dropped_asks,
+        }
     }
 
     fn from_open_orders(orders: &[OrderAny], depth: usize) -> Self {
@@ -268,12 +301,134 @@ fn build_reconcile_actions(
     actions
 }
 
+fn place_crosses_open_order(side: OrderSide, price: Decimal, open_orders: &[OrderAny]) -> bool {
+    match side {
+        OrderSide::Buy => open_orders.iter().any(|order| {
+            order.order_side() == OrderSide::Sell
+                && order
+                    .price()
+                    .is_some_and(|resting| resting.as_decimal() <= price)
+        }),
+        OrderSide::Sell => open_orders.iter().any(|order| {
+            order.order_side() == OrderSide::Buy
+                && order
+                    .price()
+                    .is_some_and(|resting| resting.as_decimal() >= price)
+        }),
+        _ => false,
+    }
+}
+
+fn place_crosses_prices(side: OrderSide, price: Decimal, opposite: &[Decimal]) -> bool {
+    match side {
+        OrderSide::Buy => opposite.iter().any(|ask| *ask <= price),
+        OrderSide::Sell => opposite.iter().any(|bid| *bid >= price),
+        _ => false,
+    }
+}
+
+fn without_crossing_places(
+    actions: Vec<ReconcileAction>,
+    open_orders: &[OrderAny],
+) -> Vec<ReconcileAction> {
+    let mut deferred = Vec::new();
+    let mut kept = Vec::new();
+    for action in actions {
+        match &action {
+            ReconcileAction::Place {
+                side,
+                price,
+                quantity,
+            } if place_crosses_open_order(*side, price.as_decimal(), open_orders) => {
+                deferred.push(format!("{side:?} {quantity}@{price}"));
+            }
+            _ => kept.push(action),
+        }
+    }
+
+    let bid_prices: Vec<Decimal> = kept
+        .iter()
+        .filter_map(|action| match action {
+            ReconcileAction::Place {
+                side: OrderSide::Buy,
+                price,
+                ..
+            } => Some(price.as_decimal()),
+            _ => None,
+        })
+        .collect();
+    let ask_prices: Vec<Decimal> = kept
+        .iter()
+        .filter_map(|action| match action {
+            ReconcileAction::Place {
+                side: OrderSide::Sell,
+                price,
+                ..
+            } => Some(price.as_decimal()),
+            _ => None,
+        })
+        .collect();
+    let ask_prices: Vec<Decimal> = ask_prices
+        .into_iter()
+        .filter(|ask| !bid_prices.iter().any(|bid| bid >= ask))
+        .collect();
+
+    kept.retain(|action| match action {
+        ReconcileAction::Place {
+            side,
+            price,
+            quantity,
+        } => {
+            let px = price.as_decimal();
+            let crosses = match side {
+                OrderSide::Buy => place_crosses_prices(*side, px, &ask_prices),
+                OrderSide::Sell => place_crosses_prices(*side, px, &bid_prices),
+                _ => false,
+            };
+            if crosses {
+                deferred.push(format!("{side:?} {quantity}@{price}"));
+                false
+            } else {
+                true
+            }
+        }
+        _ => true,
+    });
+
+    if !deferred.is_empty() {
+        log::info!(
+            "Defer {} crossing place(s) so this batch cannot trade with itself: [{}]",
+            deferred.len(),
+            deferred.join(", "),
+        );
+    }
+    kept
+}
+
 impl EquityLiquidityMaker {
     pub(super) fn reconcile_from_hl_delta(
         &mut self,
         hl_instrument_id: InstrumentId,
     ) -> anyhow::Result<()> {
         let Some(lightpool_instrument_id) = self.hl_to_lp.get(&hl_instrument_id).copied() else {
+            return Ok(());
+        };
+        self.reconcile_pair(hl_instrument_id, lightpool_instrument_id)
+    }
+
+    pub(super) fn reconcile_after_own_cancel(
+        &mut self,
+        lightpool_instrument_id: InstrumentId,
+    ) -> anyhow::Result<()> {
+        if lightpool_instrument_id.venue.as_str() != LIGHTPOOL_VENUE {
+            return Ok(());
+        }
+        let Some(hl_instrument_id) = self
+            .hl_to_lp
+            .iter()
+            .find(|(_, lp_id)| **lp_id == lightpool_instrument_id)
+            .map(|(hl_id, _)| *hl_id)
+        else {
             return Ok(());
         };
         self.reconcile_pair(hl_instrument_id, lightpool_instrument_id)
@@ -332,14 +487,39 @@ impl EquityLiquidityMaker {
                 .map(|order| order.cloned())
                 .collect::<Vec<_>>();
 
-            let reference = BookSnapshot::from_book(hl_book, depth);
+            let filtered = BookSnapshot::from_book_filtered(hl_book, depth);
+            let hl_bid_levels = filtered.hl_bid_levels;
+            let hl_ask_levels = filtered.hl_ask_levels;
+            let dropped_bids = filtered.dropped_bids;
+            let dropped_asks = filtered.dropped_asks;
+            let reference = filtered.snapshot;
             let actual = BookSnapshot::from_open_orders(&open_orders, depth);
+            let ref_bids = reference.bids.levels.len();
+            let ref_asks = reference.asks.levels.len();
+            let lp_bids = actual.bids.levels.len();
+            let lp_asks = actual.asks.levels.len();
+            if ref_bids < depth
+                || ref_asks < depth
+                || lp_bids < depth
+                || lp_asks < depth
+                || ref_bids != lp_bids
+                || ref_asks != lp_asks
+            {
+                log::info!(
+                    "Mirror book depth {hl_instrument_id} → {lightpool_instrument_id}: \
+                     depth={depth} hl_top bids={hl_bid_levels} asks={hl_ask_levels} \
+                     after_min_size(0.1) bids={ref_bids} asks={ref_asks} \
+                     lp_open bids={lp_bids} asks={lp_asks} \
+                     dropped_bids=[{dropped_bids}] dropped_asks=[{dropped_asks}]"
+                );
+            }
             if books_match(&reference, &actual) {
                 return Ok(());
             }
 
             let orders_by_level = OrdersByLevel::from_open_orders(&open_orders);
-            build_reconcile_actions(&reference, &actual, &orders_by_level)
+            let actions = build_reconcile_actions(&reference, &actual, &orders_by_level);
+            without_crossing_places(actions, &open_orders)
         };
 
         if actions.is_empty() {

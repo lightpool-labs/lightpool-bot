@@ -59,6 +59,7 @@ pub struct LightpoolExecutionClient {
     private_key: Option<String>,
     ws_stream_handle: Mutex<Option<JoinHandle<()>>>,
     tracked_orders: Arc<Mutex<HashMap<String, OrderAny>>>,
+    cloid_orders: Arc<Mutex<HashMap<String, OrderAny>>>,
 }
 
 impl std::fmt::Debug for LightpoolExecutionClient {
@@ -100,6 +101,7 @@ impl LightpoolExecutionClient {
             private_key,
             ws_stream_handle: Mutex::new(None),
             tracked_orders: Arc::new(Mutex::new(HashMap::new())),
+            cloid_orders: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -153,6 +155,9 @@ impl LightpoolExecutionClient {
         let emitter = self.emitter.clone();
         let clob_client = self.clob_client.clone();
         let tracked_orders = self.tracked_orders.clone();
+        let cloid_orders = self.cloid_orders.clone();
+        let cloid = order.client_order_id().to_string();
+        cache_cloid(&cloid_orders, &cloid, &order);
         let ts_event = self.ts_event();
 
         self.emitter.emit_order_submitted(&order);
@@ -161,8 +166,9 @@ impl LightpoolExecutionClient {
             let signer = match signer_from_private_key(&private_key) {
                 Ok(signer) => signer,
                 Err(e) => {
+                    remove_cloid(&cloid_orders, &cloid);
                     let reason = format!("invalid signer: {e:#}");
-                    emitter.emit_order_denied(&order, &reason);
+                    emitter.emit_order_rejected(&order, &reason, ts_event, false);
                     return;
                 }
             };
@@ -175,16 +181,27 @@ impl LightpoolExecutionClient {
             )
             .await
             {
-                Ok(chain_order_id) => {
-                    track_order(&tracked_orders, &chain_order_id, &order);
-                    emitter.emit_order_accepted(
-                        &order,
-                        VenueOrderId::from(chain_order_id.as_str()),
-                        ts_event,
+                Ok((chain_order_id, fully_matched)) => {
+                    track_order(&tracked_orders, &spot_market, &chain_order_id, &order);
+                    let venue_order_id = VenueOrderId::from(chain_order_id.as_str());
+                    emitter.emit_order_accepted(&order, venue_order_id.clone(), ts_event);
+                    if fully_matched {
+                        emit_submit_fill(
+                            &emitter,
+                            &order,
+                            venue_order_id,
+                            ts_event,
+                        );
+                    }
+                }
+                Err(e) if submit_result_is_uncertain(&e) => {
+                    log::error!(
+                        "LightPool submit result uncertain, keep cloid={cloid} until chain events arrive: {e:#}"
                     );
                 }
                 Err(e) => {
-                    emitter.emit_order_denied(&order, &e.to_string());
+                    remove_cloid(&cloid_orders, &cloid);
+                    emitter.emit_order_rejected(&order, &e.to_string(), ts_event, false);
                 }
             }
         });
@@ -211,14 +228,15 @@ impl LightpoolExecutionClient {
 
         let emitter = self.emitter.clone();
         let tracked_orders = self.tracked_orders.clone();
+        let cloid_orders = self.cloid_orders.clone();
         let handle = get_runtime().spawn(async move {
             loop {
                 match ws.next_event().await {
                     Some(ClobIndexWsMessage::UserOrder(message)) => {
-                        apply_user_order(&tracked_orders, &emitter, &message);
+                        apply_user_order(&tracked_orders, &cloid_orders, &emitter, &message);
                     }
                     Some(ClobIndexWsMessage::UserTrade(message)) => {
-                        apply_user_trade(&tracked_orders, &emitter, &message);
+                        apply_user_trade(&tracked_orders, &cloid_orders, &emitter, &message);
                     }
                     Some(ClobIndexWsMessage::Error(error)) => {
                         log::warn!("LightPool user stream error: {error}");
@@ -257,25 +275,106 @@ fn map_index_status(status: &str, filled_raw: u64) -> OrderStatus {
     }
 }
 
-fn track_order(tracked: &Mutex<HashMap<String, OrderAny>>, chain_order_id: &str, order: &OrderAny) {
+fn chain_order_key(spot_market: &str, chain_order_id: &str) -> String {
+    let market = parse_token_contract(spot_market)
+        .map(|contract| contract.to_string())
+        .unwrap_or_else(|_| spot_market.trim().to_string());
+    format!("{market}:{chain_order_id}")
+}
+
+fn track_order(
+    tracked: &Mutex<HashMap<String, OrderAny>>,
+    spot_market: &str,
+    chain_order_id: &str,
+    order: &OrderAny,
+) {
     if let Ok(mut tracked) = tracked.lock() {
-        tracked.insert(chain_order_id.to_string(), order.clone());
+        tracked.insert(chain_order_key(spot_market, chain_order_id), order.clone());
     }
 }
 
-fn tracked_order(tracked: &Mutex<HashMap<String, OrderAny>>, chain_order_id: &str) -> Option<OrderAny> {
-    tracked
-        .lock()
-        .ok()
-        .and_then(|tracked| tracked.get(chain_order_id).cloned())
+fn cache_cloid(cloids: &Mutex<HashMap<String, OrderAny>>, cloid: &str, order: &OrderAny) {
+    if cloid.is_empty() {
+        return;
+    }
+    if let Ok(mut cloids) = cloids.lock() {
+        cloids.insert(cloid.to_string(), order.clone());
+    }
+}
+
+fn remove_cloid(cloids: &Mutex<HashMap<String, OrderAny>>, cloid: &str) {
+    if let Ok(mut cloids) = cloids.lock() {
+        cloids.remove(cloid);
+    }
+}
+
+fn submit_result_is_uncertain(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("504")
+        || msg.contains("timed out")
+        || msg.contains("timeout")
+        || msg.contains("connection")
+        || msg.contains("connect failed")
+        || msg.contains("error sending request")
+}
+
+fn tracked_order(
+    tracked: &Mutex<HashMap<String, OrderAny>>,
+    spot_market: &str,
+    chain_order_id: &str,
+) -> Option<OrderAny> {
+    tracked.lock().ok().and_then(|tracked| {
+        tracked
+            .get(&chain_order_key(spot_market, chain_order_id))
+            .cloned()
+    })
+}
+
+fn resolve_order(
+    tracked: &Mutex<HashMap<String, OrderAny>>,
+    cloids: &Mutex<HashMap<String, OrderAny>>,
+    spot_market: Option<&str>,
+    chain_order_id: &str,
+    cloid: Option<&str>,
+    emitter: &ExecutionEventEmitter,
+) -> Option<OrderAny> {
+    if let Some(market) = spot_market.filter(|market| !market.is_empty()) {
+        if let Some(order) = tracked_order(tracked, market, chain_order_id) {
+            return Some(order);
+        }
+    }
+    let cloid = cloid.filter(|value| !value.is_empty())?;
+    let order = cloids.lock().ok()?.get(cloid).cloned()?;
+    if let Some(market) = spot_market.filter(|market| !market.is_empty()) {
+        track_order(tracked, market, chain_order_id, &order);
+    }
+    let ts_event = get_atomic_clock_realtime().get_time_ns();
+    emitter.emit_order_accepted(
+        &order,
+        VenueOrderId::from(chain_order_id),
+        ts_event,
+    );
+    Some(order)
 }
 
 fn apply_user_order(
     tracked: &Mutex<HashMap<String, OrderAny>>,
+    cloids: &Mutex<HashMap<String, OrderAny>>,
     emitter: &ExecutionEventEmitter,
     message: &UserOrderMessage,
 ) {
-    let Some(order) = tracked_order(tracked, &message.chain_order_id) else {
+    let cloid = message
+        .extra
+        .get("cloid")
+        .and_then(|value| value.as_str());
+    let Some(order) = resolve_order(
+        tracked,
+        cloids,
+        message.spot_market.as_deref(),
+        &message.chain_order_id,
+        cloid,
+        emitter,
+    ) else {
         return;
     };
     if order.is_closed() {
@@ -333,10 +432,18 @@ fn apply_user_order(
 
 fn apply_user_trade(
     tracked: &Mutex<HashMap<String, OrderAny>>,
+    cloids: &Mutex<HashMap<String, OrderAny>>,
     emitter: &ExecutionEventEmitter,
     message: &UserTradeMessage,
 ) {
-    let Some(order) = tracked_order(tracked, &message.chain_order_id) else {
+    let Some(order) = resolve_order(
+        tracked,
+        cloids,
+        message.spot_market.as_deref(),
+        &message.chain_order_id,
+        message.cloid.as_deref(),
+        emitter,
+    ) else {
         return;
     };
     if order.is_closed() {
@@ -409,6 +516,35 @@ fn emit_closing_fill(
         collateral_currency(),
         None,
         LiquiditySide::Maker,
+        ts_event,
+    );
+}
+
+fn emit_submit_fill(
+    emitter: &ExecutionEventEmitter,
+    order: &OrderAny,
+    venue_order_id: VenueOrderId,
+    ts_event: UnixNanos,
+) {
+    let last_qty = order.quantity();
+    let Some(last_px) = order.price() else {
+        return;
+    };
+    let trade_id = lightpool_trade_id(venue_order_id.as_str(), 0, "submit-fill");
+    log::info!(
+        "LightPool order fully matched on submit client_order_id={} venue_order_id={venue_order_id} last_qty={last_qty} last_px={last_px}",
+        order.client_order_id(),
+    );
+    emitter.emit_order_filled(
+        order,
+        venue_order_id,
+        None,
+        trade_id,
+        last_qty,
+        last_px,
+        collateral_currency(),
+        None,
+        LiquiditySide::Taker,
         ts_event,
     );
 }
@@ -510,7 +646,7 @@ async fn submit_limit_order_via_index(
     instrument: &InstrumentAny,
     order: &OrderAny,
     spot_market_str: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, bool)> {
     let spot_market_display = spot_market_str.to_string();
 
     let price_decimal = order.price().map(|p| p.as_decimal());
@@ -551,12 +687,13 @@ async fn submit_limit_order_via_index(
         },
         limit_price,
         token_address,
+        cloid: Some(order.client_order_id().to_string()),
     };
 
-    let (_digest, chain_order_id) = clob_client
+    let (_digest, chain_order_id, fully_matched) = clob_client
         .submit_order_params(signer, spot_market_str, params)
         .await?;
-    Ok(chain_order_id.to_string())
+    Ok((chain_order_id.to_string(), fully_matched))
 }
 
 #[async_trait(?Send)]
