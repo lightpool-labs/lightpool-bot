@@ -16,7 +16,7 @@ use nautilus_polymarket::{
     http::{
         gamma::PolymarketGammaHttpClient,
         models::GammaMarket,
-        query::GetGammaMarketsParams,
+        query::{GetGammaEventsParams, GetGammaMarketsParams},
     },
 };
 
@@ -31,7 +31,7 @@ pub struct MarketPair {
 
 #[derive(Debug, Clone)]
 pub struct BootstrapConfig {
-    pub polymarket_event_slug: String,
+    pub polymarket_event_slugs: Vec<String>,
     pub max_markets: u32,
     pub mint_amount: u64,
     pub order_field: String,
@@ -43,7 +43,7 @@ pub struct BootstrapConfig {
 impl Default for BootstrapConfig {
     fn default() -> Self {
         Self {
-            polymarket_event_slug: String::new(),
+            polymarket_event_slugs: Vec::new(),
             max_markets: 5,
             mint_amount: 1_000_000_000_000_000, // 1e9 tokens at 6 decimals
             order_field: "liquidity".into(),
@@ -52,25 +52,43 @@ impl Default for BootstrapConfig {
     }
 }
 
-fn parse_resolution_deadline(end_date: Option<&str>) -> u64 {
-    // Prefer ISO date; fall back to end of 2026.
-    const FALLBACK: u64 = 1_798_761_599; // 2026-12-31T23:59:59Z approx
-    let Some(raw) = end_date.map(str::trim).filter(|s| !s.is_empty()) else {
-        return FALLBACK;
-    };
+fn parse_deadline_unix(raw: &str) -> Option<u64> {
     // Accept "2026-12-31T23:59:59Z" or with fractional seconds.
     let cleaned = raw.trim_end_matches('Z');
     let cleaned = cleaned.split('.').next().unwrap_or(cleaned);
     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(cleaned, "%Y-%m-%dT%H:%M:%S") {
-        return dt.and_utc().timestamp().max(0) as u64;
+        return Some(dt.and_utc().timestamp().max(0) as u64);
     }
     if let Ok(d) = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
         return d
             .and_hms_opt(23, 59, 59)
-            .map(|dt| dt.and_utc().timestamp().max(0) as u64)
-            .unwrap_or(FALLBACK);
+            .map(|dt| dt.and_utc().timestamp().max(0) as u64);
     }
-    FALLBACK
+    None
+}
+
+fn parse_resolution_deadline(end_date: Option<&str>) -> u64 {
+    // Prefer ISO date; fall back to end of 2026.
+    const FALLBACK: u64 = 1_798_761_599; // 2026-12-31T23:59:59Z approx
+    end_date
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(parse_deadline_unix)
+        .unwrap_or(FALLBACK)
+}
+
+const MIN_DEADLINE_HORIZON_SECS: u64 = 7 * 24 * 60 * 60;
+
+fn deadline_still_open(end_date: Option<&str>) -> bool {
+    let Some(deadline) = end_date
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(parse_deadline_unix)
+    else {
+        return false;
+    };
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    deadline > now.saturating_add(MIN_DEADLINE_HORIZON_SECS)
 }
 
 fn parse_outcome_prices(raw: &Option<String>) -> Option<Vec<f64>> {
@@ -90,6 +108,81 @@ fn parse_outcome_prices(raw: &Option<String>) -> Option<Vec<f64>> {
     (!values.is_empty()).then_some(values)
 }
 
+fn gamma_client() -> Result<PolymarketGammaHttpClient> {
+    let proxy = proxy_url_from_env().or_else(|| Some("http://127.0.0.1:8118".into()));
+    PolymarketGammaHttpClient::new_with_proxy(None, proxy, 30, RetryConfig::default())
+        .context("create Polymarket Gamma HTTP client")
+}
+
+/// Active Polymarket event slugs ranked by 24-hour volume, highest first.
+pub async fn fetch_hottest_event_slugs(limit: u32) -> Result<Vec<String>> {
+    let limit = limit.max(1);
+    let client = gamma_client()?;
+    let params = GetGammaEventsParams {
+        active: Some(true),
+        closed: Some(false),
+        archived: Some(false),
+        order: Some("volume24hr".into()),
+        ascending: Some(false),
+        limit: Some(limit.saturating_mul(5).max(limit)),
+        ..Default::default()
+    };
+    let events = client
+        .inner()
+        .get_gamma_events(params)
+        .await
+        .context("fetch hottest Polymarket events by volume24hr")?;
+
+    let mut slugs = Vec::new();
+    for event in events {
+        if event.closed.unwrap_or(false) || event.archived.unwrap_or(false) {
+            continue;
+        }
+        let event_open = if event.markets.is_empty() {
+            deadline_still_open(event.end_date.as_deref())
+        } else {
+            event
+                .markets
+                .iter()
+                .any(|market| deadline_still_open(market.end_date.as_deref()))
+        };
+        if !event_open {
+            log::info!(
+                "skip event past deadline slug={} title={} end={}",
+                event.slug.as_deref().unwrap_or(""),
+                event.title.as_deref().unwrap_or(""),
+                event.end_date.as_deref().unwrap_or(""),
+            );
+            continue;
+        }
+        if !event.markets.is_empty() && !event.markets.iter().any(has_order_book) {
+            log::info!(
+                "skip event without order book slug={} title={}",
+                event.slug.as_deref().unwrap_or(""),
+                event.title.as_deref().unwrap_or(""),
+            );
+            continue;
+        }
+        let Some(slug) = event.slug.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        log::info!(
+            "hot event rank={} slug={slug} title={} volume24hr={}",
+            slugs.len() + 1,
+            event.title.as_deref().unwrap_or(""),
+            event.volume_24hr.unwrap_or(0.0),
+        );
+        slugs.push(slug.to_string());
+        if slugs.len() >= limit as usize {
+            break;
+        }
+    }
+    if slugs.is_empty() {
+        bail!("no active Polymarket events returned for volume24hr ranking");
+    }
+    Ok(slugs)
+}
+
 fn normalize_outcome_price(price: f64) -> f64 {
     // Gamma usually returns 0–1; accept cents (e.g. 96) as well.
     if price > 1.5 {
@@ -97,6 +190,17 @@ fn normalize_outcome_price(price: f64) -> f64 {
     } else {
         price
     }
+}
+
+/// Closed markets and markets with no CLOB book cannot be mirrored.
+fn has_order_book(market: &GammaMarket) -> bool {
+    if market.closed.unwrap_or(false) {
+        return false;
+    }
+    if market.enable_order_book == Some(false) || market.accepting_orders == Some(false) {
+        return false;
+    }
+    market.best_bid.is_some() || market.best_ask.is_some()
 }
 
 /// Still-active market: every Yes/No outcome price is strictly below `max_price` (0–1).
@@ -120,14 +224,7 @@ async fn fetch_top_polymarket_markets(
     order_field: &str,
     max_outcome_price: f64,
 ) -> Result<Vec<GammaMarket>> {
-    let proxy = proxy_url_from_env().or_else(|| Some("http://127.0.0.1:8118".into()));
-    let client = PolymarketGammaHttpClient::new_with_proxy(
-        None,
-        proxy,
-        30,
-        RetryConfig::default(),
-    )
-    .context("create Polymarket Gamma HTTP client")?;
+    let client = gamma_client()?;
 
     // Fetch full sorted list first, then filter near-final markets, then take top-N.
     let params = GetGammaMarketsParams {
@@ -146,11 +243,29 @@ async fn fetch_top_polymarket_markets(
         .with_context(|| format!("fetch Polymarket markets for event '{event_slug}'"))?;
 
     if markets.is_empty() {
-        bail!("no Polymarket markets found for event '{event_slug}'");
+        log::warn!("no Polymarket markets found for event '{event_slug}'");
+        return Ok(Vec::new());
     }
 
     let mut active = Vec::new();
     for market in markets {
+        if !deadline_still_open(market.end_date.as_deref()) {
+            log::info!(
+                "skip PM market past deadline condition={} question={} end={}",
+                market.condition_id,
+                market.question,
+                market.end_date.as_deref().unwrap_or(""),
+            );
+            continue;
+        }
+        if !has_order_book(&market) {
+            log::info!(
+                "skip PM market without order book condition={} question={}",
+                market.condition_id,
+                market.question,
+            );
+            continue;
+        }
         if is_still_active_market(&market, max_outcome_price) {
             active.push(market);
         } else {
@@ -166,7 +281,7 @@ async fn fetch_top_polymarket_markets(
     }
 
     if active.is_empty() {
-        bail!(
+        log::warn!(
             "no still-active Polymarket markets for event '{event_slug}' \
              (all outcomes must be < {max_outcome_price})"
         );
@@ -183,30 +298,79 @@ pub async fn bootstrap_markets_from_polymarket(
     let collateral = resolve_collateral_token();
     let clob = ClobIndexHttpClient::new(clob_index_http_from_env());
 
-    let pm_markets = fetch_top_polymarket_markets(
-        &config.polymarket_event_slug,
-        config.max_markets,
-        &config.order_field,
-        config.max_outcome_price,
-    )
-    .await?;
+    if config.polymarket_event_slugs.is_empty() {
+        bail!("bootstrap requires at least one Polymarket event slug");
+    }
+
+    let mut pm_markets = Vec::new();
+    for event_slug in &config.polymarket_event_slugs {
+        let markets = fetch_top_polymarket_markets(
+            event_slug,
+            config.max_markets,
+            &config.order_field,
+            config.max_outcome_price,
+        )
+        .await?;
+        log::info!(
+            "event '{event_slug}' contributes {} still-active markets (cap {})",
+            markets.len(),
+            config.max_markets,
+        );
+        pm_markets.extend(markets);
+    }
 
     log::info!(
-        "Bootstrapping {} LightPool markets from Polymarket event '{}' \
+        "Bootstrapping {} LightPool markets from {} Polymarket events \
          (mint_amount={}, max_outcome_price={})",
         pm_markets.len(),
-        config.polymarket_event_slug,
+        config.polymarket_event_slugs.len(),
         config.mint_amount,
         config.max_outcome_price,
     );
 
+    let existing = clob
+        .fetch_all_markets()
+        .await
+        .context("list existing LightPool markets")?;
+    let mut existing_by_question: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    for market in existing {
+        existing_by_question
+            .entry(market.question.trim().to_string())
+            .or_insert((market.slug, market.market_address));
+    }
+
     let mut pairs = Vec::with_capacity(pm_markets.len());
+    let mut token_cap_reached = false;
     for (idx, pm) in pm_markets.iter().enumerate() {
         let question = pm.question.trim();
         if question.is_empty() {
             log::warn!("skip PM market {}: empty question", pm.condition_id);
             continue;
         }
+        if let Some((slug, market_address)) = existing_by_question.get(question) {
+            log::info!(
+                "[{}/{}] reuse LP market slug={slug} condition={}",
+                idx + 1,
+                pm_markets.len(),
+                pm.condition_id,
+            );
+            pairs.push(MarketPair {
+                condition_id: pm.condition_id.clone(),
+                question: question.to_string(),
+                lightpool_slug: slug.clone(),
+                market_address: market_address.clone(),
+            });
+            continue;
+        }
+        if token_cap_reached {
+            log::warn!(
+                "skip PM market {}: education token index cap already reached",
+                pm.condition_id
+            );
+            continue;
+        }
+
         let deadline = parse_resolution_deadline(pm.end_date.as_deref());
         log::info!(
             "[{}/{}] create+mint LP market for condition={} question={question}",
@@ -215,7 +379,7 @@ pub async fn bootstrap_markets_from_polymarket(
             pm.condition_id,
         );
 
-        let created: BootstrappedMarket = bootstrap_one_market(
+        let created = match bootstrap_one_market(
             &clob,
             &signer,
             question,
@@ -224,12 +388,27 @@ pub async fn bootstrap_markets_from_polymarket(
             config.mint_amount,
         )
         .await
-        .with_context(|| {
-            format!(
-                "bootstrap LightPool market for condition={}",
-                pm.condition_id
-            )
-        })?;
+        {
+            Ok(created) => created,
+            Err(err) => {
+                let rendered = format!("{err:#}");
+                if rendered.contains("MAX_MODULE_INDEX") || rendered.contains("Cannot create more tokens")
+                {
+                    token_cap_reached = true;
+                    log::warn!(
+                        "stop creating markets at condition={}: {rendered}",
+                        pm.condition_id
+                    );
+                    continue;
+                }
+                return Err(err).with_context(|| {
+                    format!(
+                        "bootstrap LightPool market for condition={}",
+                        pm.condition_id
+                    )
+                });
+            }
+        };
 
         log::info!(
             "indexed LightPool market slug={} address={}",
@@ -237,6 +416,10 @@ pub async fn bootstrap_markets_from_polymarket(
             created.market_address,
         );
 
+        existing_by_question.insert(
+            question.to_string(),
+            (created.slug.clone(), created.market_address.clone()),
+        );
         pairs.push(MarketPair {
             condition_id: pm.condition_id.clone(),
             question: question.to_string(),

@@ -7,7 +7,9 @@ pub mod markets;
 pub mod strategy;
 mod sync;
 
-pub use bootstrap::{BootstrapConfig, MarketPair, bootstrap_markets_from_polymarket};
+pub use bootstrap::{
+    BootstrapConfig, MarketPair, bootstrap_markets_from_polymarket, fetch_hottest_event_slugs,
+};
 pub use config::LiquidityMakerConfig;
 pub use markets::SlugMarketIds;
 pub use strategy::LiquidityMaker;

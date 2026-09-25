@@ -7,19 +7,20 @@
 //!
 //! # Usage
 //!
-//! Bootstrap top-5 Polymarket markets into LightPool, then mirror:
+//! Bootstrap markets from the 9 hottest Polymarket events (24h volume):
+//! ```sh
+//! cargo run -p lightpool-strategies --bin liquidity-maker -- \
+//!   --bootstrap-markets \
+//!   --hot-events 9 \
+//!   --max-markets 5
+//! ```
+//!
+//! Or pin explicit Gamma event slugs:
 //! ```sh
 //! cargo run -p lightpool-strategies --bin liquidity-maker -- \
 //!   --polymarket-slug world-cup-winner \
 //!   --bootstrap-markets \
 //!   --max-markets 5
-//! ```
-//!
-//! Or use an existing LightPool market slug:
-//! ```sh
-//! cargo run -p lightpool-strategies --bin liquidity-maker -- \
-//!   --polymarket-slug world-cup-winner \
-//!   --lightpool-slug france-world-cup-2026
 //! ```
 
 use std::sync::Arc;
@@ -28,7 +29,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use lightpool_strategies::{
     BootstrapConfig, LiquidityMaker, LiquidityMakerConfig, MarketPair,
-    bootstrap_markets_from_polymarket,
+    bootstrap_markets_from_polymarket, fetch_hottest_event_slugs,
 };
 use log::LevelFilter;
 use nautilus_common::{enums::Environment, logging::logger::LoggerConfig};
@@ -47,12 +48,17 @@ use nautilus_polymarket::{
 
 #[derive(Parser, Debug)]
 #[command(
-    about = "Dual-venue liquidity maker: Polymarket + LightPool order book mirroring."
+    about = "Dual-venue liquidity maker: Polymarket + LightPool order book mirroring. Reuses indexed markets. Skips markets resolving within 7 days."
 )]
 struct Args {
-    /// Polymarket event slug (Gamma event slug).
+    /// Polymarket Gamma event slug. Repeat to pin several events.
+    /// When omitted, the hottest events are loaded with `--hot-events`.
     #[arg(long)]
-    polymarket_slug: String,
+    polymarket_slug: Vec<String>,
+    /// How many hottest Polymarket events to load when `--polymarket-slug` is omitted.
+    /// Ranked by 24-hour volume.
+    #[arg(long, default_value_t = 9)]
+    hot_events: u32,
     /// LightPool market slug (clob-index). Required unless --bootstrap-markets or --polymarket-only.
     #[arg(long)]
     lightpool_slug: Option<String>,
@@ -107,8 +113,16 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     let args = Args::parse();
 
-    let polymarket_slug = require_non_empty("--polymarket-slug", &args.polymarket_slug)?;
-    let polymarket_slugs = vec![polymarket_slug.clone()];
+    let mut polymarket_slugs: Vec<String> = args
+        .polymarket_slug
+        .iter()
+        .map(|slug| require_non_empty("--polymarket-slug", slug))
+        .collect::<Result<_>>()?;
+    if polymarket_slugs.is_empty() {
+        polymarket_slugs = fetch_hottest_event_slugs(args.hot_events)
+            .await
+            .context("resolve hottest Polymarket events")?;
+    }
     let lightpool_enabled = !args.polymarket_only;
 
     if args.bootstrap_markets && args.polymarket_only {
@@ -125,7 +139,7 @@ async fn main() -> Result<()> {
             args.max_outcome_price_cents
         };
         let boot_cfg = BootstrapConfig {
-            polymarket_event_slug: polymarket_slug.clone(),
+            polymarket_event_slugs: polymarket_slugs.clone(),
             max_markets: args.max_markets.max(1),
             mint_amount: args.mint_amount,
             order_field: "liquidity".into(),
@@ -245,7 +259,7 @@ async fn main() -> Result<()> {
 
     let mut node = node_builder.build()?;
 
-    let mut strategy_config = LiquidityMakerConfig::new(polymarket_slugs)
+    let mut strategy_config = LiquidityMakerConfig::new(polymarket_slugs.clone())
         .with_depth(args.depth)
         .with_log_interval(args.log_interval)
         .with_log_polymarket(!args.no_polymarket_log)
@@ -268,7 +282,7 @@ async fn main() -> Result<()> {
     }
 
     log::info!(
-        "Starting liquidity maker polymarket_slug={polymarket_slug} \
+        "Starting liquidity maker polymarket_slugs={polymarket_slugs:?} \
          lightpool_slugs={lightpool_slugs:?} depth={} trading_enabled={trading_enabled} \
          bootstrap={}",
         args.depth,
