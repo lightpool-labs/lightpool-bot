@@ -455,6 +455,7 @@ impl ClobIndexHttpClient {
             limit_price,
             token_address,
             cloid: None,
+            whitelist: None,
         };
         let (digest, chain_order_id, _fully_matched) = self
             .submit_order_params(signer.as_ref(), &spot_market, params)
@@ -500,6 +501,7 @@ impl ClobIndexHttpClient {
                 .map_err(|e| anyhow::anyhow!("invalid yes token: {e}"))?,
             no_token: parse_token_contract(&market.no_token)
                 .map_err(|e| anyhow::anyhow!("invalid no token: {e}"))?,
+            whitelist: None,
         };
         let action = ActionBuilder::mint_event_contract(market_address, params)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -539,6 +541,7 @@ impl ClobIndexHttpClient {
                 .map_err(|e| anyhow::anyhow!("invalid yes token: {e}"))?,
             no_token: parse_token_contract(&market.no_token)
                 .map_err(|e| anyhow::anyhow!("invalid no token: {e}"))?,
+            whitelist: None,
         };
         let action = ActionBuilder::burn_event_contract(market_address, params)
             .map_err(|e| anyhow::anyhow!("{e}"))?;

@@ -88,6 +88,7 @@ pub async fn mint_event_contract(
         collateral_token,
         yes_token,
         no_token,
+        whitelist: None,
     };
     let action = ActionBuilder::mint_event_contract(market_address, params)
         .map_err(|e| anyhow::anyhow!("build mint_event_contract: {e}"))?;

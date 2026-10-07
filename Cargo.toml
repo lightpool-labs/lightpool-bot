@@ -46,7 +46,6 @@ members = [
   "crates/system",
   "crates/testkit",
   "crates/trading",
-  "crates/strategies",
 ]
 
 [workspace.package]

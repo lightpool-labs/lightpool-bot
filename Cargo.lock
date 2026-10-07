@@ -5465,7 +5465,6 @@ dependencies = [
  "nautilus-live",
  "nautilus-model",
  "nautilus-network",
- "nautilus-polymarket",
  "nautilus-trading",
  "rust_decimal",
  "serde",

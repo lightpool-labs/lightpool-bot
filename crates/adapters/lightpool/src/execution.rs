@@ -688,6 +688,7 @@ async fn submit_limit_order_via_index(
         limit_price,
         token_address,
         cloid: Some(order.client_order_id().to_string()),
+        whitelist: None,
     };
 
     let (_digest, chain_order_id, fully_matched) = clob_client
